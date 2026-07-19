@@ -1,0 +1,15 @@
+node:
+  id: tokyo-01
+  name: 东京节点
+  host: auto
+
+server:
+  port: 8088
+
+security:
+  token: abc123456789
+
+singbox:
+  config: ./singbox/config.json
+  api_port: 9090
+  api_secret: ""
