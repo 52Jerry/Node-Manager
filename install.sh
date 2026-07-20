@@ -104,7 +104,11 @@ echo "检查配置文件..."
 sing-box check -c /etc/sing-box/config.json
 
 echo "开放防火墙端口..."
-ufw allow 20168/tcp 20169/tcp 5001/tcp 9090/tcp 8088/tcp
+ufw allow 20168/tcp
+ufw allow 20169/tcp
+ufw allow 5001/tcp
+ufw allow 9090/tcp
+ufw allow 8088/tcp
 ufw --force enable
 
 echo "启动 sing-box..."
@@ -680,4 +684,5 @@ else
     systemctl status node-manager
     exit 1
 fi
+
 
