@@ -85,21 +85,21 @@ http://localhost:8088
 
 ```bash
 # 一键部署命令（推荐）
-bash <(curl -sL https://raw.githubusercontent.com/52Jerry/Node-Manager/main/install.sh)
+curl -sL -o install.sh https://raw.githubusercontent.com/52Jerry/Node-Manager/main/install.sh && chmod +x install.sh && ./install.sh
 ```
 
 部署流程：
 ```
-[1/4] 安装 sing-box
+[1/4] 安装系统依赖
     |
     ↓
-[2/4] 配置基础节点
+[2/4] 安装 sing-box
     |
     ↓
-[3/4] 测试 sing-box 运行
+[3/4] 获取服务器信息（公网IP、UUID、密钥等）
     |
     ↓
-[4/4] 安装 Python Node Manager
+[4/4] 配置并启动服务
     |
     ↓
 部署完成！
@@ -107,17 +107,12 @@ bash <(curl -sL https://raw.githubusercontent.com/52Jerry/Node-Manager/main/inst
 
 #### 备用方案
 
-如果上面的命令失败，尝试分步执行：
-
 ```bash
-# 1. 下载脚本
-curl -sL -o install.sh https://raw.githubusercontent.com/52Jerry/Node-Manager/main/install.sh
+# 使用 gh-proxy 镜像
+curl -sL -o install.sh https://gh.api.99988866.xyz/https://raw.githubusercontent.com/52Jerry/Node-Manager/main/install.sh && chmod +x install.sh && ./install.sh
 
-# 2. 赋予执行权限
-chmod +x install.sh
-
-# 3. 执行安装
-./install.sh
+# 使用 jsdelivr CDN
+curl -sL -o install.sh https://cdn.jsdelivr.net/gh/52Jerry/Node-Manager@main/install.sh && chmod +x install.sh && ./install.sh
 ```
 
 ## API 接口
