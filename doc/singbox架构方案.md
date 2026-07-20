@@ -109,7 +109,17 @@ sing-box
 直接在服务器上执行以下命令，完成全流程部署：
 
 ```bash
-bash <(curl -sL https://raw.githubusercontent.com/52Jerry/Node-Manager/main/install.sh)
+curl -sL -o install.sh https://raw.githubusercontent.com/52Jerry/Node-Manager/main/install.sh && chmod +x install.sh && ./install.sh
+```
+
+### 备用方案
+
+```bash
+# 使用 gh-proxy 镜像
+curl -sL -o install.sh https://gh.api.99988866.xyz/https://raw.githubusercontent.com/52Jerry/Node-Manager/main/install.sh && chmod +x install.sh && ./install.sh
+
+# 使用 jsdelivr CDN
+curl -sL -o install.sh https://cdn.jsdelivr.net/gh/52Jerry/Node-Manager@main/install.sh && chmod +x install.sh && ./install.sh
 ```
 
 部署流程：
