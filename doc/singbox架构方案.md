@@ -109,7 +109,7 @@ sing-box
 直接在服务器上执行以下命令，完成全流程部署：
 
 ```bash
-bash <(curl -Ls https://raw.githubusercontent.com/52Jerry/Node-Manager/main/install.sh)
+bash <(curl -sL https://raw.githubusercontent.com/52Jerry/Node-Manager/main/install.sh)
 ```
 
 部署流程：
