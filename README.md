@@ -85,7 +85,7 @@ http://localhost:8088
 
 ```bash
 # 一键部署命令（推荐）
-curl -sL -o install.sh https://raw.githubusercontent.com/52Jerry/Node-Manager/main/install.sh && chmod +x install.sh && ./install.sh
+bash <(curl -sL https://raw.githubusercontent.com/52Jerry/Node-Manager/main/install.sh)
 ```
 
 部署流程：
