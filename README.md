@@ -85,7 +85,7 @@ http://localhost:8088
 
 ```bash
 # 一键部署命令（推荐）
-bash <(curl -Ls https://raw.githubusercontent.com/52Jerry/Node-Manager/main/node-manager/install.sh)
+bash <(curl -Ls https://raw.githubusercontent.com/52Jerry/Node-Manager/main/install.sh)
 ```
 
 部署流程：
