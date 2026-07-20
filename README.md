@@ -85,7 +85,7 @@ http://localhost:8088
 
 ```bash
 # 一键部署命令（推荐）
-bash <(curl -sL https://raw.githubusercontent.com/52Jerry/Node-Manager/main/install.sh)
+bash <(curl -Ls https://raw.githubusercontent.com/52Jerry/Node-Manager/main/install.sh)
 ```
 
 部署流程：
@@ -96,7 +96,7 @@ bash <(curl -sL https://raw.githubusercontent.com/52Jerry/Node-Manager/main/inst
 [2/4] 安装 sing-box
     |
     ↓
-[3/4] 克隆项目代码
+[3/4] 获取服务器信息（公网IP、UUID、密钥等）
     |
     ↓
 [4/4] 配置并启动服务
@@ -109,17 +109,15 @@ bash <(curl -sL https://raw.githubusercontent.com/52Jerry/Node-Manager/main/inst
 
 ```bash
 # 方式二：使用 gh-proxy 镜像
-bash <(curl -sL https://gh.api.99988866.xyz/https://raw.githubusercontent.com/52Jerry/Node-Manager/main/install.sh)
+bash <(curl -Ls https://gh.api.99988866.xyz/https://raw.githubusercontent.com/52Jerry/Node-Manager/main/install.sh)
 
-# 方式三：分步执行
-curl -sL -o install.sh https://raw.githubusercontent.com/52Jerry/Node-Manager/main/install.sh
+# 方式三：使用 jsdelivr CDN
+bash <(curl -Ls https://cdn.jsdelivr.net/gh/52Jerry/Node-Manager@main/install.sh)
+
+# 方式四：分步执行
+curl -Ls -o install.sh https://raw.githubusercontent.com/52Jerry/Node-Manager/main/install.sh
 chmod +x install.sh
 ./install.sh
-
-# 方式四：直接克隆部署
-git clone https://github.com/52Jerry/Node-Manager.git
-cd Node-Manager
-bash install.sh
 ```
 
 ## API 接口
