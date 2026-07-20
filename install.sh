@@ -107,6 +107,7 @@ echo "开放防火墙端口..."
 ufw allow 20168/tcp
 ufw allow 20169/tcp
 ufw allow 5001/tcp
+ufw allow 5001/udp
 ufw allow 9090/tcp
 ufw allow 8088/tcp
 ufw --force enable
@@ -684,5 +685,6 @@ else
     systemctl status node-manager
     exit 1
 fi
+
 
 
