@@ -84,12 +84,25 @@ http://localhost:8088
 ### 服务器一键部署
 
 ```bash
-# 下载安装脚本
-curl -o install.sh https://raw.githubusercontent.com/52Jerry/Node-Manager/main/node-manager/install.sh
+# 一键部署命令（推荐）
+bash <(curl -Ls https://raw.githubusercontent.com/52Jerry/Node-Manager/main/node-manager/install.sh)
+```
 
-# 执行安装
-chmod +x install.sh
-./install.sh
+部署流程：
+```
+[1/4] 安装 sing-box
+    |
+    ↓
+[2/4] 配置基础节点
+    |
+    ↓
+[3/4] 测试 sing-box 运行
+    |
+    ↓
+[4/4] 安装 Python Node Manager
+    |
+    ↓
+部署完成！
 ```
 
 ## API 接口
