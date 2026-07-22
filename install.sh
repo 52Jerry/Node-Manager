@@ -261,7 +261,7 @@ systemctl restart sing-box
 systemctl restart node-manager
 
 for _ in $(seq 1 20); do
-  curl -fsS http://127.0.0.1:8088/health >/dev/null && break
+  curl -fsS http://127.0.0.1:8088/health >/dev/null 2>&1 && break
   sleep 1
 done
 curl -fsS http://127.0.0.1:8088/health >/dev/null || {
