@@ -179,6 +179,33 @@ class ManagerTestCase(unittest.TestCase):
         self.assertEqual(connection["socks"]["username"], "residential-user-2")
         self.assertEqual(connection["socks"]["password"], created["socks"]["password"])
 
+    def test_connection_details_support_legacy_socks_user_without_registry(self):
+        data = base_singbox_config()
+        legacy_name = "node-manager:legacy-user"
+        data["inbounds"][0]["users"].append(
+            {
+                "name": legacy_name,
+                "uuid": "11111111-1111-4111-8111-111111111111",
+                "flow": "xtls-rprx-vision",
+            }
+        )
+        data["inbounds"][1]["users"].append(
+            {
+                "name": legacy_name,
+                "uuid": "11111111-1111-4111-8111-111111111111",
+            }
+        )
+        data["inbounds"][2]["users"].append(
+            {"username": legacy_name, "password": "legacy-password"}
+        )
+        self._write_config(data)
+
+        connection = manager.get_user_connection("legacy-user")
+
+        self.assertEqual(connection["protocols"], ["vless", "vmess", "socks"])
+        self.assertEqual(connection["socks"]["username"], legacy_name)
+        self.assertEqual(connection["socks"]["password"], "legacy-password")
+
     def test_create_can_atomically_bind_proxy_and_reuse_credentials(self):
         created = manager.create_user(
             "customer-proxy",
@@ -377,7 +404,7 @@ class ApiTestCase(unittest.TestCase):
         body = response.json()
         self.assertEqual(body["total"], 1)
         self.assertEqual(body["items"][0]["nodeId"], "test-node")
-        self.assertEqual(body["items"][0]["managerVersion"], "1.4.0")
+        self.assertEqual(body["items"][0]["managerVersion"], "1.4.1")
         self.assertEqual(body["items"][0]["singboxVersion"], "1.13.14")
         self.assertEqual(body["items"][0]["connections"], 3)
         self.assertEqual(body["items"][0]["systemConnections"], 8)

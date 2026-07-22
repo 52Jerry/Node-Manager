@@ -542,7 +542,7 @@ def get_user_connection(user_id: str) -> dict[str, Any]:
 
     metadata = _registry_user(registry, user_id)
     auth_name = _auth_name(user_id)
-    socks_username = metadata.get("socksUsername")
+    socks_username = metadata.get("socksUsername") or auth_name
     protocols: list[str] = []
     user_uuid: str | None = None
     response: dict[str, Any] = {

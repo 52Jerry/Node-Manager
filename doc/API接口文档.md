@@ -1,6 +1,6 @@
 # Python Node Manager API 接口文档
 
-当前版本：`1.4.0`
+当前版本：`1.4.1`
 
 部署节点：`http://198.13.46.231:8088`
 
@@ -9,7 +9,7 @@
 - Swagger UI：`http://198.13.46.231:8088/docs`
 - OpenAPI JSON：`http://198.13.46.231:8088/openapi.json`
 
-> `1.4.0` 将 Node Manager 定位为单服务器 Agent。它提供标准心跳快照、代理连接统计和用户连接详情；多节点注册、心跳调度和离线判定由 Spring Boot 控制面负责。
+> `1.4.1` 将 Node Manager 定位为单服务器 Agent。它提供标准心跳快照、代理连接统计和用户连接详情；多节点注册、心跳调度和离线判定由 Spring Boot 控制面负责。
 
 ## 1. 快速接入
 
@@ -268,7 +268,7 @@ curl 'http://198.13.46.231:8088/api/nodes?page=1&pageSize=20' \
       "name": "sing-box-node",
       "host": "198.13.46.231",
       "domain": null,
-      "managerVersion": "1.4.0",
+      "managerVersion": "1.4.1",
       "singboxVersion": "1.13.14",
       "status": "online",
       "singbox": "running",
@@ -401,7 +401,7 @@ Spring Boot 接入节点时先调用该接口，确认版本和能力：
 {
   "agent": "node-manager",
   "apiVersion": "v1",
-  "managerVersion": "1.4.0",
+  "managerVersion": "1.4.1",
   "nodeId": "vultr",
   "capabilities": [
     "user.create",
@@ -437,7 +437,7 @@ Spring Boot 建议每 15 到 30 秒轮询一次，并在连续 3 次失败或超
   "name": "sing-box-node",
   "host": "198.13.46.231",
   "status": "online",
-  "managerVersion": "1.4.0",
+  "managerVersion": "1.4.1",
   "singboxVersion": "1.13.14",
   "singbox": "running",
   "apiAvailable": true,
@@ -537,6 +537,7 @@ api.example.com {
 - ✔ 下一阶段核心接口自动化回归测试
 - ✔ `1.3.0` Agent 能力声明和标准心跳快照
 - ✔ `1.4.0` 代理连接统计、用户三协议连接详情和全新安装测试用户
+- ✔ `1.4.1` 兼容旧版未登记 SOCKS 用户名的三协议用户
 - ✔ 创建、绑定、删除写接口支持持久化 `Idempotency-Key`
 - ✔ 每个用户使用稳定的唯一出站标签，兼容旧用户自动迁移
 - ✔ 用户级上传、下载、累计流量采样和持久化
@@ -546,7 +547,7 @@ api.example.com {
 - ✔ 用户数据和流量数据使用权限 `600` 的本地文件保存
 - ✔ 包含 SOCKS 凭据的幂等响应加密后持久化
 - ✔ 明确 Node Manager 与 Spring Boot 控制面的职责边界
-- ✔ 14 项节点端自动化回归测试
+- ✔ 15 项节点端自动化回归测试
 
 ### Spring Boot 控制面下一阶段
 
