@@ -30,6 +30,7 @@ CONFIG_PATH = Path(config.singbox.config)
 LOCK_PATH = Path("/run/lock/node-manager-singbox.lock")
 REGISTRY_PATH = Path(os.environ.get("NODE_MANAGER_USER_REGISTRY", "/var/lib/node-manager/users.json"))
 USER_PREFIX = "node-manager:"
+USER_OUTBOUND_PREFIX = "node-manager-out:"
 singbox_api = SingboxAPI()
 thread_lock = threading.Lock()
 
@@ -331,6 +332,8 @@ def create_user(
         }
         if proxy is not None:
             _set_proxy_binding(data, registry, user_id, proxy)
+        else:
+            _set_direct_binding(data, registry, user_id)
         return response
 
     return mutate_config(apply)
@@ -339,7 +342,7 @@ def create_user(
 def _set_proxy_binding(
     data: dict[str, Any], registry: dict[str, Any], user_id: str, proxy: dict[str, Any]
 ) -> None:
-    outbound_tag = f"node-manager-out:{user_id}"
+    outbound_tag = f"{USER_OUTBOUND_PREFIX}{user_id}"
     outbound = {
         "type": "socks",
         "tag": outbound_tag,
@@ -359,6 +362,25 @@ def _set_proxy_binding(
     rules[:] = [rule for rule in rules if rule.get("outbound") != outbound_tag]
     auth_names = sorted(_user_auth_names(registry, user_id))
     rules.insert(0, {"auth_user": auth_names, "action": "route", "outbound": outbound_tag})
+
+
+def _set_direct_binding(data: dict[str, Any], registry: dict[str, Any], user_id: str) -> None:
+    outbound_tag = f"{USER_OUTBOUND_PREFIX}{user_id}"
+    data.setdefault("outbounds", [])
+    if not any(item.get("tag") == outbound_tag for item in data["outbounds"]):
+        data["outbounds"].append({"type": "direct", "tag": outbound_tag})
+
+    route = data.setdefault("route", {})
+    rules = route.setdefault("rules", [])
+    if not any(rule.get("outbound") == outbound_tag for rule in rules):
+        rules.insert(
+            0,
+            {
+                "auth_user": sorted(_user_auth_names(registry, user_id)),
+                "action": "route",
+                "outbound": outbound_tag,
+            },
+        )
 
 
 def bind_proxy(user_id: str, proxy: dict[str, Any]) -> dict[str, Any]:
@@ -385,7 +407,7 @@ def delete_user(user_id: str) -> dict[str, Any]:
                 if user.get("name") not in auth_names and user.get("username") not in auth_names
             ]
 
-        outbound_tag = f"node-manager-out:{user_id}"
+        outbound_tag = f"{USER_OUTBOUND_PREFIX}{user_id}"
         data["outbounds"] = [item for item in data.get("outbounds", []) if item.get("tag") != outbound_tag]
         route = data.get("route", {})
         route["rules"] = [
@@ -401,6 +423,43 @@ def _extract_user_id(value: Any) -> str | None:
     if isinstance(value, str) and value.startswith(USER_PREFIX):
         return value[len(USER_PREFIX):]
     return None
+
+
+def _discover_user_ids(data: dict[str, Any], registry: dict[str, Any]) -> set[str]:
+    user_ids = set(registry.get("users", {}))
+    for inbound in data.get("inbounds", []):
+        for user in inbound.get("users", []):
+            for field in ("name", "username"):
+                user_id = _extract_user_id(user.get(field))
+                if user_id:
+                    user_ids.add(user_id)
+    return user_ids
+
+
+def ensure_user_outbounds() -> int:
+    with _config_lock():
+        current = read_config()
+        registry = read_registry()
+        user_ids = _discover_user_ids(current, registry)
+        outbound_tags = {item.get("tag") for item in current.get("outbounds", [])}
+        route_tags = {
+            rule.get("outbound") for rule in current.get("route", {}).get("rules", [])
+        }
+        missing = [
+            user_id
+            for user_id in user_ids
+            if f"{USER_OUTBOUND_PREFIX}{user_id}" not in outbound_tags
+            or f"{USER_OUTBOUND_PREFIX}{user_id}" not in route_tags
+        ]
+    if not missing:
+        return 0
+
+    def apply(data: dict[str, Any], registry: dict[str, Any]) -> int:
+        for user_id in missing:
+            _set_direct_binding(data, registry, user_id)
+        return len(missing)
+
+    return mutate_config(apply)
 
 
 def list_users() -> list[dict[str, Any]]:
@@ -444,12 +503,14 @@ def list_users() -> list[dict[str, Any]]:
     result: list[dict[str, Any]] = []
     for user_id, item in users.items():
         metadata = _registry_user(registry, user_id)
-        outbound = outbounds.get(f"node-manager-out:{user_id}")
+        outbound = outbounds.get(f"{USER_OUTBOUND_PREFIX}{user_id}")
         item["protocols"].sort(key=protocol_order.get)
         item["socksUsername"] = item.get("socksUsername") or metadata.get("socksUsername")
-        item["proxyBound"] = outbound is not None
+        item["proxyBound"] = bool(outbound and outbound.get("type") == "socks")
         item["proxyServer"] = (
-            f"{outbound.get('server')}:{outbound.get('server_port')}" if outbound else None
+            f"{outbound.get('server')}:{outbound.get('server_port')}"
+            if item["proxyBound"]
+            else None
         )
         item["createdAt"] = metadata.get("createdAt")
         item["status"] = "active"

@@ -13,8 +13,10 @@ Python Node Manager 是部署在每台 sing-box 节点服务器上的管理 Agen
 - ✅ 支持 VLESS / VMess / SOCKS5 协议
 - ✅ 绑定用户住宅 SOCKS5 出口
 - ✅ 获取节点状态（CPU、内存、连接数）
-- ✅ 获取用户流量数据
-- ✅ 支持 sing-box Clash API 热更新（无需重启）
+- ✅ 采样并持久化用户累计流量
+- ✅ 提供 Agent 能力声明和标准心跳快照
+- ✅ 写接口支持持久化幂等键
+- ✅ sing-box 配置校验、原子替换和失败回滚
 - ✅ 可视化管理界面
 - ✅ 一键部署脚本
 
@@ -125,6 +127,8 @@ chmod +x install.sh
 | 接口 | 方法 | 描述 |
 |------|------|------|
 | `/api/node/status` | GET | 获取节点状态 |
+| `/api/agent/info` | GET | 获取 Agent 版本、能力和职责边界 |
+| `/api/agent/heartbeat` | GET | 获取 Spring Boot 心跳快照 |
 | `/api/nodes` | GET | 获取节点列表 |
 | `/api/users` | GET | 获取用户列表 |
 | `/api/user/create` | POST | 创建用户，可指定 SOCKS5 账号密码 |
@@ -144,6 +148,7 @@ curl -H "Authorization: Bearer YOUR_TOKEN" http://node-ip:8088/api/node/status
 **创建用户**
 ```bash
 curl -H "Authorization: Bearer YOUR_TOKEN" \
+     -H "Idempotency-Key: order-10001-create" \
      -H "Content-Type: application/json" \
      -d '{"userId":"10001","protocols":["vless","vmess","socks"],"proxy":{"type":"socks5","server":"1.2.3.4","port":1080,"username":"residential-user","password":"residential-password"}}' \
      http://node-ip:8088/api/user/create
@@ -153,6 +158,15 @@ curl -H "Authorization: Bearer YOUR_TOKEN" \
 `node-manager:{userId}`，不传密码时由服务端生成随机密码。创建请求可选携带 `proxy`，
 一次完成住宅 SOCKS5 出口绑定；不传 `proxy` 时可在以后调用绑定接口。未单独指定本节点
 SOCKS5 凭据时，会自动复用住宅出口的用户名和密码。用户列表不会返回明文密码。
+Spring Boot 调用创建、绑定和删除接口时应始终发送唯一 `Idempotency-Key`；相同键和相同请求会返回首次结果，响应头 `Idempotency-Replayed: true` 表示本次为重放。
+
+**Agent 能力与心跳**
+```bash
+curl -H "Authorization: Bearer YOUR_TOKEN" http://node-ip:8088/api/agent/info
+curl -H "Authorization: Bearer YOUR_TOKEN" http://node-ip:8088/api/agent/heartbeat
+```
+
+Node Manager 只管理当前服务器。节点注册、定时心跳、离线判定、全局用户分配和业务数据由 Spring Boot 控制面负责。
 
 **查询用户和节点列表**
 ```bash
@@ -210,14 +224,14 @@ singbox:
 ### 方式一：配置文件模式（默认）
 修改 `config.json` → 执行 `systemctl restart sing-box`
 
-### 方式二：Clash API 热更新（推荐）
-通过 sing-box experimental API 动态管理，无需重启：
+### Clash API 指标采集
+Clash API 仅监听 `127.0.0.1`，用于连接和流量指标采集：
 
 ```json
 {
   "experimental": {
     "clash_api": {
-      "external_controller": "0.0.0.0:9090",
+      "external_controller": "127.0.0.1:9090",
       "secret": "YOUR_SECRET"
     }
   }
@@ -237,8 +251,8 @@ singbox:
 ## 安全设计
 
 - ✅ Token 认证：所有接口需要 Authorization 头
-- ✅ IP 白名单：可配置只允许特定 IP 访问
-- ✅ HTTPS：生产环境建议使用 HTTPS
+- ⏳ IP 白名单：部署 Spring Boot 后限制为控制面服务器 IP
+- ⏳ HTTPS：绑定 API 域名后使用 Caddy 反向代理
 
 ## 部署流程
 

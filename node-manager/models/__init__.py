@@ -1,4 +1,6 @@
 from .request import (
+    AgentHeartbeatResponse,
+    AgentInfoResponse,
     BindProxyRequest,
     CreateUserRequest,
     CreateUserResponse,
@@ -6,4 +8,6 @@ from .request import (
     OperationResponse,
     ReloadResponse,
     TrafficResponse,
+    TrafficTotals,
+    UserListResponse,
 )

@@ -84,6 +84,9 @@ class TrafficResponse(BaseModel):
     upload: int = 0
     download: int = 0
     total: int = 0
+    available: bool = False
+    source: str = "clash-api-sampled"
+    collectedAt: datetime | None = None
 
 
 class ReloadResponse(BaseModel):
@@ -132,3 +135,40 @@ class NodeListResponse(BaseModel):
     page: int
     pageSize: int
     total: int
+
+
+class AgentInfoResponse(BaseModel):
+    agent: str = "node-manager"
+    apiVersion: str
+    managerVersion: str
+    nodeId: str
+    capabilities: list[str]
+    controlPlaneResponsibilities: list[str]
+    idempotencyHeader: str = "Idempotency-Key"
+    heartbeatEndpoint: str = "/api/agent/heartbeat"
+
+
+class TrafficTotals(BaseModel):
+    upload: int = 0
+    download: int = 0
+    total: int = 0
+    available: bool = False
+    source: str = "clash-api-sampled"
+    collectedAt: datetime | None = None
+
+
+class AgentHeartbeatResponse(BaseModel):
+    nodeId: str
+    name: str
+    host: str
+    status: Literal["online", "degraded", "offline"]
+    managerVersion: str
+    singboxVersion: str
+    singbox: str
+    apiAvailable: bool
+    cpu: float
+    memory: float
+    connections: int
+    userCount: int
+    traffic: TrafficTotals
+    reportedAt: datetime

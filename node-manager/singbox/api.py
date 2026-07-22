@@ -23,6 +23,19 @@ class SingboxAPI:
             logger.warning(f"Sing-box API not available: {e}")
             return None
 
+    def get_connections(self):
+        try:
+            response = requests.get(
+                f"{self.base_url}/connections", headers=self.headers, timeout=3
+            )
+            if response.status_code == 200:
+                return response.json()
+            logger.error("Failed to get connections: %s", response.text)
+            return None
+        except Exception as exc:
+            logger.warning("Sing-box connection metrics are not available: %s", exc)
+            return None
+
     def add_proxy(self, proxy_data):
         try:
             response = requests.put(

@@ -43,7 +43,9 @@ import config as config_module
 
 importlib.reload(config_module)
 import singbox.manager as manager
+import idempotency
 import main
+import monitor.traffic as traffic
 from models.request import CreateUserRequest
 
 
@@ -77,17 +79,27 @@ class ManagerTestCase(unittest.TestCase):
         root = Path(self.temp_dir.name)
         self.config_path = root / "sing-box.json"
         self.registry_path = root / "users.json"
+        self.idempotency_path = root / "idempotency.json"
+        self.traffic_path = root / "traffic.json"
         self.config_path.write_text(
             json.dumps(base_singbox_config(), indent=2) + "\n", encoding="utf-8"
         )
         self.config_patch = patch.object(manager, "CONFIG_PATH", self.config_path)
         self.registry_patch = patch.object(manager, "REGISTRY_PATH", self.registry_path)
         self.write_patch = patch.object(manager, "_write_and_reload", self._write_config)
+        self.idempotency_patch = patch.object(
+            idempotency, "STORE_PATH", self.idempotency_path
+        )
+        self.traffic_patch = patch.object(traffic, "TRAFFIC_PATH", self.traffic_path)
         self.config_patch.start()
         self.registry_patch.start()
         self.write_patch.start()
+        self.idempotency_patch.start()
+        self.traffic_patch.start()
 
     def tearDown(self):
+        self.traffic_patch.stop()
+        self.idempotency_patch.stop()
         self.write_patch.stop()
         self.registry_patch.stop()
         self.config_patch.stop()
@@ -143,6 +155,15 @@ class ManagerTestCase(unittest.TestCase):
         )
         self.assertEqual(created["socks"]["username"], "residential-user-2")
         self.assertGreaterEqual(len(created["socks"]["password"]), 20)
+
+        data = json.loads(self.config_path.read_text(encoding="utf-8"))
+        outbound = next(
+            item
+            for item in data["outbounds"]
+            if item["tag"] == "node-manager-out:customer-2"
+        )
+        self.assertEqual(outbound["type"], "direct")
+        self.assertFalse(manager.list_users()[0]["proxyBound"])
 
     def test_create_can_atomically_bind_proxy_and_reuse_credentials(self):
         created = manager.create_user(
@@ -206,18 +227,33 @@ class ApiTestCase(unittest.TestCase):
         root = Path(self.temp_dir.name)
         self.config_path = root / "sing-box.json"
         self.registry_path = root / "users.json"
+        self.idempotency_path = root / "idempotency.json"
+        self.traffic_path = root / "traffic.json"
         self.config_path.write_text(
             json.dumps(base_singbox_config(), indent=2) + "\n", encoding="utf-8"
         )
         self.config_patch = patch.object(manager, "CONFIG_PATH", self.config_path)
         self.registry_patch = patch.object(manager, "REGISTRY_PATH", self.registry_path)
         self.write_patch = patch.object(manager, "_write_and_reload", self._write_config)
+        self.idempotency_patch = patch.object(
+            idempotency, "STORE_PATH", self.idempotency_path
+        )
+        self.traffic_path_patch = patch.object(traffic, "TRAFFIC_PATH", self.traffic_path)
+        self.connections_patch = patch.object(
+            traffic.singbox_api, "get_connections", return_value={"connections": []}
+        )
         self.config_patch.start()
         self.registry_patch.start()
         self.write_patch.start()
+        self.idempotency_patch.start()
+        self.traffic_path_patch.start()
+        self.connections_patch.start()
         self.client = TestClient(main.app)
 
     def tearDown(self):
+        self.connections_patch.stop()
+        self.traffic_path_patch.stop()
+        self.idempotency_patch.stop()
         self.write_patch.stop()
         self.registry_patch.stop()
         self.config_patch.stop()
@@ -271,6 +307,31 @@ class ApiTestCase(unittest.TestCase):
         response = self.client.get("/api/users", headers=headers)
         self.assertTrue(response.json()["items"][0]["proxyBound"])
 
+    def test_create_user_is_idempotent(self):
+        headers = {
+            "Authorization": "Bearer test-token",
+            "Idempotency-Key": "spring-order-1001",
+        }
+        payload = {"userId": "idempotent-user", "protocols": ["socks"]}
+        first = self.client.post("/api/user/create", headers=headers, json=payload)
+        second = self.client.post("/api/user/create", headers=headers, json=payload)
+        self.assertEqual(first.status_code, 200, first.text)
+        self.assertEqual(second.status_code, 200, second.text)
+        self.assertEqual(first.json(), second.json())
+        self.assertEqual(first.headers["Idempotency-Replayed"], "false")
+        self.assertEqual(second.headers["Idempotency-Replayed"], "true")
+        self.assertEqual(len(manager.list_users()), 1)
+        stored = self.idempotency_path.read_text(encoding="utf-8")
+        self.assertNotIn(first.json()["socks"]["password"], stored)
+        self.assertIn("responseEncrypted", stored)
+
+        conflict = self.client.post(
+            "/api/user/create",
+            headers=headers,
+            json={"userId": "different-user", "protocols": ["socks"]},
+        )
+        self.assertEqual(conflict.status_code, 409, conflict.text)
+
     def test_node_list_endpoint(self):
         headers = {"Authorization": "Bearer test-token"}
         with (
@@ -293,8 +354,101 @@ class ApiTestCase(unittest.TestCase):
         body = response.json()
         self.assertEqual(body["total"], 1)
         self.assertEqual(body["items"][0]["nodeId"], "test-node")
-        self.assertEqual(body["items"][0]["managerVersion"], "1.2.0")
+        self.assertEqual(body["items"][0]["managerVersion"], "1.3.0")
         self.assertEqual(body["items"][0]["singboxVersion"], "1.13.14")
+
+    def test_agent_contract_and_heartbeat(self):
+        headers = {"Authorization": "Bearer test-token"}
+        info = self.client.get("/api/agent/info", headers=headers)
+        self.assertEqual(info.status_code, 200, info.text)
+        self.assertEqual(info.json()["apiVersion"], "v1")
+        self.assertIn("request.idempotency", info.json()["capabilities"])
+        self.assertIn(
+            "offline-detection", info.json()["controlPlaneResponsibilities"]
+        )
+
+        with (
+            patch.object(
+                main,
+                "get_node_status",
+                return_value={
+                    "node": "test-node",
+                    "singbox": "running",
+                    "cpu": 1.5,
+                    "memory": 2.5,
+                    "connections": 3,
+                },
+            ),
+            patch.object(main, "_singbox_version", return_value="1.13.14"),
+            patch.object(main, "is_api_available", return_value=True),
+            patch.object(
+                main,
+                "get_traffic_totals",
+                return_value={
+                    "upload": 10,
+                    "download": 20,
+                    "total": 30,
+                    "available": True,
+                    "source": "clash-api-sampled",
+                    "collectedAt": "2026-07-22T00:00:00Z",
+                },
+            ),
+        ):
+            heartbeat = self.client.get("/api/agent/heartbeat", headers=headers)
+        self.assertEqual(heartbeat.status_code, 200, heartbeat.text)
+        self.assertEqual(heartbeat.json()["status"], "online")
+        self.assertEqual(heartbeat.json()["traffic"]["total"], 30)
+
+
+class TrafficTestCase(unittest.TestCase):
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.traffic_path = Path(self.temp_dir.name) / "traffic.json"
+        self.path_patch = patch.object(traffic, "TRAFFIC_PATH", self.traffic_path)
+        self.path_patch.start()
+
+    def tearDown(self):
+        self.path_patch.stop()
+        self.temp_dir.cleanup()
+
+    def test_sampled_connection_traffic_is_accumulated(self):
+        snapshots = [
+            {
+                "connections": [
+                    {
+                        "id": "connection-1",
+                        "upload": 100,
+                        "download": 200,
+                        "chains": ["node-manager-out:traffic-user"],
+                    }
+                ]
+            },
+            {
+                "connections": [
+                    {
+                        "id": "connection-1",
+                        "upload": 150,
+                        "download": 260,
+                        "chains": ["node-manager-out:traffic-user"],
+                    }
+                ]
+            },
+            {"connections": []},
+        ]
+        with patch.object(traffic.singbox_api, "get_connections", side_effect=snapshots):
+            self.assertTrue(traffic.collect_traffic())
+            self.assertTrue(traffic.collect_traffic())
+            self.assertTrue(traffic.collect_traffic())
+
+        result = traffic.get_user_traffic("traffic-user", refresh=False)
+        self.assertEqual(result["upload"], 150)
+        self.assertEqual(result["download"], 260)
+        self.assertEqual(result["total"], 410)
+        self.assertTrue(result["available"])
+
+        traffic.delete_user_traffic("traffic-user")
+        deleted = traffic.get_user_traffic("traffic-user", refresh=False)
+        self.assertEqual(deleted["total"], 0)
 
 
 if __name__ == "__main__":
