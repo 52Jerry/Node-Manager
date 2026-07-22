@@ -14,7 +14,7 @@ class SingboxAPI:
 
     def get_proxies(self):
         try:
-            response = requests.get(f"{self.base_url}/proxies", headers=self.headers)
+            response = requests.get(f"{self.base_url}/proxies", headers=self.headers, timeout=3)
             if response.status_code == 200:
                 return response.json()
             logger.error(f"Failed to get proxies: {response.text}")
@@ -28,7 +28,8 @@ class SingboxAPI:
             response = requests.put(
                 f"{self.base_url}/proxies/{proxy_data['name']}",
                 headers=self.headers,
-                json=proxy_data
+                json=proxy_data,
+                timeout=5,
             )
             if response.status_code == 200:
                 logger.info(f"Added proxy: {proxy_data['name']}")
@@ -43,7 +44,8 @@ class SingboxAPI:
         try:
             response = requests.delete(
                 f"{self.base_url}/proxies/{proxy_name}",
-                headers=self.headers
+                headers=self.headers,
+                timeout=5,
             )
             if response.status_code == 200:
                 logger.info(f"Removed proxy: {proxy_name}")
@@ -59,7 +61,8 @@ class SingboxAPI:
             response = requests.post(
                 f"{self.base_url}/rules",
                 headers=self.headers,
-                json=rule_data
+                json=rule_data,
+                timeout=5,
             )
             if response.status_code == 200:
                 logger.info(f"Added rule")
@@ -74,7 +77,8 @@ class SingboxAPI:
         try:
             response = requests.delete(
                 f"{self.base_url}/rules/{rule_id}",
-                headers=self.headers
+                headers=self.headers,
+                timeout=5,
             )
             if response.status_code == 200:
                 logger.info(f"Removed rule: {rule_id}")
@@ -89,7 +93,8 @@ class SingboxAPI:
         try:
             response = requests.post(
                 f"{self.base_url}/configs/reload",
-                headers=self.headers
+                headers=self.headers,
+                timeout=10,
             )
             if response.status_code == 200:
                 logger.info("Sing-box config reloaded via API")
