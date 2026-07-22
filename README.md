@@ -125,7 +125,9 @@ chmod +x install.sh
 | 接口 | 方法 | 描述 |
 |------|------|------|
 | `/api/node/status` | GET | 获取节点状态 |
-| `/api/user/create` | POST | 创建用户 |
+| `/api/nodes` | GET | 获取节点列表 |
+| `/api/users` | GET | 获取用户列表 |
+| `/api/user/create` | POST | 创建用户，可指定 SOCKS5 账号密码 |
 | `/api/user/bind-proxy` | POST | 绑定住宅代理 |
 | `/api/user/delete/{userId}` | DELETE | 删除用户 |
 | `/api/user/{userId}/traffic` | GET | 获取用户流量 |
@@ -143,8 +145,19 @@ curl -H "Authorization: Bearer YOUR_TOKEN" http://node-ip:8088/api/node/status
 ```bash
 curl -H "Authorization: Bearer YOUR_TOKEN" \
      -H "Content-Type: application/json" \
-     -d '{"userId":"10001","protocols":["vless","vmess","socks"]}' \
+     -d '{"userId":"10001","protocols":["vless","vmess","socks"],"proxy":{"type":"socks5","server":"1.2.3.4","port":1080,"username":"residential-user","password":"residential-password"}}' \
      http://node-ip:8088/api/user/create
+```
+
+`socksUsername` 和 `socksPassword` 均为可选字段。不传用户名时使用
+`node-manager:{userId}`，不传密码时由服务端生成随机密码。创建请求可选携带 `proxy`，
+一次完成住宅 SOCKS5 出口绑定；不传 `proxy` 时可在以后调用绑定接口。未单独指定本节点
+SOCKS5 凭据时，会自动复用住宅出口的用户名和密码。用户列表不会返回明文密码。
+
+**查询用户和节点列表**
+```bash
+curl -H "Authorization: Bearer YOUR_TOKEN" "http://node-ip:8088/api/users?page=1&pageSize=20"
+curl -H "Authorization: Bearer YOUR_TOKEN" "http://node-ip:8088/api/nodes?page=1&pageSize=20"
 ```
 
 **绑定代理**

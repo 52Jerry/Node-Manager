@@ -1,24 +1,10 @@
+from datetime import datetime
 from typing import Literal
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 
 UserProtocol = Literal["vless", "vmess", "socks"]
-
-
-class CreateUserRequest(BaseModel):
-    userId: str = Field(min_length=1, max_length=64, pattern=r"^[A-Za-z0-9._-]+$")
-    protocols: list[UserProtocol] = Field(
-        default_factory=lambda: ["vless", "vmess", "socks"],
-        min_length=1,
-    )
-
-    @field_validator("protocols")
-    @classmethod
-    def protocols_must_be_unique(cls, value: list[UserProtocol]) -> list[UserProtocol]:
-        if len(value) != len(set(value)):
-            raise ValueError("protocols must not contain duplicates")
-        return value
 
 
 class ProxyConfig(BaseModel):
@@ -27,6 +13,30 @@ class ProxyConfig(BaseModel):
     port: int = Field(ge=1, le=65535)
     username: str | None = Field(default=None, max_length=255)
     password: str | None = Field(default=None, max_length=255)
+
+
+class CreateUserRequest(BaseModel):
+    userId: str = Field(min_length=1, max_length=64, pattern=r"^[A-Za-z0-9._-]+$")
+    protocols: list[UserProtocol] = Field(
+        default_factory=lambda: ["vless", "vmess", "socks"],
+        min_length=1,
+    )
+    socksUsername: str | None = Field(default=None, min_length=1, max_length=255)
+    socksPassword: str | None = Field(default=None, min_length=1, max_length=255)
+    proxy: ProxyConfig | None = None
+
+    @field_validator("protocols")
+    @classmethod
+    def protocols_must_be_unique(cls, value: list[UserProtocol]) -> list[UserProtocol]:
+        if len(value) != len(set(value)):
+            raise ValueError("protocols must not contain duplicates")
+        return value
+
+    @model_validator(mode="after")
+    def socks_credentials_require_socks_protocol(self):
+        if (self.socksUsername is not None or self.socksPassword is not None) and "socks" not in self.protocols:
+            raise ValueError("socksUsername and socksPassword require the socks protocol")
+        return self
 
 
 class BindProxyRequest(BaseModel):
@@ -49,6 +59,7 @@ class CreateUserResponse(BaseModel):
     vless: str | None = None
     vmess: str | None = None
     socks: SocksConnection | None = None
+    proxyBound: bool = False
 
 
 class OperationResponse(BaseModel):
@@ -77,3 +88,47 @@ class TrafficResponse(BaseModel):
 
 class ReloadResponse(BaseModel):
     success: bool
+
+
+class UserSummary(BaseModel):
+    userId: str
+    protocols: list[UserProtocol]
+    socksUsername: str | None = None
+    proxyBound: bool
+    proxyServer: str | None = None
+    upload: int = 0
+    download: int = 0
+    total: int = 0
+    status: Literal["active"] = "active"
+    createdAt: datetime | None = None
+
+
+class UserListResponse(BaseModel):
+    items: list[UserSummary]
+    page: int
+    pageSize: int
+    total: int
+
+
+class NodeSummary(BaseModel):
+    nodeId: str
+    name: str
+    host: str
+    domain: str | None = None
+    managerVersion: str
+    singboxVersion: str
+    status: Literal["online", "offline"]
+    singbox: str
+    cpu: float
+    memory: float
+    connections: int
+    userCount: int
+    apiAvailable: bool
+    lastHeartbeatAt: datetime
+
+
+class NodeListResponse(BaseModel):
+    items: list[NodeSummary]
+    page: int
+    pageSize: int
+    total: int

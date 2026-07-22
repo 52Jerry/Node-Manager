@@ -195,6 +195,10 @@ if [ "$UPDATE_NODE_MANAGER" -eq 1 ]; then
 fi
 
 install -d -m 0750 "$CONFIG_DIR"
+install -d -o root -g root -m 0750 /var/lib/node-manager
+if [ -f /var/lib/node-manager/users.json ]; then
+  chmod 0600 /var/lib/node-manager/users.json
+fi
 if [ -f "$CONFIG_DIR/config.yaml" ]; then
   EXISTING_TOKEN="$(awk '/^[[:space:]]*token:/ {print $2; exit}' "$CONFIG_DIR/config.yaml" | tr -d '"' | tr -d "'")"
   [ -z "$EXISTING_TOKEN" ] || NODE_TOKEN="$EXISTING_TOKEN"

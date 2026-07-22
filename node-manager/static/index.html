@@ -28,6 +28,14 @@
     .protocols label { display: flex; align-items: center; gap: 5px; }
     .protocols input { min-width: auto; width: 16px; height: 16px; }
     pre { margin: 14px 0 0; padding: 14px; background: #101820; color: #d8e2e8; border-radius: 4px; overflow: auto; min-height: 72px; white-space: pre-wrap; overflow-wrap: anywhere; }
+    .table-wrap { width: 100%; overflow-x: auto; border: 1px solid #dbe1e6; border-radius: 6px; background: #fff; }
+    table { width: 100%; border-collapse: collapse; min-width: 760px; }
+    th, td { padding: 11px 12px; border-bottom: 1px solid #e6eaed; text-align: left; font-size: 13px; white-space: nowrap; }
+    th { background: #eef2f5; color: #485460; font-weight: 600; }
+    tbody tr:last-child td { border-bottom: 0; }
+    .empty { color: #65737e; text-align: center; padding: 24px; }
+    .section-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 14px; }
+    .section-heading h2 { margin: 0; }
     .ok { color: #14804a; }
     .bad { color: #b42318; }
     @media (max-width: 760px) {
@@ -59,6 +67,12 @@
       <h2>创建用户</h2>
       <div class="form-row">
         <label>用户 ID<input id="create-user-id" placeholder="例如 user-10001"></label>
+        <label>本节点 SOCKS5 用户名（可选）<input id="create-socks-username" autocomplete="off"></label>
+        <label>本节点 SOCKS5 密码（可选）<input id="create-socks-password" type="password" autocomplete="new-password"></label>
+        <label>住宅 SOCKS5 IP（可选）<input id="create-proxy-server" autocomplete="off"></label>
+        <label>住宅端口<input id="create-proxy-port" type="number" min="1" max="65535" value="1080"></label>
+        <label>住宅用户名（可选）<input id="create-proxy-username" autocomplete="off"></label>
+        <label>住宅密码（可选）<input id="create-proxy-password" type="password" autocomplete="new-password"></label>
         <div class="protocols">
           <label><input type="checkbox" value="vless" checked>VLESS</label>
           <label><input type="checkbox" value="vmess" checked>VMess</label>
@@ -67,6 +81,32 @@
         <button id="create-user">创建</button>
       </div>
       <pre id="create-result">等待操作</pre>
+    </section>
+
+    <section>
+      <div class="section-heading">
+        <h2>用户列表</h2>
+        <button id="refresh-users" class="secondary">刷新</button>
+      </div>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>用户 ID</th><th>协议</th><th>SOCKS5 用户名</th><th>住宅出口</th><th>流量</th><th>状态</th></tr></thead>
+          <tbody id="user-list"><tr><td colspan="6" class="empty">等待加载</td></tr></tbody>
+        </table>
+      </div>
+    </section>
+
+    <section>
+      <div class="section-heading">
+        <h2>节点列表</h2>
+        <button id="refresh-nodes" class="secondary">刷新</button>
+      </div>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>节点</th><th>地址</th><th>状态</th><th>版本</th><th>资源</th><th>用户数</th></tr></thead>
+          <tbody id="node-list"><tr><td colspan="6" class="empty">等待加载</td></tr></tbody>
+        </table>
+      </div>
     </section>
 
     <section>
@@ -112,6 +152,54 @@
       element.className = error ? 'bad' : 'ok';
     }
 
+    function escapeHtml(value) {
+      return String(value ?? '').replace(/[&<>'"]/g, character => ({
+        '&': '&amp;', '<': '&lt;', '>': '&gt;', "'": '&#39;', '"': '&quot;'
+      })[character]);
+    }
+
+    function formatBytes(value) {
+      const bytes = Number(value || 0);
+      if (bytes < 1024) return `${bytes} B`;
+      if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+      if (bytes < 1024 * 1024 * 1024) return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
+      return `${(bytes / 1024 / 1024 / 1024).toFixed(1)} GB`;
+    }
+
+    async function refreshUsers() {
+      const target = document.getElementById('user-list');
+      try {
+        const data = await request('/api/users?page=1&pageSize=100');
+        target.innerHTML = data.items.length ? data.items.map(item => `<tr>
+          <td>${escapeHtml(item.userId)}</td>
+          <td>${escapeHtml(item.protocols.join(', '))}</td>
+          <td>${escapeHtml(item.socksUsername || '-')}</td>
+          <td>${escapeHtml(item.proxyBound ? item.proxyServer : '未绑定')}</td>
+          <td>↑ ${formatBytes(item.upload)} / ↓ ${formatBytes(item.download)}</td>
+          <td class="ok">${escapeHtml(item.status)}</td>
+        </tr>`).join('') : '<tr><td colspan="6" class="empty">暂无用户</td></tr>';
+      } catch (error) {
+        target.innerHTML = `<tr><td colspan="6" class="empty bad">${escapeHtml(error.message)}</td></tr>`;
+      }
+    }
+
+    async function refreshNodes() {
+      const target = document.getElementById('node-list');
+      try {
+        const data = await request('/api/nodes?page=1&pageSize=100');
+        target.innerHTML = data.items.length ? data.items.map(item => `<tr>
+          <td>${escapeHtml(item.name)}<br><small>${escapeHtml(item.nodeId)}</small></td>
+          <td>${escapeHtml(item.domain || item.host)}</td>
+          <td class="${item.status === 'online' ? 'ok' : 'bad'}">${escapeHtml(item.status)}</td>
+          <td>Manager ${escapeHtml(item.managerVersion)}<br>sing-box ${escapeHtml(item.singboxVersion)}</td>
+          <td>CPU ${escapeHtml(item.cpu)}% / 内存 ${escapeHtml(item.memory)}%</td>
+          <td>${escapeHtml(item.userCount)}</td>
+        </tr>`).join('') : '<tr><td colspan="6" class="empty">暂无节点</td></tr>';
+      } catch (error) {
+        target.innerHTML = `<tr><td colspan="6" class="empty bad">${escapeHtml(error.message)}</td></tr>`;
+      }
+    }
+
     async function refresh() {
       try {
         const data = await request('/api/node/status');
@@ -120,6 +208,7 @@
         document.getElementById('cpu').textContent = `${data.cpu}%`;
         document.getElementById('memory').textContent = `${data.memory}%`;
         document.getElementById('connections').textContent = data.connections;
+        await Promise.all([refreshUsers(), refreshNodes()]);
       } catch (error) {
         document.getElementById('singbox').textContent = error.message;
       }
@@ -130,13 +219,35 @@
       refresh();
     };
     document.getElementById('refresh').onclick = refresh;
+    document.getElementById('refresh-users').onclick = refreshUsers;
+    document.getElementById('refresh-nodes').onclick = refreshNodes;
     document.getElementById('create-user').onclick = async () => {
       const protocols = [...document.querySelectorAll('.protocols input:checked')].map(item => item.value);
+      const socksUsername = document.getElementById('create-socks-username').value.trim() || null;
+      const socksPassword = document.getElementById('create-socks-password').value || null;
+      const proxyServer = document.getElementById('create-proxy-server').value.trim();
+      const proxyPort = Number(document.getElementById('create-proxy-port').value);
+      const proxyUsername = document.getElementById('create-proxy-username').value || null;
+      const proxyPassword = document.getElementById('create-proxy-password').value || null;
+      const proxy = proxyServer ? {
+        type: 'socks5',
+        server: proxyServer,
+        port: proxyPort,
+        username: proxyUsername,
+        password: proxyPassword
+      } : null;
       try {
         show('create-result', await request('/api/user/create', {
           method: 'POST',
-          body: JSON.stringify({ userId: document.getElementById('create-user-id').value.trim(), protocols })
+          body: JSON.stringify({
+            userId: document.getElementById('create-user-id').value.trim(),
+            protocols,
+            socksUsername,
+            socksPassword,
+            proxy
+          })
         }));
+        await refreshUsers();
       } catch (error) { show('create-result', error.message, true); }
     };
     document.getElementById('bind-proxy').onclick = async () => {
@@ -154,12 +265,16 @@
             }
           })
         }));
+        await refreshUsers();
       } catch (error) { show('bind-result', error.message, true); }
     };
     document.getElementById('delete-user').onclick = async () => {
       const userId = document.getElementById('delete-user-id').value.trim();
       if (!userId || !confirm(`确认删除用户 ${userId}？`)) return;
-      try { show('delete-result', await request(`/api/user/delete/${encodeURIComponent(userId)}`, { method: 'DELETE' })); }
+      try {
+        show('delete-result', await request(`/api/user/delete/${encodeURIComponent(userId)}`, { method: 'DELETE' }));
+        await refreshUsers();
+      }
       catch (error) { show('delete-result', error.message, true); }
     };
     if (tokenInput.value) refresh();
