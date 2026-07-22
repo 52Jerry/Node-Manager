@@ -17,7 +17,8 @@
     button, a.button { min-height: 38px; border: 0; border-radius: 4px; padding: 0 14px; background: #1261a0; color: #fff; cursor: pointer; text-decoration: none; display: inline-flex; align-items: center; }
     button.secondary, a.secondary { background: #52616b; }
     button.danger { background: #a93226; }
-    .status-grid { display: grid; grid-template-columns: repeat(5, minmax(120px, 1fr)); gap: 12px; margin-bottom: 24px; }
+    button.compact { min-height: 30px; padding: 0 10px; font-size: 12px; }
+    .status-grid { display: grid; grid-template-columns: repeat(6, minmax(120px, 1fr)); gap: 12px; margin-bottom: 24px; }
     .metric { background: #fff; border: 1px solid #dbe1e6; border-radius: 6px; padding: 14px; min-height: 88px; }
     .metric span { display: block; color: #65737e; font-size: 12px; margin-bottom: 10px; }
     .metric strong { font-size: 20px; overflow-wrap: anywhere; }
@@ -60,7 +61,8 @@
       <div class="metric"><span>sing-box</span><strong id="singbox">-</strong></div>
       <div class="metric"><span>CPU</span><strong id="cpu">-</strong></div>
       <div class="metric"><span>内存</span><strong id="memory">-</strong></div>
-      <div class="metric"><span>连接数</span><strong id="connections">-</strong></div>
+      <div class="metric"><span>代理活跃连接</span><strong id="connections">-</strong></div>
+      <div class="metric"><span>整机网络套接字</span><strong id="system-connections">-</strong></div>
     </div>
 
     <section>
@@ -90,10 +92,11 @@
       </div>
       <div class="table-wrap">
         <table>
-          <thead><tr><th>用户 ID</th><th>协议</th><th>SOCKS5 用户名</th><th>住宅出口</th><th>流量</th><th>状态</th></tr></thead>
-          <tbody id="user-list"><tr><td colspan="6" class="empty">等待加载</td></tr></tbody>
+          <thead><tr><th>用户 ID</th><th>协议</th><th>SOCKS5 用户名</th><th>住宅出口</th><th>流量</th><th>状态</th><th>操作</th></tr></thead>
+          <tbody id="user-list"><tr><td colspan="7" class="empty">等待加载</td></tr></tbody>
         </table>
       </div>
+      <pre id="connection-result">点击用户的“连接信息”查看 VLESS、VMess 和 SOCKS5 地址</pre>
     </section>
 
     <section>
@@ -177,9 +180,21 @@
           <td>${escapeHtml(item.proxyBound ? item.proxyServer : '未绑定')}</td>
           <td>↑ ${formatBytes(item.upload)} / ↓ ${formatBytes(item.download)}</td>
           <td class="ok">${escapeHtml(item.status)}</td>
-        </tr>`).join('') : '<tr><td colspan="6" class="empty">暂无用户</td></tr>';
+          <td><button class="secondary compact connection-button" data-user-id="${escapeHtml(item.userId)}">连接信息</button></td>
+        </tr>`).join('') : '<tr><td colspan="7" class="empty">暂无用户</td></tr>';
+        target.querySelectorAll('.connection-button').forEach(button => {
+          button.onclick = () => showConnections(button.dataset.userId);
+        });
       } catch (error) {
-        target.innerHTML = `<tr><td colspan="6" class="empty bad">${escapeHtml(error.message)}</td></tr>`;
+        target.innerHTML = `<tr><td colspan="7" class="empty bad">${escapeHtml(error.message)}</td></tr>`;
+      }
+    }
+
+    async function showConnections(userId) {
+      try {
+        show('connection-result', await request(`/api/user/${encodeURIComponent(userId)}/connections`));
+      } catch (error) {
+        show('connection-result', error.message, true);
       }
     }
 
@@ -192,7 +207,7 @@
           <td>${escapeHtml(item.domain || item.host)}</td>
           <td class="${item.status === 'online' ? 'ok' : 'bad'}">${escapeHtml(item.status)}</td>
           <td>Manager ${escapeHtml(item.managerVersion)}<br>sing-box ${escapeHtml(item.singboxVersion)}</td>
-          <td>CPU ${escapeHtml(item.cpu)}% / 内存 ${escapeHtml(item.memory)}%</td>
+          <td>CPU ${escapeHtml(item.cpu)}% / 内存 ${escapeHtml(item.memory)}%<br>代理连接 ${escapeHtml(item.connections)} / 系统套接字 ${escapeHtml(item.systemConnections)}</td>
           <td>${escapeHtml(item.userCount)}</td>
         </tr>`).join('') : '<tr><td colspan="6" class="empty">暂无节点</td></tr>';
       } catch (error) {
@@ -208,6 +223,7 @@
         document.getElementById('cpu').textContent = `${data.cpu}%`;
         document.getElementById('memory').textContent = `${data.memory}%`;
         document.getElementById('connections').textContent = data.connections;
+        document.getElementById('system-connections').textContent = data.systemConnections;
         await Promise.all([refreshUsers(), refreshNodes()]);
       } catch (error) {
         document.getElementById('singbox').textContent = error.message;

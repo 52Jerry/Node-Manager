@@ -9,5 +9,6 @@ from .request import (
     ReloadResponse,
     TrafficResponse,
     TrafficTotals,
+    UserConnectionResponse,
     UserListResponse,
 )

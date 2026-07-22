@@ -24,6 +24,7 @@ from models.request import (
     OperationResponse,
     ReloadResponse,
     TrafficResponse,
+    UserConnectionResponse,
     UserListResponse,
 )
 from monitor.status import get_node_status
@@ -41,6 +42,7 @@ from singbox.manager import (
     create_user,
     delete_user,
     ensure_user_outbounds,
+    get_user_connection,
     is_api_available,
     list_users,
     reload_singbox,
@@ -54,7 +56,7 @@ logging.basicConfig(
 
 app = FastAPI(
     title="Python Node Manager API",
-    version="1.3.0",
+    version="1.4.0",
     description="Single-node sing-box agent API for a Spring Boot multi-node control plane.",
 )
 
@@ -167,6 +169,22 @@ def get_users(
     return {"items": page_items, "page": page, "pageSize": pageSize, "total": total}
 
 
+@app.get(
+    "/api/user/{userId}/connections",
+    response_model=UserConnectionResponse,
+    tags=["users"],
+)
+def get_user_connections(
+    userId: str,
+    response: Response,
+    _token: str = Depends(verify_token),
+):
+    if not userId or len(userId) > 64:
+        raise HTTPException(status_code=422, detail="invalid userId")
+    response.headers["Cache-Control"] = "no-store"
+    return get_user_connection(userId)
+
+
 @app.post("/api/user/bind-proxy", response_model=OperationResponse, tags=["users"])
 def bind_proxy_endpoint(
     request: BindProxyRequest,
@@ -242,6 +260,7 @@ def get_agent_info(_token: str = Depends(verify_token)):
             "user.create",
             "user.delete",
             "user.list",
+            "user.connections",
             "proxy.bind",
             "traffic.sampled",
             "node.heartbeat",
@@ -278,6 +297,7 @@ def get_agent_heartbeat(_token: str = Depends(verify_token)):
         "cpu": current["cpu"],
         "memory": current["memory"],
         "connections": current["connections"],
+        "systemConnections": current["systemConnections"],
         "userCount": len(list_users()),
         "traffic": get_traffic_totals(),
         "reportedAt": datetime.now(timezone.utc),
@@ -330,6 +350,7 @@ def get_nodes(
         "cpu": current["cpu"],
         "memory": current["memory"],
         "connections": current["connections"],
+        "systemConnections": current["systemConnections"],
         "userCount": len(list_users()),
         "apiAvailable": is_api_available(),
         "lastHeartbeatAt": datetime.now(timezone.utc),

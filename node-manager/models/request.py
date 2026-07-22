@@ -62,6 +62,10 @@ class CreateUserResponse(BaseModel):
     proxyBound: bool = False
 
 
+class UserConnectionResponse(CreateUserResponse):
+    createdAt: datetime | None = None
+
+
 class OperationResponse(BaseModel):
     success: bool
     userId: str | None = None
@@ -76,6 +80,7 @@ class NodeStatusResponse(BaseModel):
     cpu: float
     memory: float
     connections: int
+    systemConnections: int
     api_available: bool
 
 
@@ -125,6 +130,7 @@ class NodeSummary(BaseModel):
     cpu: float
     memory: float
     connections: int
+    systemConnections: int
     userCount: int
     apiAvailable: bool
     lastHeartbeatAt: datetime
@@ -169,6 +175,7 @@ class AgentHeartbeatResponse(BaseModel):
     cpu: float
     memory: float
     connections: int
+    systemConnections: int
     userCount: int
     traffic: TrafficTotals
     reportedAt: datetime

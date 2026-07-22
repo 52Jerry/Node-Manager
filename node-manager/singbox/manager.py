@@ -250,6 +250,48 @@ def _reality_client_options(inbound: dict[str, Any]) -> tuple[str, str, str]:
     return _base64url(public_raw), str(short_ids[0]), str(server_name)
 
 
+def _vless_connection(user_id: str, user_uuid: str, inbound: dict[str, Any]) -> str:
+    public_key, short_id, server_name = _reality_client_options(inbound)
+    port = int(inbound["listen_port"])
+    return (
+        f"vless://{user_uuid}@{config.node.host}:{port}"
+        f"?encryption=none&flow=xtls-rprx-vision&type=tcp&security=reality"
+        f"&pbk={public_key}&sid={short_id}&sni={server_name}&fp=chrome"
+        f"#{user_id}"
+    )
+
+
+def _vmess_connection(user_id: str, user_uuid: str, inbound: dict[str, Any]) -> str:
+    vmess = {
+        "v": "2",
+        "ps": user_id,
+        "add": config.node.host,
+        "port": str(inbound["listen_port"]),
+        "id": user_uuid,
+        "aid": "0",
+        "net": "tcp",
+        "type": "none",
+        "host": "",
+        "path": "",
+        "tls": "",
+    }
+    encoded = base64.b64encode(
+        json.dumps(vmess, separators=(",", ":")).encode("utf-8")
+    ).decode("ascii")
+    return f"vmess://{encoded}"
+
+
+def _socks_connection(
+    username: str, password: str, inbound: dict[str, Any]
+) -> dict[str, Any]:
+    return {
+        "host": config.node.host,
+        "port": int(inbound["listen_port"]),
+        "username": username,
+        "password": password,
+    }
+
+
 def create_user(
     user_id: str,
     protocols: list[str],
@@ -284,47 +326,21 @@ def create_user(
             inbound["users"].append(
                 {"name": auth_name, "uuid": user_uuid, "flow": "xtls-rprx-vision"}
             )
-            public_key, short_id, server_name = _reality_client_options(inbound)
-            port = int(inbound["listen_port"])
-            response["vless"] = (
-                f"vless://{user_uuid}@{config.node.host}:{port}"
-                f"?encryption=none&flow=xtls-rprx-vision&type=tcp&security=reality"
-                f"&pbk={public_key}&sid={short_id}&sni={server_name}&fp=chrome"
-                f"#{user_id}"
-            )
+            response["vless"] = _vless_connection(user_id, user_uuid, inbound)
 
         if "vmess" in protocols:
             inbound = _find_inbound(data, config.singbox.vmess_tag)
             inbound["users"].append({"name": auth_name, "uuid": user_uuid})
-            vmess = {
-                "v": "2",
-                "ps": user_id,
-                "add": config.node.host,
-                "port": str(inbound["listen_port"]),
-                "id": user_uuid,
-                "aid": "0",
-                "net": "tcp",
-                "type": "none",
-                "host": "",
-                "path": "",
-                "tls": "",
-            }
-            encoded = base64.b64encode(
-                json.dumps(vmess, separators=(",", ":")).encode("utf-8")
-            ).decode("ascii")
-            response["vmess"] = f"vmess://{encoded}"
+            response["vmess"] = _vmess_connection(user_id, user_uuid, inbound)
 
         if "socks" in protocols:
             inbound = _find_inbound(data, config.singbox.socks_tag)
             inbound["users"].append(
                 {"username": effective_socks_username, "password": effective_socks_password}
             )
-            response["socks"] = {
-                "host": config.node.host,
-                "port": int(inbound["listen_port"]),
-                "username": effective_socks_username,
-                "password": effective_socks_password,
-            }
+            response["socks"] = _socks_connection(
+                effective_socks_username, effective_socks_password, inbound
+            )
 
         registry.setdefault("users", {})[user_id] = {
             "socksUsername": effective_socks_username if "socks" in protocols else None,
@@ -517,3 +533,87 @@ def list_users() -> list[dict[str, Any]]:
         result.append(item)
 
     return sorted(result, key=lambda item: item["userId"].lower())
+
+
+def get_user_connection(user_id: str) -> dict[str, Any]:
+    with _config_lock():
+        data = read_config()
+        registry = read_registry()
+
+    metadata = _registry_user(registry, user_id)
+    auth_name = _auth_name(user_id)
+    socks_username = metadata.get("socksUsername")
+    protocols: list[str] = []
+    user_uuid: str | None = None
+    response: dict[str, Any] = {
+        "success": True,
+        "userId": user_id,
+        "uuid": "",
+        "protocols": protocols,
+        "vless": None,
+        "vmess": None,
+        "socks": None,
+        "proxyBound": False,
+        "createdAt": metadata.get("createdAt"),
+    }
+
+    for inbound in data.get("inbounds", []):
+        tag = inbound.get("tag")
+        if tag == config.singbox.vless_tag:
+            user = next(
+                (
+                    item
+                    for item in inbound.get("users", [])
+                    if item.get("name") == auth_name
+                ),
+                None,
+            )
+            if user:
+                user_uuid = str(user.get("uuid") or "")
+                protocols.append("vless")
+                response["vless"] = _vless_connection(user_id, user_uuid, inbound)
+        elif tag == config.singbox.vmess_tag:
+            user = next(
+                (
+                    item
+                    for item in inbound.get("users", [])
+                    if item.get("name") == auth_name
+                ),
+                None,
+            )
+            if user:
+                vmess_uuid = str(user.get("uuid") or "")
+                user_uuid = user_uuid or vmess_uuid
+                protocols.append("vmess")
+                response["vmess"] = _vmess_connection(user_id, vmess_uuid, inbound)
+        elif tag == config.singbox.socks_tag and socks_username:
+            user = next(
+                (
+                    item
+                    for item in inbound.get("users", [])
+                    if item.get("username") == socks_username
+                ),
+                None,
+            )
+            if user:
+                protocols.append("socks")
+                response["socks"] = _socks_connection(
+                    str(user.get("username") or ""),
+                    str(user.get("password") or ""),
+                    inbound,
+                )
+
+    if not protocols:
+        raise SingboxConfigError(f"user not found: {user_id}")
+
+    outbound = next(
+        (
+            item
+            for item in data.get("outbounds", [])
+            if item.get("tag") == f"{USER_OUTBOUND_PREFIX}{user_id}"
+        ),
+        None,
+    )
+    response["uuid"] = user_uuid or ""
+    response["proxyBound"] = bool(outbound and outbound.get("type") == "socks")
+    return response

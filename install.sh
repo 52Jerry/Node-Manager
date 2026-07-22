@@ -11,6 +11,13 @@ TEMP_DIR=""
 APP_VERSION=""
 INSTALLED_APP_VERSION=""
 UPDATE_NODE_MANAGER=1
+FRESH_SINGBOX_CONFIG=0
+TEST_USER_ID="node-manager-test"
+TEST_USER_UUID=""
+TEST_SOCKS_USER=""
+TEST_SOCKS_PASSWORD=""
+TEST_VLESS_URL=""
+TEST_VMESS_URL=""
 
 log() { printf '[node-manager] %s\n' "$*"; }
 fail() { printf '[node-manager] ERROR: %s\n' "$*" >&2; exit 1; }
@@ -90,12 +97,16 @@ if [ -f "$SINGBOX_CONFIG" ]; then
   EXISTING_SECRET="$(jq -r '.experimental.clash_api.secret // empty' "$SINGBOX_CONFIG")"
   [ -z "$EXISTING_SECRET" ] || API_SECRET="$EXISTING_SECRET"
 else
-  UUID="$(sing-box generate uuid)"
+  FRESH_SINGBOX_CONFIG=1
+  TEST_USER_UUID="$(sing-box generate uuid)"
   REALITY_KEYS="$(sing-box generate reality-keypair)"
   PRIVATE_KEY="$(printf '%s\n' "$REALITY_KEYS" | awk '/PrivateKey/ {print $2}')"
+  PUBLIC_KEY="$(printf '%s\n' "$REALITY_KEYS" | awk '/PublicKey/ {print $2}')"
   SHORT_ID="$(openssl rand -hex 4)"
-  SOCKS_BOOTSTRAP_USER="node-manager-bootstrap"
-  SOCKS_BOOTSTRAP_PASSWORD="$(openssl rand -base64 24 | tr -d '\n')"
+  TEST_SOCKS_USER="$TEST_USER_ID"
+  TEST_SOCKS_PASSWORD="$(openssl rand -base64 24 | tr -d '\n')"
+  SOCKS_BOOTSTRAP_USER="$TEST_SOCKS_USER"
+  SOCKS_BOOTSTRAP_PASSWORD="$TEST_SOCKS_PASSWORD"
   cat > "$SINGBOX_CONFIG" <<EOF
 {
   "log": {"level": "info"},
@@ -115,7 +126,7 @@ else
       "tag": "vless-reality",
       "listen": "0.0.0.0",
       "listen_port": 20168,
-      "users": [{"uuid": "$UUID", "flow": "xtls-rprx-vision"}],
+      "users": [{"name": "node-manager:$TEST_USER_ID", "uuid": "$TEST_USER_UUID", "flow": "xtls-rprx-vision"}],
       "tls": {
         "enabled": true,
         "server_name": "www.cloudflare.com",
@@ -132,20 +143,29 @@ else
       "tag": "vmess",
       "listen": "0.0.0.0",
       "listen_port": 20169,
-      "users": [{"uuid": "$UUID"}]
+      "users": [{"name": "node-manager:$TEST_USER_ID", "uuid": "$TEST_USER_UUID"}]
     },
     {
       "type": "socks",
       "tag": "socks",
       "listen": "0.0.0.0",
       "listen_port": 5001,
-      "users": [{"username": "$SOCKS_BOOTSTRAP_USER", "password": "$SOCKS_BOOTSTRAP_PASSWORD"}]
+      "users": [{"username": "$TEST_SOCKS_USER", "password": "$TEST_SOCKS_PASSWORD"}]
     }
   ],
-  "outbounds": [{"type": "direct", "tag": "direct"}],
-  "route": {"final": "direct"}
+  "outbounds": [
+    {"type": "direct", "tag": "direct"},
+    {"type": "direct", "tag": "node-manager-out:$TEST_USER_ID"}
+  ],
+  "route": {
+    "rules": [{"auth_user": ["node-manager:$TEST_USER_ID", "$TEST_SOCKS_USER"], "action": "route", "outbound": "node-manager-out:$TEST_USER_ID"}],
+    "final": "direct"
+  }
 }
 EOF
+  TEST_VLESS_URL="vless://$TEST_USER_UUID@$SERVER_IP:20168?encryption=none&flow=xtls-rprx-vision&type=tcp&security=reality&pbk=$PUBLIC_KEY&sid=$SHORT_ID&sni=www.cloudflare.com&fp=chrome#$TEST_USER_ID"
+  TEST_VMESS_JSON="$(jq -nc --arg ps "$TEST_USER_ID" --arg add "$SERVER_IP" --arg id "$TEST_USER_UUID" '{v:"2",ps:$ps,add:$add,port:"20169",id:$id,aid:"0",net:"tcp",type:"none",host:"",path:"",tls:""}')"
+  TEST_VMESS_URL="vmess://$(printf '%s' "$TEST_VMESS_JSON" | base64 -w 0)"
 fi
 
 for tag in vless-reality vmess socks; do
@@ -196,6 +216,15 @@ fi
 
 install -d -m 0750 "$CONFIG_DIR"
 install -d -o root -g root -m 0750 /var/lib/node-manager
+if [ "$FRESH_SINGBOX_CONFIG" -eq 1 ] && [ ! -f /var/lib/node-manager/users.json ]; then
+  jq -n \
+    --arg user_id "$TEST_USER_ID" \
+    --arg socks_username "$TEST_SOCKS_USER" \
+    --arg created_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+    '{version: 1, users: {($user_id): {socksUsername: $socks_username, createdAt: $created_at}}}' \
+    > /var/lib/node-manager/users.json
+  chmod 0600 /var/lib/node-manager/users.json
+fi
 for state_file in users.json traffic.json idempotency.json; do
   if [ -f "/var/lib/node-manager/$state_file" ]; then
     chmod 0600 "/var/lib/node-manager/$state_file"
@@ -283,11 +312,14 @@ API token: $NODE_TOKEN
 Clash API: http://127.0.0.1:9090 (local only)
 Clash API secret: $API_SECRET
 EOF
-if [ -n "$SOCKS_BOOTSTRAP_USER" ]; then
+if [ "$FRESH_SINGBOX_CONFIG" -eq 1 ]; then
   cat >> "$INFO_FILE" <<EOF
-Bootstrap SOCKS5: $SERVER_IP:5001
-Bootstrap SOCKS5 username: $SOCKS_BOOTSTRAP_USER
-Bootstrap SOCKS5 password: $SOCKS_BOOTSTRAP_PASSWORD
+Test user: $TEST_USER_ID
+Test VLESS: $TEST_VLESS_URL
+Test VMess: $TEST_VMESS_URL
+Test SOCKS5: $SERVER_IP:5001
+Test SOCKS5 username: $TEST_SOCKS_USER
+Test SOCKS5 password: $TEST_SOCKS_PASSWORD
 EOF
 fi
 chmod 0600 "$INFO_FILE"

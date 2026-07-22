@@ -1,6 +1,6 @@
 # Python Node Manager API 接口文档
 
-当前版本：`1.3.0`
+当前版本：`1.4.0`
 
 部署节点：`http://198.13.46.231:8088`
 
@@ -9,7 +9,7 @@
 - Swagger UI：`http://198.13.46.231:8088/docs`
 - OpenAPI JSON：`http://198.13.46.231:8088/openapi.json`
 
-> `1.3.0` 将 Node Manager 定位为单服务器 Agent。它提供标准心跳快照；多节点注册、心跳调度和离线判定由 Spring Boot 控制面负责。
+> `1.4.0` 将 Node Manager 定位为单服务器 Agent。它提供标准心跳快照、代理连接统计和用户连接详情；多节点注册、心跳调度和离线判定由 Spring Boot 控制面负责。
 
 ## 1. 快速接入
 
@@ -96,10 +96,13 @@ curl http://198.13.46.231:8088/api/node/status \
   "singbox": "running",
   "cpu": 3.2,
   "memory": 12.6,
-  "connections": 41,
+  "connections": 2,
+  "systemConnections": 41,
   "api_available": true
 }
 ```
+
+`connections` 是 sing-box Clash API 当前返回的活跃代理连接数。`systemConnections` 是操作系统当前全部网络套接字数量，包含 SSH、Node Manager API、DNS 和其他进程连接，不能当作代理用户在线数。
 
 ### 2.3 创建用户
 
@@ -221,6 +224,31 @@ curl 'http://198.13.46.231:8088/api/users?page=1&pageSize=20' \
 }
 ```
 
+#### `GET /api/user/{userId}/connections`
+
+按用户读取完整 VLESS、VMess 和 SOCKS5 连接信息。该接口按需返回 SOCKS5 密码，要求 Bearer Token，并返回 `Cache-Control: no-store`；不要把响应写入普通业务日志。
+
+```json
+{
+  "success": true,
+  "userId": "user-10001",
+  "uuid": "19cbb87d-a20f-40f2-89a8-d92332c46999",
+  "protocols": ["vless", "vmess", "socks"],
+  "vless": "vless://...",
+  "vmess": "vmess://...",
+  "socks": {
+    "host": "198.13.46.231",
+    "port": 5001,
+    "username": "residential-user",
+    "password": "residential-password"
+  },
+  "proxyBound": true,
+  "createdAt": "2026-07-22T10:00:00Z"
+}
+```
+
+Node Manager 管理页提供“连接信息”按钮，点击后才读取并显示完整连接信息；批量用户列表仍不返回密码。
+
 ### 2.5 节点列表
 
 #### `GET /api/nodes?page=1&pageSize=20&status=online`
@@ -240,7 +268,7 @@ curl 'http://198.13.46.231:8088/api/nodes?page=1&pageSize=20' \
       "name": "sing-box-node",
       "host": "198.13.46.231",
       "domain": null,
-      "managerVersion": "1.3.0",
+      "managerVersion": "1.4.0",
       "singboxVersion": "1.13.14",
       "status": "online",
       "singbox": "running",
@@ -373,12 +401,13 @@ Spring Boot 接入节点时先调用该接口，确认版本和能力：
 {
   "agent": "node-manager",
   "apiVersion": "v1",
-  "managerVersion": "1.3.0",
+  "managerVersion": "1.4.0",
   "nodeId": "vultr",
   "capabilities": [
     "user.create",
     "user.delete",
     "user.list",
+    "user.connections",
     "proxy.bind",
     "traffic.sampled",
     "node.heartbeat",
@@ -408,13 +437,14 @@ Spring Boot 建议每 15 到 30 秒轮询一次，并在连续 3 次失败或超
   "name": "sing-box-node",
   "host": "198.13.46.231",
   "status": "online",
-  "managerVersion": "1.3.0",
+  "managerVersion": "1.4.0",
   "singboxVersion": "1.13.14",
   "singbox": "running",
   "apiAvailable": true,
   "cpu": 3.2,
   "memory": 12.6,
-  "connections": 41,
+  "connections": 2,
+  "systemConnections": 41,
   "userCount": 1,
   "traffic": {
     "upload": 1024,
@@ -506,13 +536,17 @@ api.example.com {
 - ✔ 管理页支持填写 SOCKS5 凭据并查看用户、节点列表
 - ✔ 下一阶段核心接口自动化回归测试
 - ✔ `1.3.0` Agent 能力声明和标准心跳快照
+- ✔ `1.4.0` 代理连接统计、用户三协议连接详情和全新安装测试用户
 - ✔ 创建、绑定、删除写接口支持持久化 `Idempotency-Key`
 - ✔ 每个用户使用稳定的唯一出站标签，兼容旧用户自动迁移
 - ✔ 用户级上传、下载、累计流量采样和持久化
+- ✔ 活跃代理连接数与整机网络套接字分开统计
+- ✔ 用户详情接口和管理页按需展示 VLESS、VMess、SOCKS5 连接信息
+- ✔ 全新安装时自动登记一个三协议 `node-manager-test` 测试用户
 - ✔ 用户数据和流量数据使用权限 `600` 的本地文件保存
 - ✔ 包含 SOCKS 凭据的幂等响应加密后持久化
 - ✔ 明确 Node Manager 与 Spring Boot 控制面的职责边界
-- ✔ 13 项节点端自动化回归测试
+- ✔ 14 项节点端自动化回归测试
 
 ### Spring Boot 控制面下一阶段
 

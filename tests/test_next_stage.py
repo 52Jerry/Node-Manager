@@ -45,6 +45,7 @@ importlib.reload(config_module)
 import singbox.manager as manager
 import idempotency
 import main
+import monitor.status as status_monitor
 import monitor.traffic as traffic
 from models.request import CreateUserRequest
 
@@ -142,6 +143,14 @@ class ManagerTestCase(unittest.TestCase):
         self.assertTrue(users[0]["proxyBound"])
         self.assertEqual(users[0]["proxyServer"], "203.0.113.20:1080")
 
+        connection = manager.get_user_connection("customer-1")
+        self.assertEqual(connection["protocols"], ["vless", "vmess", "socks"])
+        self.assertEqual(connection["uuid"], created["uuid"])
+        self.assertEqual(connection["vless"], created["vless"])
+        self.assertEqual(connection["vmess"], created["vmess"])
+        self.assertEqual(connection["socks"], created["socks"])
+        self.assertTrue(connection["proxyBound"])
+
         manager.delete_user("customer-1")
         data = json.loads(self.config_path.read_text(encoding="utf-8"))
         self.assertEqual(sum(len(item["users"]) for item in data["inbounds"]), 0)
@@ -164,6 +173,11 @@ class ManagerTestCase(unittest.TestCase):
         )
         self.assertEqual(outbound["type"], "direct")
         self.assertFalse(manager.list_users()[0]["proxyBound"])
+
+        connection = manager.get_user_connection("customer-2")
+        self.assertEqual(connection["protocols"], ["socks"])
+        self.assertEqual(connection["socks"]["username"], "residential-user-2")
+        self.assertEqual(connection["socks"]["password"], created["socks"]["password"])
 
     def test_create_can_atomically_bind_proxy_and_reuse_credentials(self):
         created = manager.create_user(
@@ -282,6 +296,14 @@ class ApiTestCase(unittest.TestCase):
         self.assertEqual(response.json()["items"][0]["userId"], "api-user")
         self.assertNotIn("password", response.text.lower())
 
+        response = self.client.get(
+            "/api/user/api-user/connections", headers=headers
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.headers["Cache-Control"], "no-store")
+        self.assertEqual(response.json()["socks"]["username"], "api-socks-user")
+        self.assertTrue(response.json()["socks"]["password"])
+
     def test_create_user_endpoint_can_bind_proxy(self):
         headers = {"Authorization": "Bearer test-token"}
         response = self.client.post(
@@ -344,6 +366,7 @@ class ApiTestCase(unittest.TestCase):
                     "cpu": 1.5,
                     "memory": 2.5,
                     "connections": 3,
+                    "systemConnections": 8,
                 },
             ),
             patch.object(main, "_singbox_version", return_value="1.13.14"),
@@ -354,8 +377,10 @@ class ApiTestCase(unittest.TestCase):
         body = response.json()
         self.assertEqual(body["total"], 1)
         self.assertEqual(body["items"][0]["nodeId"], "test-node")
-        self.assertEqual(body["items"][0]["managerVersion"], "1.3.0")
+        self.assertEqual(body["items"][0]["managerVersion"], "1.4.0")
         self.assertEqual(body["items"][0]["singboxVersion"], "1.13.14")
+        self.assertEqual(body["items"][0]["connections"], 3)
+        self.assertEqual(body["items"][0]["systemConnections"], 8)
 
     def test_agent_contract_and_heartbeat(self):
         headers = {"Authorization": "Bearer test-token"}
@@ -377,6 +402,7 @@ class ApiTestCase(unittest.TestCase):
                     "cpu": 1.5,
                     "memory": 2.5,
                     "connections": 3,
+                    "systemConnections": 8,
                 },
             ),
             patch.object(main, "_singbox_version", return_value="1.13.14"),
@@ -397,7 +423,19 @@ class ApiTestCase(unittest.TestCase):
             heartbeat = self.client.get("/api/agent/heartbeat", headers=headers)
         self.assertEqual(heartbeat.status_code, 200, heartbeat.text)
         self.assertEqual(heartbeat.json()["status"], "online")
+        self.assertEqual(heartbeat.json()["connections"], 3)
+        self.assertEqual(heartbeat.json()["systemConnections"], 8)
         self.assertEqual(heartbeat.json()["traffic"]["total"], 30)
+
+
+class StatusTestCase(unittest.TestCase):
+    def test_proxy_connections_are_counted_from_clash_api(self):
+        with patch.object(
+            status_monitor.singbox_api,
+            "get_connections",
+            return_value={"connections": [{"id": "a"}, {"id": "b"}]},
+        ):
+            self.assertEqual(status_monitor.get_proxy_connections(), 2)
 
 
 class TrafficTestCase(unittest.TestCase):
