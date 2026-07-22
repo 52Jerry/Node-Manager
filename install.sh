@@ -196,7 +196,7 @@ fi
 
 install -d -m 0750 "$CONFIG_DIR"
 if [ -f "$CONFIG_DIR/config.yaml" ]; then
-  EXISTING_TOKEN="$(awk '/^[[:space:]]*token:/ {print $2; exit}' "$CONFIG_DIR/config.yaml")"
+  EXISTING_TOKEN="$(awk '/^[[:space:]]*token:/ {print $2; exit}' "$CONFIG_DIR/config.yaml" | tr -d '"' | tr -d "'")"
   [ -z "$EXISTING_TOKEN" ] || NODE_TOKEN="$EXISTING_TOKEN"
 fi
 cat > "$CONFIG_DIR/config.yaml" <<EOF
@@ -223,7 +223,6 @@ cat > "$SERVICE_FILE" <<'EOF'
 Description=Python Node Manager
 After=network-online.target sing-box.service
 Wants=network-online.target
-Requires=sing-box.service
 
 [Service]
 Type=simple
@@ -253,9 +252,7 @@ ufw --force enable >/dev/null
 systemctl daemon-reload
 systemctl enable sing-box node-manager >/dev/null
 systemctl restart sing-box
-if [ "$UPDATE_NODE_MANAGER" -eq 1 ] || ! systemctl is-active --quiet node-manager; then
-  systemctl restart node-manager
-fi
+systemctl restart node-manager
 
 for _ in $(seq 1 20); do
   curl -fsS http://127.0.0.1:8088/health >/dev/null && break
