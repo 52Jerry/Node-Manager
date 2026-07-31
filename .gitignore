@@ -24,4 +24,4 @@ dist/
 .cache/
 .vscode/
 .idea/
-*.md
+node-manager/logs/

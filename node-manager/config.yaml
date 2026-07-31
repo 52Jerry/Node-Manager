@@ -7,7 +7,7 @@ server:
   port: 8088
 
 security:
-  token: abc123456789
+  token: CHANGE_ME
 
 singbox:
   config: ./singbox/config.json

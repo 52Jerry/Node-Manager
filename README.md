@@ -45,6 +45,12 @@ Python Node Manager 是部署在每台 sing-box 节点服务器上的管理 Agen
 - **配置管理**: PyYAML
 - **认证**: HTTP Bearer Token
 
+## 项目文档
+
+- [API 接口文档](doc/API接口文档.md)
+- [Node Manager 开发文档](doc/Python-Node-Manager-开发文档.md)
+- [sing-box 架构方案](doc/singbox架构方案.md)
+
 ## 项目结构
 
 ```
@@ -134,6 +140,7 @@ chmod +x install.sh
 | `/api/nodes` | GET | 获取节点列表 |
 | `/api/users` | GET | 获取用户列表 |
 | `/api/user/create` | POST | 创建用户，可指定 SOCKS5 账号密码 |
+| `/api/user/{userId}/connections` | GET | 按需获取 VLESS、VMess、SOCKS5 完整连接信息 |
 | `/api/user/bind-proxy` | POST | 绑定住宅代理 |
 | `/api/user/delete/{userId}` | DELETE | 删除用户 |
 | `/api/user/{userId}/traffic` | GET | 获取用户流量 |
@@ -175,6 +182,14 @@ Node Manager 只管理当前服务器。节点注册、定时心跳、离线判�
 curl -H "Authorization: Bearer YOUR_TOKEN" "http://node-ip:8088/api/users?page=1&pageSize=20"
 curl -H "Authorization: Bearer YOUR_TOKEN" "http://node-ip:8088/api/nodes?page=1&pageSize=20"
 ```
+
+**查询用户连接信息**
+```bash
+curl -H "Authorization: Bearer YOUR_TOKEN" \
+     http://node-ip:8088/api/user/10001/connections
+```
+
+该接口会返回完整 VLESS、VMess 和 SOCKS5 凭据，响应使用 `Cache-Control: no-store`。不要把响应写入普通业务日志。
 
 **绑定代理**
 ```bash
@@ -244,8 +259,9 @@ Clash API 仅监听 `127.0.0.1`，用于连接和流量指标采集：
 
 访问 `http://localhost:8088` 即可打开管理界面：
 
-- 📊 状态监控：节点状态、CPU、内存、连接数
+- 📊 状态监控：节点状态、CPU、内存、代理活跃连接、整机网络套接字
 - 👥 用户管理：创建、删除用户
+- 🔑 连接信息：按需查看用户 VLESS、VMess、SOCKS5 连接参数
 - ➕ 创建用户：选择协议类型，自动生成配置
 - 🔗 绑定代理：配置住宅 SOCKS5 出口
 - 🔄 重启服务：一键重启 sing-box
