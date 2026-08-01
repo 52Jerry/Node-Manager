@@ -8,6 +8,7 @@ SINGBOX_CONFIG="/etc/sing-box/config.json"
 SERVICE_FILE="/etc/systemd/system/node-manager.service"
 REPO_ARCHIVE_URL="${NODE_MANAGER_ARCHIVE_URL:-https://github.com/52Jerry/Node-Manager/archive/refs/heads/main.tar.gz}"
 TEMP_DIR=""
+REGISTRATION_TEMP_DIR=""
 APP_VERSION=""
 INSTALLED_APP_VERSION=""
 UPDATE_NODE_MANAGER=1
@@ -18,10 +19,16 @@ TEST_SOCKS_USER=""
 TEST_SOCKS_PASSWORD=""
 TEST_VLESS_URL=""
 TEST_VMESS_URL=""
+CONTROL_PLANE_REGISTRATION_STATUS="not-configured"
+CONTROL_PLANE_NODE_ID=""
+CONTROL_PLANE_RESPONSE=""
 
 log() { printf '[node-manager] %s\n' "$*"; }
 fail() { printf '[node-manager] ERROR: %s\n' "$*" >&2; exit 1; }
-cleanup() { [ -z "$TEMP_DIR" ] || rm -rf -- "$TEMP_DIR"; }
+cleanup() {
+  [ -z "$REGISTRATION_TEMP_DIR" ] || rm -rf -- "$REGISTRATION_TEMP_DIR"
+  [ -z "$TEMP_DIR" ] || rm -rf -- "$TEMP_DIR"
+}
 trap cleanup EXIT
 
 [ "${EUID}" -eq 0 ] || fail "run this installer as root"
@@ -234,10 +241,19 @@ if [ -f "$CONFIG_DIR/config.yaml" ]; then
   EXISTING_TOKEN="$(awk '/^[[:space:]]*token:/ {print $2; exit}' "$CONFIG_DIR/config.yaml" | tr -d '"' | tr -d "'")"
   [ -z "$EXISTING_TOKEN" ] || NODE_TOKEN="$EXISTING_TOKEN"
 fi
+EXISTING_NODE_ID=""
+if [ -f "$CONFIG_DIR/config.yaml" ]; then
+  EXISTING_NODE_ID="$(awk '
+    /^[^[:space:]]/ {section = ($1 == "node:") ? "node" : ""}
+    section == "node" && /^[[:space:]]+id:/ {print $2; exit}
+  ' "$CONFIG_DIR/config.yaml" | tr -d '"' | tr -d "'")"
+fi
+NODE_ID="${NODE_MANAGER_NODE_ID:-${EXISTING_NODE_ID:-$(hostname)}}"
+NODE_NAME="${NODE_MANAGER_NAME:-sing-box-node}"
 cat > "$CONFIG_DIR/config.yaml" <<EOF
 node:
-  id: "$(hostname)"
-  name: "sing-box-node"
+  id: "$NODE_ID"
+  name: "$NODE_NAME"
   host: "$SERVER_IP"
 server:
   port: 8088
@@ -298,6 +314,85 @@ curl -fsS http://127.0.0.1:8088/health >/dev/null || {
   fail "Node Manager health check failed"
 }
 
+register_with_control_plane() {
+  local control_plane_url="${CONTROL_PLANE_URL:-}"
+  local registration_token="${CONTROL_PLANE_REGISTRATION_TOKEN:-}"
+  local registration_required="${CONTROL_PLANE_REGISTRATION_REQUIRED:-0}"
+  local public_url="${NODE_MANAGER_PUBLIC_URL:-http://$SERVER_IP:8088}"
+  local max_users="${NODE_MANAGER_MAX_USERS:-500}"
+  local response_file request_file header_file http_code delay
+
+  if [ -z "$control_plane_url" ] && [ -z "$registration_token" ]; then
+    CONTROL_PLANE_REGISTRATION_STATUS="not-configured"
+    [ "$registration_required" != "1" ] || fail "control-plane registration is required but CONTROL_PLANE_URL and CONTROL_PLANE_REGISTRATION_TOKEN are missing"
+    return 0
+  fi
+  if [ -z "$control_plane_url" ] || [ -z "$registration_token" ]; then
+    CONTROL_PLANE_REGISTRATION_STATUS="incomplete-configuration"
+    [ "$registration_required" != "1" ] || fail "control-plane registration requires both CONTROL_PLANE_URL and CONTROL_PLANE_REGISTRATION_TOKEN"
+    log "control-plane registration skipped because its configuration is incomplete"
+    return 0
+  fi
+  case "$max_users" in
+    ''|*[!0-9]*) fail "NODE_MANAGER_MAX_USERS must be a positive integer" ;;
+  esac
+  [ "$max_users" -ge 1 ] || fail "NODE_MANAGER_MAX_USERS must be a positive integer"
+
+  control_plane_url="${control_plane_url%/}"
+  public_url="${public_url%/}"
+  REGISTRATION_TEMP_DIR="$(mktemp -d)"
+  chmod 0700 "$REGISTRATION_TEMP_DIR"
+  response_file="$REGISTRATION_TEMP_DIR/response.json"
+  request_file="$REGISTRATION_TEMP_DIR/request.json"
+  header_file="$REGISTRATION_TEMP_DIR/headers.txt"
+  : > "$response_file"
+  : > "$request_file"
+  : > "$header_file"
+  chmod 0600 "$response_file" "$request_file" "$header_file"
+  printf 'X-Registration-Token: %s\n' "$registration_token" > "$header_file"
+  jq -nc \
+    --arg nodeId "$NODE_ID" \
+    --arg name "$NODE_NAME" \
+    --arg baseUrl "$public_url" \
+    --arg apiToken "$NODE_TOKEN" \
+    --arg host "$SERVER_IP" \
+    --arg managerVersion "$APP_VERSION" \
+    --argjson maxUsers "$max_users" \
+    '{nodeId:$nodeId,name:$name,baseUrl:$baseUrl,apiToken:$apiToken,host:$host,managerVersion:$managerVersion,maxUsers:$maxUsers}' \
+    > "$request_file"
+  for delay in 0 2 4 8 16; do
+    [ "$delay" -eq 0 ] || sleep "$delay"
+    log "registering Node Manager with control-plane"
+    http_code="$(curl -sS --connect-timeout 10 --max-time 30 \
+      -o "$response_file" -w '%{http_code}' \
+      -X POST "$control_plane_url/api/control/agent/register" \
+      -H 'Content-Type: application/json' \
+      --header "@$header_file" \
+      --data-binary "@$request_file" \
+      || true)"
+    [ -n "$http_code" ] || http_code="000"
+    if [ "$http_code" = "200" ]; then
+      CONTROL_PLANE_NODE_ID="$(jq -r '.id // empty' "$response_file" 2>/dev/null || true)"
+      CONTROL_PLANE_REGISTRATION_STATUS="registered"
+      CONTROL_PLANE_RESPONSE="$(jq -r 'if .created then "created" else "updated" end' "$response_file" 2>/dev/null || true)"
+      rm -rf -- "$REGISTRATION_TEMP_DIR"
+      REGISTRATION_TEMP_DIR=""
+      log "control-plane registration completed"
+      return 0
+    fi
+    CONTROL_PLANE_REGISTRATION_STATUS="failed-http-$http_code"
+  done
+
+  rm -rf -- "$REGISTRATION_TEMP_DIR"
+  REGISTRATION_TEMP_DIR=""
+  if [ "$registration_required" = "1" ]; then
+    fail "control-plane registration failed after retries ($CONTROL_PLANE_REGISTRATION_STATUS)"
+  fi
+  log "control-plane registration failed after retries; Node Manager remains installed"
+}
+
+register_with_control_plane
+
 INFO_FILE="/root/node-manager-info.txt"
 cat > "$INFO_FILE" <<EOF
 Node Manager deployment
@@ -311,6 +406,10 @@ OpenAPI JSON: http://$SERVER_IP:8088/openapi.json
 API token: $NODE_TOKEN
 Clash API: http://127.0.0.1:9090 (local only)
 Clash API secret: $API_SECRET
+Control-plane URL: ${CONTROL_PLANE_URL:-not configured}
+Control-plane registration: $CONTROL_PLANE_REGISTRATION_STATUS
+Control-plane node ID: ${CONTROL_PLANE_NODE_ID:-not assigned}
+Control-plane registration action: ${CONTROL_PLANE_RESPONSE:-none}
 EOF
 if [ "$FRESH_SINGBOX_CONFIG" -eq 1 ]; then
   cat >> "$INFO_FILE" <<EOF
@@ -325,4 +424,4 @@ fi
 chmod 0600 "$INFO_FILE"
 
 log "deployment completed"
-cat "$INFO_FILE"
+log "deployment details and generated credentials were saved to $INFO_FILE (mode 0600)"

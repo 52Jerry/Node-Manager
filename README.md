@@ -20,6 +20,7 @@ Python Node Manager 是部署在每台 sing-box 节点服务器上的管理 Agen
 - ✅ sing-box 配置校验、原子替换和失败回滚
 - ✅ 可视化管理界面
 - ✅ 一键部署脚本
+- ✅ 安装完成后自动注册到 Spring Boot control-plane
 - ✅ 全新安装自动创建三协议测试用户
 
 ## 架构设计
@@ -97,6 +98,33 @@ http://localhost:8088
 # 一键部署命令（推荐）
 bash <(curl -Ls https://raw.githubusercontent.com/52Jerry/Node-Manager/main/install.sh)
 ```
+
+### 安装并注册到 control-plane
+
+```bash
+CONTROL_PLANE_URL="https://control.example.com" \
+CONTROL_PLANE_REGISTRATION_TOKEN="registration-secret" \
+NODE_MANAGER_PUBLIC_URL="http://VPS_PUBLIC_IP:8088" \
+NODE_MANAGER_NAME="us-vps-01" \
+NODE_MANAGER_NODE_ID="us-vps-01" \
+NODE_MANAGER_MAX_USERS="500" \
+CONTROL_PLANE_REGISTRATION_REQUIRED="1" \
+bash <(curl -Ls https://raw.githubusercontent.com/52Jerry/Node-Manager/main/install.sh)
+```
+
+| 环境变量 | 默认值 | 说明 |
+| --- | --- | --- |
+| `CONTROL_PLANE_URL` | 空 | control-plane 外部地址 |
+| `CONTROL_PLANE_REGISTRATION_TOKEN` | 空 | 安装脚本专用注册令牌，不会写入信息文件 |
+| `CONTROL_PLANE_REGISTRATION_REQUIRED` | `0` | 设为 `1` 时，注册失败会使安装命令失败 |
+| `NODE_MANAGER_PUBLIC_URL` | `http://公网IP:8088` | control-plane 回调本节点使用的地址 |
+| `NODE_MANAGER_NAME` | `sing-box-node` | 控制面显示名称 |
+| `NODE_MANAGER_NODE_ID` | 已有 ID 或主机名 | 稳定节点 ID，重装时用于更新原记录 |
+| `NODE_MANAGER_MAX_USERS` | `500` | 节点最大用户容量 |
+
+脚本会在 Node Manager 健康检查通过后注册，并以 `0/2/4/8/16` 秒退避重试。升级或重装会沿用已有 API Token 和节点 ID。注册状态及 control-plane 分配的节点 UUID 会写入 `/root/node-manager-info.txt`。注册令牌、Node Manager API Token 和生成密码通过权限为 `0600` 的文件传递或保存，不会出现在 `curl` 进程参数和安装末尾的控制台输出中。
+
+注册请求会提交稳定节点 ID、显示名称、Node Manager 公网 URL、Node Manager API Token、VPS 公网 IP、Node Manager 版本和最大用户数。Control Plane 保存注册信息后会主动访问 `/api/agent/info` 和 `/api/agent/heartbeat`，补充在线状态、sing-box 版本、CPU、内存、连接数、用户数和流量等运行信息。要完成这一过程，VPS 必须能访问 `CONTROL_PLANE_URL`，同时 Control Plane 必须能访问 `NODE_MANAGER_PUBLIC_URL`；默认直连部署需放行 VPS 的 TCP 8088 端口。
 
 部署流程：
 ```
