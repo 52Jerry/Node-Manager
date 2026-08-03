@@ -516,5 +516,34 @@ class TrafficTestCase(unittest.TestCase):
         self.assertEqual(deleted["total"], 0)
 
 
+class InstallerContractTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.installer = (PROJECT_ROOT / "install.sh").read_text(encoding="utf-8")
+
+    def test_page_install_token_uses_dedicated_header(self):
+        self.assertIn(
+            'usage: bash install.sh [CONTROL_PLANE_URL] [ONE_TIME_INSTALL_TOKEN]',
+            self.installer,
+        )
+        self.assertIn('CONTROL_PLANE_INSTALL_TOKEN="$2"', self.installer)
+        self.assertIn(
+            "printf 'X-Install-Token: %s\\n' \"$install_token\" > \"$header_file\"",
+            self.installer,
+        )
+        self.assertIn(
+            "printf 'X-Registration-Token: %s\\n' \"$registration_token\" > \"$header_file\"",
+            self.installer,
+        )
+
+    def test_registration_credentials_are_not_written_to_info_file(self):
+        info_file_section = self.installer.split('INFO_FILE="/root/node-manager-info.txt"', 1)[1]
+        self.assertNotIn("CONTROL_PLANE_INSTALL_TOKEN", info_file_section)
+        self.assertNotIn("CONTROL_PLANE_REGISTRATION_TOKEN", info_file_section)
+        self.assertIn('chmod 0600 "$response_file" "$request_file" "$header_file"', self.installer)
+        self.assertIn('CONTROL_PLANE_INSTALL_TOKEN=""', self.installer)
+        self.assertIn('CONTROL_PLANE_REGISTRATION_TOKEN=""', self.installer)
+
+
 if __name__ == "__main__":
     unittest.main()

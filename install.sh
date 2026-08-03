@@ -22,6 +22,7 @@ TEST_VMESS_URL=""
 CONTROL_PLANE_REGISTRATION_STATUS="not-configured"
 CONTROL_PLANE_NODE_ID=""
 CONTROL_PLANE_RESPONSE=""
+CONTROL_PLANE_INSTALL_TOKEN="${CONTROL_PLANE_INSTALL_TOKEN:-}"
 
 log() { printf '[node-manager] %s\n' "$*"; }
 fail() { printf '[node-manager] ERROR: %s\n' "$*" >&2; exit 1; }
@@ -34,17 +35,20 @@ trap cleanup EXIT
 [ "${EUID}" -eq 0 ] || fail "run this installer as root"
 command -v apt-get >/dev/null 2>&1 || fail "only Debian and Ubuntu are supported"
 
-# 简化安装：把 Control Plane 地址作为唯一参数传入，注册令牌从终端隐藏读取。
-# 原有环境变量方式继续保留，便于自动化部署和高级覆盖。
-[ "$#" -le 1 ] || fail "usage: bash install.sh [CONTROL_PLANE_URL]"
-if [ "$#" -eq 1 ]; then
+# 页面一键安装会传入 Control Plane 地址和短时一次性安装码。
+# 只传地址时仍可隐藏输入长期注册令牌，环境变量方式也继续兼容。
+[ "$#" -le 2 ] || fail "usage: bash install.sh [CONTROL_PLANE_URL] [ONE_TIME_INSTALL_TOKEN]"
+if [ "$#" -ge 1 ]; then
   CONTROL_PLANE_URL="${1%/}"
   case "$CONTROL_PLANE_URL" in
     http://*|https://*) ;;
     *) fail "CONTROL_PLANE_URL must start with http:// or https://" ;;
   esac
   CONTROL_PLANE_REGISTRATION_REQUIRED="${CONTROL_PLANE_REGISTRATION_REQUIRED:-1}"
-  if [ -z "${CONTROL_PLANE_REGISTRATION_TOKEN:-}" ]; then
+  if [ "$#" -eq 2 ]; then
+    CONTROL_PLANE_INSTALL_TOKEN="$2"
+    [ -n "$CONTROL_PLANE_INSTALL_TOKEN" ] || fail "one-time install token cannot be empty"
+  elif [ -z "$CONTROL_PLANE_INSTALL_TOKEN" ] && [ -z "${CONTROL_PLANE_REGISTRATION_TOKEN:-}" ]; then
     [ -r /dev/tty ] || fail "a registration token is required; set CONTROL_PLANE_REGISTRATION_TOKEN for non-interactive installation"
     printf '请输入 Control Plane 节点注册令牌: ' > /dev/tty
     IFS= read -r -s CONTROL_PLANE_REGISTRATION_TOKEN < /dev/tty
@@ -335,20 +339,21 @@ curl -fsS http://127.0.0.1:8088/health >/dev/null || {
 
 register_with_control_plane() {
   local control_plane_url="${CONTROL_PLANE_URL:-}"
+  local install_token="${CONTROL_PLANE_INSTALL_TOKEN:-}"
   local registration_token="${CONTROL_PLANE_REGISTRATION_TOKEN:-}"
   local registration_required="${CONTROL_PLANE_REGISTRATION_REQUIRED:-0}"
   local public_url="${NODE_MANAGER_PUBLIC_URL:-http://$SERVER_IP:8088}"
   local max_users="${NODE_MANAGER_MAX_USERS:-500}"
   local response_file request_file header_file http_code delay
 
-  if [ -z "$control_plane_url" ] && [ -z "$registration_token" ]; then
+  if [ -z "$control_plane_url" ] && [ -z "$install_token" ] && [ -z "$registration_token" ]; then
     CONTROL_PLANE_REGISTRATION_STATUS="not-configured"
-    [ "$registration_required" != "1" ] || fail "control-plane registration is required but CONTROL_PLANE_URL and CONTROL_PLANE_REGISTRATION_TOKEN are missing"
+    [ "$registration_required" != "1" ] || fail "control-plane registration is required but the URL and registration credential are missing"
     return 0
   fi
-  if [ -z "$control_plane_url" ] || [ -z "$registration_token" ]; then
+  if [ -z "$control_plane_url" ] || { [ -z "$install_token" ] && [ -z "$registration_token" ]; }; then
     CONTROL_PLANE_REGISTRATION_STATUS="incomplete-configuration"
-    [ "$registration_required" != "1" ] || fail "control-plane registration requires both CONTROL_PLANE_URL and CONTROL_PLANE_REGISTRATION_TOKEN"
+    [ "$registration_required" != "1" ] || fail "control-plane registration requires a URL and either an install token or registration token"
     log "control-plane registration skipped because its configuration is incomplete"
     return 0
   fi
@@ -368,7 +373,11 @@ register_with_control_plane() {
   : > "$request_file"
   : > "$header_file"
   chmod 0600 "$response_file" "$request_file" "$header_file"
-  printf 'X-Registration-Token: %s\n' "$registration_token" > "$header_file"
+  if [ -n "$install_token" ]; then
+    printf 'X-Install-Token: %s\n' "$install_token" > "$header_file"
+  else
+    printf 'X-Registration-Token: %s\n' "$registration_token" > "$header_file"
+  fi
   jq -nc \
     --arg nodeId "$NODE_ID" \
     --arg name "$NODE_NAME" \
@@ -394,6 +403,10 @@ register_with_control_plane() {
       CONTROL_PLANE_NODE_ID="$(jq -r '.id // empty' "$response_file" 2>/dev/null || true)"
       CONTROL_PLANE_REGISTRATION_STATUS="registered"
       CONTROL_PLANE_RESPONSE="$(jq -r 'if .created then "created" else "updated" end' "$response_file" 2>/dev/null || true)"
+      install_token=""
+      CONTROL_PLANE_INSTALL_TOKEN=""
+      registration_token=""
+      CONTROL_PLANE_REGISTRATION_TOKEN=""
       rm -rf -- "$REGISTRATION_TEMP_DIR"
       REGISTRATION_TEMP_DIR=""
       log "control-plane registration completed"

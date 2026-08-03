@@ -92,14 +92,17 @@ python main.py
 http://localhost:8088
 ```
 
-### 服务器一键部署并注册
+### 从 Control Plane 页面一键部署并注册（推荐）
+
+登录牛速控制中心，在“全部节点”区域点击“一键安装 Node Manager”，复制页面生成的命令到目标 VPS 的 root 终端执行。命令会携带一个短时、仅可成功使用一次的安装码，无需查找或手动输入长期注册令牌。
+
+页面生成的命令形态如下，其中实际安装码不会写入本文档：
 
 ```bash
-# 把地址替换成你的 Control Plane 地址
-bash <(curl -Ls https://raw.githubusercontent.com/52Jerry/Node-Manager/main/install.sh) https://control.example.com
+bash <(curl -fsSL 'https://raw.githubusercontent.com/52Jerry/Node-Manager/main/install.sh') 'https://control.example.com' 'niusu_一次性安装码'
 ```
 
-命令执行后会提示输入 Control Plane 的节点注册令牌，输入内容不会显示。脚本会自动完成以下事情：
+脚本会自动完成以下事情：
 
 - 获取当前 VPS 公网 IP
 - 使用主机名作为稳定节点 ID 和显示名称
@@ -108,12 +111,22 @@ bash <(curl -Ls https://raw.githubusercontent.com/52Jerry/Node-Manager/main/inst
 - 默认设置最大用户数为 `500`
 - 重装时复用原节点 ID 和 API Token，不重复创建节点
 
+一次性安装码默认 10 分钟有效，注册成功立即作废。它只用于本次安装注册，不会写入 `/root/node-manager-info.txt`。命令可能短暂停留在 VPS Shell 历史中，但安装码成功使用或过期后无法再次注册；不要把尚未使用的命令转发给其他人。
+
 需要保证 VPS 能访问 Control Plane，并在云安全组中允许 Control Plane 服务器访问 VPS 的 TCP `8088` 端口。
 
 ### 只安装、不注册
 
 ```bash
 bash <(curl -Ls https://raw.githubusercontent.com/52Jerry/Node-Manager/main/install.sh)
+```
+
+### 兼容的长期注册令牌方式
+
+如果不从页面生成命令，也可以只传 Control Plane 地址，随后在终端隐藏输入长期注册令牌：
+
+```bash
+bash <(curl -Ls https://raw.githubusercontent.com/52Jerry/Node-Manager/main/install.sh) https://control.example.com
 ```
 
 ### 自动化和高级覆盖
@@ -127,6 +140,7 @@ bash <(curl -Ls https://raw.githubusercontent.com/52Jerry/Node-Manager/main/inst
 
 | 环境变量 | 默认值 | 说明 |
 | --- | --- | --- |
+| `CONTROL_PLANE_INSTALL_TOKEN` | 页面命令第二参数 | 短时一次性安装码，优先于长期注册令牌，不写入信息文件 |
 | `CONTROL_PLANE_REGISTRATION_TOKEN` | 交互输入 | 安装脚本专用注册令牌，不会写入信息文件 |
 | `NODE_MANAGER_PUBLIC_URL` | `http://公网IP:8088` | control-plane 回调本节点使用的地址 |
 | `NODE_MANAGER_NAME` | 节点 ID | 控制面显示名称 |
