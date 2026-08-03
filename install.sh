@@ -34,6 +34,25 @@ trap cleanup EXIT
 [ "${EUID}" -eq 0 ] || fail "run this installer as root"
 command -v apt-get >/dev/null 2>&1 || fail "only Debian and Ubuntu are supported"
 
+# 简化安装：把 Control Plane 地址作为唯一参数传入，注册令牌从终端隐藏读取。
+# 原有环境变量方式继续保留，便于自动化部署和高级覆盖。
+[ "$#" -le 1 ] || fail "usage: bash install.sh [CONTROL_PLANE_URL]"
+if [ "$#" -eq 1 ]; then
+  CONTROL_PLANE_URL="${1%/}"
+  case "$CONTROL_PLANE_URL" in
+    http://*|https://*) ;;
+    *) fail "CONTROL_PLANE_URL must start with http:// or https://" ;;
+  esac
+  CONTROL_PLANE_REGISTRATION_REQUIRED="${CONTROL_PLANE_REGISTRATION_REQUIRED:-1}"
+  if [ -z "${CONTROL_PLANE_REGISTRATION_TOKEN:-}" ]; then
+    [ -r /dev/tty ] || fail "a registration token is required; set CONTROL_PLANE_REGISTRATION_TOKEN for non-interactive installation"
+    printf '请输入 Control Plane 节点注册令牌: ' > /dev/tty
+    IFS= read -r -s CONTROL_PLANE_REGISTRATION_TOKEN < /dev/tty
+    printf '\n' > /dev/tty
+    [ -n "$CONTROL_PLANE_REGISTRATION_TOKEN" ] || fail "registration token cannot be empty"
+  fi
+fi
+
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 if [ -f "$SCRIPT_DIR/main.py" ]; then
   SOURCE_DIR="$SCRIPT_DIR"
@@ -249,7 +268,7 @@ if [ -f "$CONFIG_DIR/config.yaml" ]; then
   ' "$CONFIG_DIR/config.yaml" | tr -d '"' | tr -d "'")"
 fi
 NODE_ID="${NODE_MANAGER_NODE_ID:-${EXISTING_NODE_ID:-$(hostname)}}"
-NODE_NAME="${NODE_MANAGER_NAME:-sing-box-node}"
+NODE_NAME="${NODE_MANAGER_NAME:-$NODE_ID}"
 cat > "$CONFIG_DIR/config.yaml" <<EOF
 node:
   id: "$NODE_ID"

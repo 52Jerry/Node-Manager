@@ -92,37 +92,48 @@ python main.py
 http://localhost:8088
 ```
 
-### 服务器一键部署
+### 服务器一键部署并注册
 
 ```bash
-# 一键部署命令（推荐）
+# 把地址替换成你的 Control Plane 地址
+bash <(curl -Ls https://raw.githubusercontent.com/52Jerry/Node-Manager/main/install.sh) https://control.example.com
+```
+
+命令执行后会提示输入 Control Plane 的节点注册令牌，输入内容不会显示。脚本会自动完成以下事情：
+
+- 获取当前 VPS 公网 IP
+- 使用主机名作为稳定节点 ID 和显示名称
+- 生成并保存 Node Manager API Token
+- 使用 `http://公网IP:8088` 注册到 Control Plane
+- 默认设置最大用户数为 `500`
+- 重装时复用原节点 ID 和 API Token，不重复创建节点
+
+需要保证 VPS 能访问 Control Plane，并在云安全组中允许 Control Plane 服务器访问 VPS 的 TCP `8088` 端口。
+
+### 只安装、不注册
+
+```bash
 bash <(curl -Ls https://raw.githubusercontent.com/52Jerry/Node-Manager/main/install.sh)
 ```
 
-### 安装并注册到 control-plane
+### 自动化和高级覆盖
+
+无人值守安装可以预先提供令牌：
 
 ```bash
-CONTROL_PLANE_URL="https://control.example.com" \
 CONTROL_PLANE_REGISTRATION_TOKEN="registration-secret" \
-NODE_MANAGER_PUBLIC_URL="http://VPS_PUBLIC_IP:8088" \
-NODE_MANAGER_NAME="us-vps-01" \
-NODE_MANAGER_NODE_ID="us-vps-01" \
-NODE_MANAGER_MAX_USERS="500" \
-CONTROL_PLANE_REGISTRATION_REQUIRED="1" \
-bash <(curl -Ls https://raw.githubusercontent.com/52Jerry/Node-Manager/main/install.sh)
+bash <(curl -Ls https://raw.githubusercontent.com/52Jerry/Node-Manager/main/install.sh) https://control.example.com
 ```
 
 | 环境变量 | 默认值 | 说明 |
 | --- | --- | --- |
-| `CONTROL_PLANE_URL` | 空 | control-plane 外部地址 |
-| `CONTROL_PLANE_REGISTRATION_TOKEN` | 空 | 安装脚本专用注册令牌，不会写入信息文件 |
-| `CONTROL_PLANE_REGISTRATION_REQUIRED` | `0` | 设为 `1` 时，注册失败会使安装命令失败 |
+| `CONTROL_PLANE_REGISTRATION_TOKEN` | 交互输入 | 安装脚本专用注册令牌，不会写入信息文件 |
 | `NODE_MANAGER_PUBLIC_URL` | `http://公网IP:8088` | control-plane 回调本节点使用的地址 |
-| `NODE_MANAGER_NAME` | `sing-box-node` | 控制面显示名称 |
+| `NODE_MANAGER_NAME` | 节点 ID | 控制面显示名称 |
 | `NODE_MANAGER_NODE_ID` | 已有 ID 或主机名 | 稳定节点 ID，重装时用于更新原记录 |
 | `NODE_MANAGER_MAX_USERS` | `500` | 节点最大用户容量 |
 
-脚本会在 Node Manager 健康检查通过后注册，并以 `0/2/4/8/16` 秒退避重试。升级或重装会沿用已有 API Token 和节点 ID。注册状态及 control-plane 分配的节点 UUID 会写入 `/root/node-manager-info.txt`。注册令牌、Node Manager API Token 和生成密码通过权限为 `0600` 的文件传递或保存，不会出现在 `curl` 进程参数和安装末尾的控制台输出中。
+旧的 `CONTROL_PLANE_URL`、`CONTROL_PLANE_REGISTRATION_REQUIRED` 等环境变量方式继续兼容。脚本会在 Node Manager 健康检查通过后注册，并以 `0/2/4/8/16` 秒退避重试。升级或重装会沿用已有 API Token 和节点 ID。注册状态及 Control Plane 分配的节点 UUID 会写入 `/root/node-manager-info.txt`。注册令牌、Node Manager API Token 和生成密码通过权限为 `0600` 的文件传递或保存，不会出现在安装末尾的控制台输出中。
 
 注册请求会提交稳定节点 ID、显示名称、Node Manager 公网 URL、Node Manager API Token、VPS 公网 IP、Node Manager 版本和最大用户数。Control Plane 保存注册信息后会主动访问 `/api/agent/info` 和 `/api/agent/heartbeat`，补充在线状态、sing-box 版本、CPU、内存、连接数、用户数和流量等运行信息。要完成这一过程，VPS 必须能访问 `CONTROL_PLANE_URL`，同时 Control Plane 必须能访问 `NODE_MANAGER_PUBLIC_URL`；默认直连部署需放行 VPS 的 TCP 8088 端口。
 
