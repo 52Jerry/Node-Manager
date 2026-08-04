@@ -115,6 +115,8 @@ bash <(curl -fsSL 'https://raw.githubusercontent.com/52Jerry/Node-Manager/main/i
 
 `1.4.3` 起，安装器会在 Ubuntu/Debian 自动更新占用 `dpkg` 时等待锁释放，默认最多等待 300 秒，避免新开通 VPS 首次执行时随机失败。必要时可在执行前通过 `APT_LOCK_TIMEOUT_SECONDS` 调整等待秒数。
 
+`1.4.4` 起，一次性安装注册发生网络超时时会直接提示检查云防火墙/安全组的 TCP `8088` 入站规则，并要求修复网络后重新生成短时安装命令，避免继续复用已处于不确定状态的一次性安装码而误报 `401`。
+
 一次性安装码默认 10 分钟有效，注册成功立即作废。它只用于本次安装注册，不会写入 `/root/node-manager-info.txt`。命令可能短暂停留在 VPS Shell 历史中，但安装码成功使用或过期后无法再次注册；不要把尚未使用的命令转发给其他人。
 
 需要保证 VPS 能访问 Control Plane，并在云安全组中允许 Control Plane 服务器访问 VPS 的 TCP `8088` 端口。

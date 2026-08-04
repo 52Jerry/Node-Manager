@@ -544,6 +544,15 @@ class InstallerContractTest(unittest.TestCase):
         self.assertIn('CONTROL_PLANE_INSTALL_TOKEN=""', self.installer)
         self.assertIn('CONTROL_PLANE_REGISTRATION_TOKEN=""', self.installer)
 
+    def test_one_time_registration_transport_error_has_actionable_diagnostic(self):
+        self.assertIn('curl_exit_code=$?', self.installer)
+        self.assertIn(
+            'if [ "$curl_exit_code" -ne 0 ] && [ -n "$install_token" ]; then',
+            self.installer,
+        )
+        self.assertIn('provider cloud firewall/security group for TCP 8088', self.installer)
+        self.assertIn('generate a new one-time install command', self.installer)
+
     def test_fresh_install_does_not_exit_when_sing_box_is_missing(self):
         self.assertIn(
             'if command -v sing-box >/dev/null 2>&1; then',

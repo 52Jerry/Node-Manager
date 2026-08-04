@@ -411,7 +411,7 @@ register_with_control_plane() {
   local registration_required="${CONTROL_PLANE_REGISTRATION_REQUIRED:-0}"
   local public_url="${NODE_MANAGER_PUBLIC_URL:-http://$SERVER_IP:8088}"
   local max_users="${NODE_MANAGER_MAX_USERS:-500}"
-  local response_file request_file header_file http_code delay
+  local response_file request_file header_file http_code delay curl_exit_code
 
   if [ -z "$control_plane_url" ] && [ -z "$install_token" ] && [ -z "$registration_token" ]; then
     CONTROL_PLANE_REGISTRATION_STATUS="not-configured"
@@ -458,13 +458,15 @@ register_with_control_plane() {
   for delay in 0 2 4 8 16; do
     [ "$delay" -eq 0 ] || sleep "$delay"
     log "registering Node Manager with control-plane"
+    set +e
     http_code="$(curl -sS --connect-timeout 10 --max-time 30 \
       -o "$response_file" -w '%{http_code}' \
       -X POST "$control_plane_url/api/control/agent/register" \
       -H 'Content-Type: application/json' \
       --header "@$header_file" \
-      --data-binary "@$request_file" \
-      || true)"
+      --data-binary "@$request_file")"
+    curl_exit_code=$?
+    set -e
     [ -n "$http_code" ] || http_code="000"
     if [ "$http_code" = "200" ]; then
       CONTROL_PLANE_NODE_ID="$(jq -r '.id // empty' "$response_file" 2>/dev/null || true)"
@@ -478,6 +480,12 @@ register_with_control_plane() {
       REGISTRATION_TEMP_DIR=""
       log "control-plane registration completed"
       return 0
+    fi
+    if [ "$curl_exit_code" -ne 0 ] && [ -n "$install_token" ]; then
+      CONTROL_PLANE_REGISTRATION_STATUS="transport-error-$curl_exit_code"
+      rm -rf -- "$REGISTRATION_TEMP_DIR"
+      REGISTRATION_TEMP_DIR=""
+      fail "control-plane registration request did not complete; verify that the Control Plane server can reach $public_url (including the provider cloud firewall/security group for TCP 8088), then generate a new one-time install command"
     fi
     CONTROL_PLANE_REGISTRATION_STATUS="failed-http-$http_code"
   done
