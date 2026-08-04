@@ -144,6 +144,20 @@ install_singbox() {
   SINGBOX_TEMP_DIR=""
 }
 
+is_packaged_default_singbox_config() {
+  local expected_md5 current_md5
+
+  [ -f "$SINGBOX_CONFIG" ] || return 1
+  expected_md5="$(
+    dpkg-query -W -f='${Conffiles}\n' sing-box 2>/dev/null \
+      | awk -v path="$SINGBOX_CONFIG" '$1 == path {print $2; exit}' \
+      || true
+  )"
+  [ -n "$expected_md5" ] || return 1
+  current_md5="$(md5sum "$SINGBOX_CONFIG" | awk '{print $1}')"
+  [ "$current_md5" = "$expected_md5" ]
+}
+
 if [ -z "$INSTALLED_SINGBOX_VERSION" ]; then
   log "sing-box is not installed; installing latest stable version"
   install_singbox "$LATEST_SINGBOX_VERSION"
@@ -164,7 +178,7 @@ SOCKS_BOOTSTRAP_USER=""
 SOCKS_BOOTSTRAP_PASSWORD=""
 
 install -d -m 0750 /etc/sing-box
-if [ -f "$SINGBOX_CONFIG" ]; then
+if [ -f "$SINGBOX_CONFIG" ] && ! is_packaged_default_singbox_config; then
   BACKUP_PATH="${SINGBOX_CONFIG}.backup.$(date -u +%Y%m%dT%H%M%SZ)"
   cp -a "$SINGBOX_CONFIG" "$BACKUP_PATH"
   chmod 0600 "$BACKUP_PATH"
@@ -172,6 +186,9 @@ if [ -f "$SINGBOX_CONFIG" ]; then
   EXISTING_SECRET="$(jq -r '.experimental.clash_api.secret // empty' "$SINGBOX_CONFIG")"
   [ -z "$EXISTING_SECRET" ] || API_SECRET="$EXISTING_SECRET"
 else
+  if [ -f "$SINGBOX_CONFIG" ]; then
+    log "replacing the sing-box package default config with the Node Manager config"
+  fi
   FRESH_SINGBOX_CONFIG=1
   TEST_USER_UUID="$(sing-box generate uuid)"
   REALITY_KEYS="$(sing-box generate reality-keypair)"

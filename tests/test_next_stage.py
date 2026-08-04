@@ -567,6 +567,19 @@ class InstallerContractTest(unittest.TestCase):
         self.assertIn('dpkg -i "$package_path"', self.installer)
         self.assertNotIn('https://sing-box.app/install.sh | sh', self.installer)
 
+    def test_packaged_default_config_is_replaced_but_user_config_is_preserved(self):
+        self.assertIn('is_packaged_default_singbox_config()', self.installer)
+        self.assertIn("dpkg-query -W -f='${Conffiles}\\n' sing-box", self.installer)
+        self.assertIn('md5sum "$SINGBOX_CONFIG"', self.installer)
+        self.assertIn(
+            'if [ -f "$SINGBOX_CONFIG" ] && ! is_packaged_default_singbox_config; then',
+            self.installer,
+        )
+        self.assertIn(
+            'replacing the sing-box package default config with the Node Manager config',
+            self.installer,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

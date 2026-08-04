@@ -111,7 +111,7 @@ bash <(curl -fsSL 'https://raw.githubusercontent.com/52Jerry/Node-Manager/main/i
 - 默认设置最大用户数为 `500`
 - 重装时复用原节点 ID 和 API Token，不重复创建节点
 
-`1.4.2` 起，脚本会安全识别尚未安装 sing-box 的全新服务器，并直接从 GitHub Release 下载与 CPU 架构匹配的 Debian 软件包；下载包含重试和明确错误提示，不再依赖 `sing-box.app` 安装入口。
+`1.4.2` 起，脚本会安全识别尚未安装 sing-box 的全新服务器，并直接从 GitHub Release 下载与 CPU 架构匹配的 Debian 软件包；下载包含重试和明确错误提示，不再依赖 `sing-box.app` 安装入口。软件包自动生成的默认示例配置会被 Node Manager 初始化配置替换，用户自行维护过的现有配置仍会备份并保护。
 
 一次性安装码默认 10 分钟有效，注册成功立即作废。它只用于本次安装注册，不会写入 `/root/node-manager-info.txt`。命令可能短暂停留在 VPS Shell 历史中，但安装码成功使用或过期后无法再次注册；不要把尚未使用的命令转发给其他人。
 
