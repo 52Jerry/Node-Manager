@@ -9,6 +9,7 @@ SERVICE_FILE="/etc/systemd/system/node-manager.service"
 REPO_ARCHIVE_URL="${NODE_MANAGER_ARCHIVE_URL:-https://github.com/52Jerry/Node-Manager/archive/refs/heads/main.tar.gz}"
 TEMP_DIR=""
 REGISTRATION_TEMP_DIR=""
+SINGBOX_TEMP_DIR=""
 APP_VERSION=""
 INSTALLED_APP_VERSION=""
 UPDATE_NODE_MANAGER=1
@@ -28,6 +29,7 @@ log() { printf '[node-manager] %s\n' "$*"; }
 fail() { printf '[node-manager] ERROR: %s\n' "$*" >&2; exit 1; }
 cleanup() {
   [ -z "$REGISTRATION_TEMP_DIR" ] || rm -rf -- "$REGISTRATION_TEMP_DIR"
+  [ -z "$SINGBOX_TEMP_DIR" ] || rm -rf -- "$SINGBOX_TEMP_DIR"
   [ -z "$TEMP_DIR" ] || rm -rf -- "$TEMP_DIR"
 }
 trap cleanup EXIT
@@ -95,19 +97,62 @@ export DEBIAN_FRONTEND=noninteractive
 apt-get update -y
 apt-get install -y ca-certificates curl jq openssl python3 python3-pip python3-venv ufw
 
-INSTALLED_SINGBOX_VERSION="$(sing-box version 2>/dev/null | awk 'NR == 1 {print $3}')"
-LATEST_SINGBOX_VERSION="$(curl -fsSL --max-time 15 https://api.github.com/repos/SagerNet/sing-box/releases/latest 2>/dev/null | jq -r '.tag_name // empty' | sed 's/^v//')"
+INSTALLED_SINGBOX_VERSION=""
+if command -v sing-box >/dev/null 2>&1; then
+  INSTALLED_SINGBOX_VERSION="$(sing-box version 2>/dev/null | awk 'NR == 1 {print $3}' || true)"
+fi
+LATEST_SINGBOX_VERSION="${SINGBOX_VERSION:-}"
+if [ -z "$LATEST_SINGBOX_VERSION" ]; then
+  LATEST_SINGBOX_VERSION="$(
+    curl --retry 3 --retry-delay 2 --retry-all-errors -fsSL \
+      --connect-timeout 10 --max-time 30 \
+      https://api.github.com/repos/SagerNet/sing-box/releases/latest 2>/dev/null \
+      | jq -r '.tag_name // empty' \
+      | sed 's/^v//' \
+      || true
+  )"
+fi
+
+install_singbox() {
+  local version="$1"
+  local architecture package_name package_url package_path
+
+  [ -n "$version" ] || fail "could not determine the latest sing-box version; set SINGBOX_VERSION and retry"
+  architecture="$(dpkg --print-architecture)"
+  case "$architecture" in
+    amd64|arm64|armhf|i386) ;;
+    *) fail "unsupported sing-box architecture: $architecture" ;;
+  esac
+
+  package_name="sing-box_${version}_linux_${architecture}.deb"
+  package_url="https://github.com/SagerNet/sing-box/releases/download/v${version}/${package_name}"
+  SINGBOX_TEMP_DIR="$(mktemp -d)"
+  chmod 0700 "$SINGBOX_TEMP_DIR"
+  package_path="$SINGBOX_TEMP_DIR/$package_name"
+
+  log "downloading sing-box $version for $architecture"
+  curl --retry 3 --retry-delay 2 --retry-all-errors -fL \
+    --connect-timeout 10 --max-time 180 \
+    "$package_url" -o "$package_path" \
+    || fail "could not download sing-box package from GitHub Releases"
+  dpkg -i "$package_path" || {
+    apt-get install -f -y
+    dpkg -i "$package_path"
+  }
+  command -v sing-box >/dev/null 2>&1 || fail "sing-box installation completed without installing the executable"
+  rm -rf -- "$SINGBOX_TEMP_DIR"
+  SINGBOX_TEMP_DIR=""
+}
 
 if [ -z "$INSTALLED_SINGBOX_VERSION" ]; then
   log "sing-box is not installed; installing latest stable version"
-  curl -fsSL https://sing-box.app/install.sh | sh
+  install_singbox "$LATEST_SINGBOX_VERSION"
 elif [ -z "$LATEST_SINGBOX_VERSION" ]; then
   log "could not query the latest sing-box version; keeping installed version $INSTALLED_SINGBOX_VERSION"
 elif dpkg --compare-versions "$INSTALLED_SINGBOX_VERSION" lt "$LATEST_SINGBOX_VERSION"; then
   log "sing-box update required: $INSTALLED_SINGBOX_VERSION -> $LATEST_SINGBOX_VERSION"
   systemctl stop sing-box 2>/dev/null || true
-  apt-get remove -y sing-box 2>/dev/null || true
-  curl -fsSL https://sing-box.app/install.sh | sh
+  install_singbox "$LATEST_SINGBOX_VERSION"
 else
   log "sing-box $INSTALLED_SINGBOX_VERSION is current; keeping the installed version"
 fi

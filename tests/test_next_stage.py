@@ -404,7 +404,7 @@ class ApiTestCase(unittest.TestCase):
         body = response.json()
         self.assertEqual(body["total"], 1)
         self.assertEqual(body["items"][0]["nodeId"], "test-node")
-        self.assertEqual(body["items"][0]["managerVersion"], "1.4.1")
+        self.assertEqual(body["items"][0]["managerVersion"], "1.4.2")
         self.assertEqual(body["items"][0]["singboxVersion"], "1.13.14")
         self.assertEqual(body["items"][0]["connections"], 3)
         self.assertEqual(body["items"][0]["systemConnections"], 8)
@@ -543,6 +543,29 @@ class InstallerContractTest(unittest.TestCase):
         self.assertIn('chmod 0600 "$response_file" "$request_file" "$header_file"', self.installer)
         self.assertIn('CONTROL_PLANE_INSTALL_TOKEN=""', self.installer)
         self.assertIn('CONTROL_PLANE_REGISTRATION_TOKEN=""', self.installer)
+
+    def test_fresh_install_does_not_exit_when_sing_box_is_missing(self):
+        self.assertIn(
+            'if command -v sing-box >/dev/null 2>&1; then',
+            self.installer,
+        )
+        self.assertIn(
+            'INSTALLED_SINGBOX_VERSION="$(sing-box version 2>/dev/null | awk',
+            self.installer,
+        )
+        self.assertNotIn(
+            'INSTALLED_SINGBOX_VERSION="$(sing-box version 2>/dev/null | awk \'NR == 1 {print $3}\')"',
+            self.installer,
+        )
+
+    def test_sing_box_uses_retrying_github_release_install(self):
+        self.assertIn(
+            'https://github.com/SagerNet/sing-box/releases/download/v${version}/${package_name}',
+            self.installer,
+        )
+        self.assertIn('--retry-all-errors', self.installer)
+        self.assertIn('dpkg -i "$package_path"', self.installer)
+        self.assertNotIn('https://sing-box.app/install.sh | sh', self.installer)
 
 
 if __name__ == "__main__":

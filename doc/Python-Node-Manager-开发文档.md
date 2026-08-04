@@ -1,6 +1,6 @@
 # Python Node Manager 开发文档
 
-当前版本：`1.4.1`
+当前版本：`1.4.2`
 
 ## 1. 项目定位
 
@@ -224,7 +224,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/52Jerry/Node-Manager/main/in
 
 ## 13. Spring Boot 控制面职责
 
-Node Manager `1.4.1` 已具备单服务器 Agent 的核心能力。下一阶段主要在 Spring Boot 开发：
+Node Manager `1.4.2` 已具备单服务器 Agent 的核心能力，并修复全新服务器未安装 sing-box 时一键安装提前退出的问题。下一阶段主要在 Spring Boot 开发：
 
 - 节点注册表与每节点 Token 管理
 - 15 至 30 秒心跳调度、快照保存和离线判定
