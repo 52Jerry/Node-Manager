@@ -66,6 +66,15 @@ class UserConnectionResponse(CreateUserResponse):
     createdAt: datetime | None = None
 
 
+class ProxyDetailsResponse(BaseModel):
+    userId: str
+    proxyBound: bool
+    server: str | None = None
+    port: int | None = None
+    username: str | None = None
+    password: str | None = None
+
+
 class OperationResponse(BaseModel):
     success: bool
     userId: str | None = None

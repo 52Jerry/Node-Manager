@@ -22,6 +22,7 @@ from models.request import (
     NodeListResponse,
     NodeStatusResponse,
     OperationResponse,
+    ProxyDetailsResponse,
     ReloadResponse,
     TrafficResponse,
     UserConnectionResponse,
@@ -43,6 +44,7 @@ from singbox.manager import (
     delete_user,
     ensure_user_outbounds,
     get_user_connection,
+    get_user_proxy,
     is_api_available,
     list_users,
     reload_singbox,
@@ -183,6 +185,22 @@ def get_user_connections(
         raise HTTPException(status_code=422, detail="invalid userId")
     response.headers["Cache-Control"] = "no-store"
     return get_user_connection(userId)
+
+
+@app.get(
+    "/api/user/{userId}/proxy",
+    response_model=ProxyDetailsResponse,
+    tags=["users"],
+)
+def get_user_proxy_endpoint(
+    userId: str,
+    response: Response,
+    _token: str = Depends(verify_token),
+):
+    if not userId or len(userId) > 64:
+        raise HTTPException(status_code=422, detail="invalid userId")
+    response.headers["Cache-Control"] = "no-store"
+    return get_user_proxy(userId)
 
 
 @app.post("/api/user/bind-proxy", response_model=OperationResponse, tags=["users"])

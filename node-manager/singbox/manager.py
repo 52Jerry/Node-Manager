@@ -198,16 +198,45 @@ def _auth_name(user_id: str) -> str:
     return f"{USER_PREFIX}{user_id}"
 
 
+def _legacy_auth_names(user_id: str) -> set[str]:
+    """Names used by older installations; never expose these as public IDs."""
+    return {_auth_name(user_id), user_id}
+
+
 def _registry_user(registry: dict[str, Any], user_id: str) -> dict[str, Any]:
     value = registry.get("users", {}).get(user_id, {})
     return value if isinstance(value, dict) else {}
 
 
 def _user_auth_names(registry: dict[str, Any], user_id: str) -> set[str]:
+    names = _legacy_auth_names(user_id)
+    socks_username = _registry_user(registry, user_id).get("socksUsername")
+    if socks_username:
+        names.add(str(socks_username))
+    return names
+
+
+def _route_auth_names(
+    data: dict[str, Any], registry: dict[str, Any], user_id: str
+) -> set[str]:
+    """Return names that should be routed for this user.
+
+    New users authenticate with the internal ``node-manager:<id>`` name and,
+    when SOCKS is enabled, the supplied SOCKS username.  A bare user id is
+    accepted only when it is actually present in a legacy sing-box config;
+    this keeps backward compatibility without adding a redundant public
+    alias to every newly-created route rule.
+    """
     names = {_auth_name(user_id)}
     socks_username = _registry_user(registry, user_id).get("socksUsername")
     if socks_username:
         names.add(str(socks_username))
+    if any(
+        user.get("name") == user_id or user.get("username") == user_id
+        for inbound in data.get("inbounds", [])
+        for user in inbound.get("users", [])
+    ):
+        names.add(user_id)
     return names
 
 
@@ -376,7 +405,7 @@ def _set_proxy_binding(
     route = data.setdefault("route", {})
     rules = route.setdefault("rules", [])
     rules[:] = [rule for rule in rules if rule.get("outbound") != outbound_tag]
-    auth_names = sorted(_user_auth_names(registry, user_id))
+    auth_names = sorted(_route_auth_names(data, registry, user_id))
     rules.insert(0, {"auth_user": auth_names, "action": "route", "outbound": outbound_tag})
 
 
@@ -392,7 +421,7 @@ def _set_direct_binding(data: dict[str, Any], registry: dict[str, Any], user_id:
         rules.insert(
             0,
             {
-                "auth_user": sorted(_user_auth_names(registry, user_id)),
+                "auth_user": sorted(_route_auth_names(data, registry, user_id)),
                 "action": "route",
                 "outbound": outbound_tag,
             },
@@ -564,7 +593,7 @@ def get_user_connection(user_id: str) -> dict[str, Any]:
                 (
                     item
                     for item in inbound.get("users", [])
-                    if item.get("name") == auth_name
+                    if item.get("name") in _legacy_auth_names(user_id)
                 ),
                 None,
             )
@@ -577,7 +606,7 @@ def get_user_connection(user_id: str) -> dict[str, Any]:
                 (
                     item
                     for item in inbound.get("users", [])
-                    if item.get("name") == auth_name
+                    if item.get("name") in _legacy_auth_names(user_id)
                 ),
                 None,
             )
@@ -617,3 +646,39 @@ def get_user_connection(user_id: str) -> dict[str, Any]:
     response["uuid"] = user_uuid or ""
     response["proxyBound"] = bool(outbound and outbound.get("type") == "socks")
     return response
+
+
+def get_user_proxy(user_id: str) -> dict[str, Any]:
+    with _config_lock():
+        data = read_config()
+        registry = read_registry()
+
+    if not _user_exists(data, registry, user_id):
+        raise SingboxConfigError(f"user not found: {user_id}")
+
+    outbound = next(
+        (
+            item
+            for item in data.get("outbounds", [])
+            if item.get("tag") == f"{USER_OUTBOUND_PREFIX}{user_id}"
+        ),
+        None,
+    )
+    if not outbound or outbound.get("type") not in {"socks", "socks5"}:
+        return {
+            "userId": user_id,
+            "proxyBound": False,
+            "server": None,
+            "port": None,
+            "username": None,
+            "password": None,
+        }
+
+    return {
+        "userId": user_id,
+        "proxyBound": True,
+        "server": outbound.get("server"),
+        "port": outbound.get("server_port"),
+        "username": outbound.get("username"),
+        "password": outbound.get("password"),
+    }
