@@ -564,8 +564,17 @@ class InstallerContractTest(unittest.TestCase):
             self.installer,
         )
         self.assertIn('--retry-all-errors', self.installer)
-        self.assertIn('dpkg -i "$package_path"', self.installer)
+        self.assertIn('apt_get install -y "$package_path"', self.installer)
         self.assertNotIn('https://sing-box.app/install.sh | sh', self.installer)
+
+    def test_apt_operations_wait_for_the_dpkg_lock(self):
+        self.assertIn('APT_LOCK_TIMEOUT_SECONDS="${APT_LOCK_TIMEOUT_SECONDS:-300}"', self.installer)
+        self.assertIn('apt-get -o "DPkg::Lock::Timeout=$APT_LOCK_TIMEOUT_SECONDS" "$@"', self.installer)
+        self.assertIn('apt_get update -y', self.installer)
+        self.assertIn(
+            'apt_get install -y ca-certificates curl jq openssl python3 python3-pip python3-venv ufw',
+            self.installer,
+        )
 
     def test_packaged_default_config_is_replaced_but_user_config_is_preserved(self):
         self.assertIn('is_packaged_default_singbox_config()', self.installer)

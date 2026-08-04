@@ -24,6 +24,7 @@ CONTROL_PLANE_REGISTRATION_STATUS="not-configured"
 CONTROL_PLANE_NODE_ID=""
 CONTROL_PLANE_RESPONSE=""
 CONTROL_PLANE_INSTALL_TOKEN="${CONTROL_PLANE_INSTALL_TOKEN:-}"
+APT_LOCK_TIMEOUT_SECONDS="${APT_LOCK_TIMEOUT_SECONDS:-300}"
 
 log() { printf '[node-manager] %s\n' "$*"; }
 fail() { printf '[node-manager] ERROR: %s\n' "$*" >&2; exit 1; }
@@ -36,6 +37,13 @@ trap cleanup EXIT
 
 [ "${EUID}" -eq 0 ] || fail "run this installer as root"
 command -v apt-get >/dev/null 2>&1 || fail "only Debian and Ubuntu are supported"
+case "$APT_LOCK_TIMEOUT_SECONDS" in
+  ''|*[!0-9]*) fail "APT_LOCK_TIMEOUT_SECONDS must be a non-negative integer" ;;
+esac
+
+apt_get() {
+  apt-get -o "DPkg::Lock::Timeout=$APT_LOCK_TIMEOUT_SECONDS" "$@"
+}
 
 # 页面一键安装会传入 Control Plane 地址和短时一次性安装码。
 # 只传地址时仍可隐藏输入长期注册令牌，环境变量方式也继续兼容。
@@ -94,8 +102,8 @@ fi
 
 log "installing system dependencies"
 export DEBIAN_FRONTEND=noninteractive
-apt-get update -y
-apt-get install -y ca-certificates curl jq openssl python3 python3-pip python3-venv ufw
+apt_get update -y
+apt_get install -y ca-certificates curl jq openssl python3 python3-pip python3-venv ufw
 
 INSTALLED_SINGBOX_VERSION=""
 if command -v sing-box >/dev/null 2>&1; then
@@ -135,10 +143,7 @@ install_singbox() {
     --connect-timeout 10 --max-time 180 \
     "$package_url" -o "$package_path" \
     || fail "could not download sing-box package from GitHub Releases"
-  dpkg -i "$package_path" || {
-    apt-get install -f -y
-    dpkg -i "$package_path"
-  }
+  apt_get install -y "$package_path"
   command -v sing-box >/dev/null 2>&1 || fail "sing-box installation completed without installing the executable"
   rm -rf -- "$SINGBOX_TEMP_DIR"
   SINGBOX_TEMP_DIR=""
