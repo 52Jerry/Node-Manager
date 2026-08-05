@@ -1,9 +1,11 @@
 import base64
 import copy
+import ipaddress
 import json
 import logging
 import os
 import secrets
+import socket
 import subprocess
 import tempfile
 import threading
@@ -387,6 +389,7 @@ def create_user(
 def _set_proxy_binding(
     data: dict[str, Any], registry: dict[str, Any], user_id: str, proxy: dict[str, Any]
 ) -> None:
+    _validate_proxy_does_not_loop_to_local_socks(data, proxy)
     outbound_tag = f"{USER_OUTBOUND_PREFIX}{user_id}"
     outbound = {
         "type": "socks",
@@ -407,6 +410,59 @@ def _set_proxy_binding(
     rules[:] = [rule for rule in rules if rule.get("outbound") != outbound_tag]
     auth_names = sorted(_route_auth_names(data, registry, user_id))
     rules.insert(0, {"auth_user": auth_names, "action": "route", "outbound": outbound_tag})
+
+
+def _canonical_ip(value: str) -> str | None:
+    normalized = value.strip().strip("[]").split("%", 1)[0]
+    try:
+        return ipaddress.ip_address(normalized).compressed.lower()
+    except ValueError:
+        return None
+
+
+def _resolve_host_addresses(host: str | None) -> set[str]:
+    if host is None or not str(host).strip():
+        return set()
+    normalized_host = str(host).strip().strip("[]")
+    literal = _canonical_ip(normalized_host)
+    if literal is not None:
+        return {literal}
+    try:
+        addresses = socket.getaddrinfo(normalized_host, None, type=socket.SOCK_STREAM)
+    except socket.gaierror:
+        return set()
+    return {
+        canonical
+        for item in addresses
+        if (canonical := _canonical_ip(str(item[4][0]))) is not None
+    }
+
+
+def _local_host_addresses() -> set[str]:
+    addresses = {"127.0.0.1", "::1"}
+    addresses.update(_resolve_host_addresses(config.node.host))
+    for local_name in {socket.gethostname(), socket.getfqdn()}:
+        addresses.update(_resolve_host_addresses(local_name))
+    return addresses
+
+
+def _validate_proxy_does_not_loop_to_local_socks(
+    data: dict[str, Any], proxy: dict[str, Any]
+) -> None:
+    socks_inbound = _find_inbound(data, config.singbox.socks_tag)
+    try:
+        proxy_port = int(proxy["port"])
+        socks_port = int(socks_inbound["listen_port"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise SingboxConfigError("the proxy or SOCKS inbound port is invalid") from exc
+    if proxy_port != socks_port:
+        return
+
+    proxy_addresses = _resolve_host_addresses(str(proxy.get("server") or ""))
+    if proxy_addresses and proxy_addresses.intersection(_local_host_addresses()):
+        raise SingboxConfigError(
+            "upstream SOCKS points to this node's SOCKS inbound and would create a proxy loop"
+        )
 
 
 def _set_direct_binding(data: dict[str, Any], registry: dict[str, Any], user_id: str) -> None:

@@ -231,6 +231,81 @@ class ManagerTestCase(unittest.TestCase):
         )
         self.assertTrue(manager.list_users()[0]["proxyBound"])
 
+    def test_create_rejects_proxy_loop_to_local_socks_without_leaving_user(self):
+        with self.assertRaisesRegex(manager.SingboxConfigError, "proxy loop"):
+            manager.create_user(
+                "loop-user",
+                ["vless", "vmess", "socks"],
+                proxy={
+                    "type": "socks5",
+                    "server": "192.0.2.10",
+                    "port": 5001,
+                    "username": "loop-user",
+                    "password": "loop-password",
+                },
+            )
+
+        data = json.loads(self.config_path.read_text(encoding="utf-8"))
+        self.assertEqual(sum(len(item["users"]) for item in data["inbounds"]), 0)
+        self.assertEqual(data["outbounds"], [])
+        self.assertEqual(data["route"]["rules"], [])
+        self.assertEqual(manager.list_users(), [])
+
+    def test_bind_rejects_domain_resolving_to_local_socks_and_preserves_direct_route(self):
+        manager.create_user("loop-bind-user", ["socks"])
+
+        with (
+            patch.object(
+                manager,
+                "_resolve_host_addresses",
+                side_effect=lambda host: (
+                    {"192.0.2.10"} if host in {"local-proxy.example", "192.0.2.10"} else set()
+                ),
+            ),
+            self.assertRaisesRegex(manager.SingboxConfigError, "proxy loop"),
+        ):
+            manager.bind_proxy(
+                "loop-bind-user",
+                {
+                    "type": "socks5",
+                    "server": "local-proxy.example",
+                    "port": 5001,
+                    "username": "upstream-user",
+                    "password": "upstream-password",
+                },
+            )
+
+        data = json.loads(self.config_path.read_text(encoding="utf-8"))
+        outbound = next(
+            item
+            for item in data["outbounds"]
+            if item["tag"] == "node-manager-out:loop-bind-user"
+        )
+        self.assertEqual(outbound["type"], "direct")
+        self.assertFalse(manager.list_users()[0]["proxyBound"])
+
+    def test_local_address_on_a_different_port_is_allowed(self):
+        created = manager.create_user(
+            "different-port-user",
+            ["socks"],
+            proxy={
+                "type": "socks5",
+                "server": "192.0.2.10",
+                "port": 6000,
+                "username": "upstream-user",
+                "password": "upstream-password",
+            },
+        )
+
+        self.assertTrue(created["proxyBound"])
+        data = json.loads(self.config_path.read_text(encoding="utf-8"))
+        outbound = next(
+            item
+            for item in data["outbounds"]
+            if item["tag"] == "node-manager-out:different-port-user"
+        )
+        self.assertEqual(outbound["server_port"], 6000)
+
     def test_duplicate_socks_username_is_rejected(self):
         manager.create_user("customer-3", ["socks"], socks_username="shared-user")
         with self.assertRaisesRegex(manager.SingboxConfigError, "SOCKS username already exists"):
