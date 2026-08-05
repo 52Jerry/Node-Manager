@@ -186,5 +186,6 @@ class AgentHeartbeatResponse(BaseModel):
     connections: int
     systemConnections: int
     userCount: int
+    socksPort: int | None = Field(default=None, ge=1, le=65535)
     traffic: TrafficTotals
     reportedAt: datetime

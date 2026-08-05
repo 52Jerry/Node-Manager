@@ -527,6 +527,7 @@ class ApiTestCase(unittest.TestCase):
         self.assertEqual(heartbeat.json()["status"], "online")
         self.assertEqual(heartbeat.json()["connections"], 3)
         self.assertEqual(heartbeat.json()["systemConnections"], 8)
+        self.assertEqual(heartbeat.json()["socksPort"], 5001)
         self.assertEqual(heartbeat.json()["traffic"]["total"], 30)
 
 

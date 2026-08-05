@@ -102,6 +102,17 @@ def is_api_available() -> bool:
     return singbox_api.is_available()
 
 
+def get_socks_inbound_port() -> int | None:
+    """Return the public SOCKS inbound port from the active sing-box config."""
+    try:
+        data = read_config()
+        inbound = _find_inbound(data, config.singbox.socks_tag)
+        port = int(inbound.get("listen_port"))
+        return port if 1 <= port <= 65535 else None
+    except (OSError, TypeError, ValueError, SingboxConfigError):
+        return None
+
+
 @contextmanager
 def _config_lock():
     if fcntl is None:

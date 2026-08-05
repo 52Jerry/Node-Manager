@@ -45,6 +45,7 @@ from singbox.manager import (
     ensure_user_outbounds,
     get_user_connection,
     get_user_proxy,
+    get_socks_inbound_port,
     is_api_available,
     list_users,
     reload_singbox,
@@ -317,6 +318,7 @@ def get_agent_heartbeat(_token: str = Depends(verify_token)):
         "connections": current["connections"],
         "systemConnections": current["systemConnections"],
         "userCount": len(list_users()),
+        "socksPort": get_socks_inbound_port(),
         "traffic": get_traffic_totals(),
         "reportedAt": datetime.now(timezone.utc),
     }
