@@ -10,7 +10,7 @@
 
 | 维度 | 优化前 | 优化后 | 改进点 |
 | --- | --- | --- | --- |
-| 功能 | 仅生成 VLESS/VMess/SOCKS5 三协议 | 新增五种协议标准化输出（SOCKS5、比特浏览器、VLESS、SOCKS加速、VMess） | 对标 IPVelo 五协议 |
+| 功能 | 仅生成 VLESS/VMess/SOCKS 三协议 | 新增住宅场景五种协议标准化输出；直连场景只返回三种加速链接 | 兼容住宅与 VPS 直出两种模式 |
 | 架构 | 协议拼接逻辑内嵌在 `manager.py` | 独立 `protocols.py`（纯函数）+ `residential.py`（校验） | 高内聚、可复用、可测试 |
 | 安全 | 无结构化审计日志 | `_audit()` 记录关键操作，自动剔除密码/Token/连接 | 可观测且不泄露凭据 |
 | 健壮性 | 住宅 SOCKS 输入仅靠 Pydantic 基础校验 | 独立 `validate_*` 校验 + UUID 格式校验 | 校验统一、错误可定位 |
@@ -35,7 +35,7 @@
 ### 3.1 协议生成（功能增强）
 **优化前**：`manager.py` 中 `_vless_connection/_vmess_connection/_socks_connection` 各自拼接，无原始地址与加速地址区分。
 
-**优化后**：`protocols.py` 提供 `generate_all()` 一次性生成五种协议：
+**优化后**：`protocols.py` 提供五种纯协议生成函数；用户创建接口按是否绑定住宅出口筛选返回：
 
 ```python
 def generate_all(data: ProtocolData) -> dict[str, str]:
@@ -53,7 +53,7 @@ def generate_all(data: ProtocolData) -> dict[str, str]:
 ### 3.2 连接接口返回五协议（接口增强）
 **优化前**：`GET /api/user/{id}/connections` 仅返回 `vless/vmess/socks` 三字段。
 
-**优化后**：新增 `protocolsAll` 字段，包含五种协议链接。
+**优化后**：新增 `protocolsAll` 字段。未绑定住宅出口时只包含 `vless`、`socksAcceleration`、`vmess`；绑定住宅出口时再包含 `socks5`、`bitbrowser`。
 
 **改进点**：前端可直接展示五协议，无需另行拼接；兼容旧字段（`vless/vmess/socks` 仍保留）。
 
@@ -82,7 +82,7 @@ def _audit(action, user_id, **fields):
 ### 3.5 可配置加速域名（可配置性增强）
 **优化前**：加速域名硬编码。
 
-**优化后**：`config.yaml` 增加 `node.acceleration_domain`，默认 `proxy.tkip.xin`。
+**优化后**：`config.yaml` 增加可选 `node.acceleration_domain`；为空时回退到当前节点 `host`，不再默认使用其他部署的域名。
 
 **改进点**：不同部署可独立配置，无需改代码。
 
@@ -90,7 +90,7 @@ def _audit(action, user_id, **fields):
 
 | 项目 | 结果 |
 | --- | --- |
-| Node Manager 全量单元/集成测试 | **45 个用例全部通过** |
+| Node Manager 全量单元/集成测试 | **49 个用例全部通过** |
 | 新增协议测试 | 14 个（五协议格式、五合一、住宅校验和 UUID 校验） |
 | 性能/配置回归测试 | 3 个（配置不变跳过 reload、采样间隔边界、越界拒绝） |
 | 新增住宅校验测试 | 5 个（IP/端口/凭据/批量） |
@@ -114,6 +114,6 @@ def _audit(action, user_id, **fields):
 ## 7. 本轮补充（动态入口端口与五协议兼容）
 
 - `build_all_protocols()` 不再依赖固定的 20168/20169/5001 端口，而是从实际 sing-box inbound 读取 `listen_port`，异常时才回退到默认值。
-- 五协议完整键名固定为 `socks5`、`bitbrowser`、`vless`、`socksAcceleration`、`vmess`。
+- 协议键名固定为 `socks5`、`bitbrowser`、`vless`、`socksAcceleration`、`vmess`；实际响应按是否绑定住宅出口动态返回。
 - 住宅批量输入严格区分“住宅出口 IP”和“上游 SOCKS 地址”：前者用于 GeoIP/备注，后者用于 Node Manager 出站路由。
-- 当前 Node Manager 全量测试基线为 47 个用例；新增动态端口回归测试覆盖自定义 VLESS、VMess、SOCKS 入口端口。
+- 当前 Node Manager 全量测试基线为 49 个用例；新增动态端口、直连三协议、住宅凭据隔离回归测试已覆盖。

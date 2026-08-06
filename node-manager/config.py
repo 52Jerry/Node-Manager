@@ -49,7 +49,10 @@ class NodeConfig:
     id: str = field(default_factory=default_node_id)
     name: str = "Default Node"
     host: str = field(default_factory=get_public_ip)
-    acceleration_domain: str = "proxy.tkip.xin"
+    # Optional public domain for generated acceleration links.  An empty value
+    # deliberately falls back to this node's configured host, so a fresh
+    # installation never emits a stale domain belonging to another deployment.
+    acceleration_domain: str = ""
 
 
 @dataclass

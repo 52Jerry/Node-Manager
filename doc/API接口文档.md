@@ -108,7 +108,14 @@ curl http://<NODE_MANAGER_HOST>:8088/api/node/status \
 
 #### `POST /api/user/create`
 
-调用方可以指定 SOCKS5 用户名和密码，也可以留空由 Node Manager 自动生成。用户共享固定的 VLESS、VMess 和 SOCKS5 入站端口，不会为每个用户额外开放公网端口。
+调用方可以指定本地 SOCKS5 用户名和密码，也可以留空由 Node Manager 自动生成。用户共享固定的 VLESS、VMess 和 SOCKS 入站端口，不会为每个用户额外开放公网端口。
+
+`protocolsAll` 按出口模式返回协议：
+
+- 未传入 `proxy`（直连用户）：`vless`、`socksAcceleration`、`vmess` 三种 Node Manager 直出加速链接；不会返回 `socks5` 或 `bitbrowser`。
+- 传入 `proxy`（住宅出口用户）：在上述三种链接之外，再返回 `socks5` 和 `bitbrowser` 两种原始住宅链接。
+
+住宅 `proxy.username` / `proxy.password` 只用于 sing-box 出站绑定，不会复用成本地 SOCKS 用户凭据，也不会拼入加速协议链接。
 
 不绑定住宅出口时的请求：
 
@@ -141,8 +148,8 @@ curl http://<NODE_MANAGER_HOST>:8088/api/node/status \
 | --- | --- | --- | --- |
 | `userId` | string | 是 | 1 到 64 位，仅允许字母、数字、`.`、`_`、`-` |
 | `protocols` | string[] | 否 | 可选值为 `vless`、`vmess`、`socks`；默认全部创建且不允许重复 |
-| `socksUsername` | string | 否 | SOCKS5 入站账号；优先使用该值，其次复用 `proxy.username`，最后生成 `node-manager:{userId}`；仅在包含 `socks` 协议时允许传入 |
-| `socksPassword` | string | 否 | SOCKS5 入站密码；优先使用该值，其次复用 `proxy.password`，最后生成高强度随机密码；不能脱离 `socks` 协议单独传入 |
+| `socksUsername` | string | 否 | 本地 SOCKS5 入站账号；未传入时生成独立的 `node-manager:{userId}` 标识；仅在包含 `socks` 协议时允许传入 |
+| `socksPassword` | string | 否 | 本地 SOCKS5 入站密码；未传入时生成高强度随机密码；不能脱离 `socks` 协议单独传入 |
 | `proxy` | object | 否 | 创建时需要自动绑定的住宅 SOCKS5 出口；不传则只创建用户，以后可调用绑定接口 |
 | `proxy.server` | string | 是 | 住宅 SOCKS5 的 IP 或域名；仅在传入 `proxy` 时必填 |
 | `proxy.port` | integer | 是 | 住宅 SOCKS5 端口，范围 1 到 65535 |
@@ -154,9 +161,10 @@ curl http://<NODE_MANAGER_HOST>:8088/api/node/status \
 1. 普通用户建议不传 SOCKS5 账号密码，由 Node Manager 自动生成。
 2. 创建时传入完整 `proxy`，用户认证、住宅出站和路由会在同一个配置事务中生效；任一步失败都不会留下半成品用户。
 3. 创建时不传 `proxy`，用户不会绑定住宅出口，以后仍可调用 `POST /api/user/bind-proxy` 完成绑定。
-4. 包含 `socks` 协议时，每个凭据字段都按“显式本节点值、住宅出口值、自动生成值”的顺序独立选择。
-5. 若住宅出口没有认证信息，本节点 SOCKS5 用户名和密码仍按默认规则自动生成。
-6. SOCKS5 用户名在整个节点的认证标识中必须唯一，冲突时返回 `409`。
+4. 住宅出口凭据与本地 SOCKS 入站凭据完全隔离；上游凭据只写入该用户的出站配置。
+5. 未传入 `proxy` 时，只生成三种直出加速链接，不伪造原始住宅 SOCKS 链接。
+6. 传入 `proxy` 时，才生成 `socks5` / `bitbrowser` 原始住宅链接；上游凭据不得出现在加速链接、普通日志或浏览器持久化存储中。
+7. SOCKS5 用户名在整个节点的认证标识中必须唯一，冲突时返回 `409`。
 
 调用示例：
 
@@ -528,7 +536,7 @@ api.example.com {
 - ✔ Clash API 仅监听本机，避免 `9090` 暴露公网
 - ✔ 创建用户时支持可选 `socksUsername` 和 `socksPassword`
 - ✔ 创建用户时可选自动绑定住宅 SOCKS5 出口
-- ✔ 自动复用住宅账号密码作为本节点 SOCKS5 凭据
+- ✔ 本地 SOCKS 凭据与住宅上游账号密码隔离，默认生成独立随机凭据
 - ✔ 创建用户与住宅绑定使用同一个配置事务，失败时完整回滚
 - ✔ 用户注册表持久化，并兼容旧版 `node-manager:{userId}` 用户
 - ✔ 用户列表接口，支持分页、搜索、协议和住宅绑定信息

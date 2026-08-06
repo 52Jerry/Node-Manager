@@ -19,7 +19,14 @@ from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey
 
 from config import config
-from protocols import ProtocolData, generate_all
+from protocols import (
+    ProtocolData,
+    bitbrowser,
+    socks5_original,
+    socks_acceleration,
+    vmess,
+    vless,
+)
 from .api import SingboxAPI
 
 try:
@@ -373,21 +380,33 @@ def build_all_protocols(
     vmess_inbound: dict[str, Any] | None = None,
     socks_inbound: dict[str, Any] | None = None,
     vless_security: str = "reality",
+    include_original: bool = False,
+    enabled_protocols: set[str] | None = None,
 ) -> dict[str, str]:
-    """基于统一数据源生成五种协议链接（对标 IPVelo）。
+    """Generate the public links for one Node Manager user.
 
-    - 原始地址(ip) 使用节点公网地址；加速线路使用 acceleration_domain。
-    - 加速线路 SOCKS 凭据由 username/password 前端 Base64 编码。
+    The three Node Manager acceleration links are generated from the local
+    inbounds and are independent of any upstream residential proxy.  The two
+    legacy/original links are opt-in and are only emitted when a local SOCKS
+    connection exists *and* the caller explicitly requests them (residential
+    provisioning).  Upstream proxy credentials are never passed here.
     """
-    if socks is None:
-        return {}
+    enabled = enabled_protocols or {"vless", "vmess", "socks"}
+    acceleration_host = (config.node.acceleration_domain or config.node.host).strip()
+    if not acceleration_host:
+        acceleration_host = config.node.host
+
+    # VLESS/VMess do not need SOCKS credentials.  For SOCKS acceleration,
+    # however, use the actual local inbound credentials only.
+    local_username = str((socks or {}).get("username") or _auth_name(user_id))
+    local_password = str((socks or {}).get("password") or "")
     data = ProtocolData(
-        ip=socks["host"],
-        port=int(socks["port"]),
-        username=socks["username"],
-        password=socks["password"],
+        ip=str((socks or {}).get("host") or config.node.host),
+        port=int((socks or {}).get("port") or _inbound_port(socks_inbound, 5001)),
+        username=local_username,
+        password=local_password,
         uuid=user_uuid or "",
-        acceleration_domain=config.node.acceleration_domain,
+        acceleration_domain=acceleration_host,
         acceleration_port_socks=_inbound_port(socks_inbound, 5001),
         vless_port=_inbound_port(vless_inbound, 20168),
         vmess_port=_inbound_port(vmess_inbound, 20169),
@@ -401,7 +420,17 @@ def build_all_protocols(
         except SingboxConfigError:
             logger.warning("could not derive Reality client params for %s", user_id)
     data.vless_security = vless_security
-    return generate_all(data)
+    links: dict[str, str] = {}
+    if include_original and socks is not None:
+        links["socks5"] = socks5_original(data)
+        links["bitbrowser"] = bitbrowser(data)
+    if "vless" in enabled and vless_inbound is not None and user_uuid:
+        links["vless"] = vless(data)
+    if "socks" in enabled and socks is not None and socks_inbound is not None:
+        links["socksAcceleration"] = socks_acceleration(data)
+    if "vmess" in enabled and vmess_inbound is not None and user_uuid:
+        links["vmess"] = vmess(data)
+    return links
 
 
 def create_user(
@@ -412,8 +441,11 @@ def create_user(
     proxy: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     user_uuid = str(uuid.uuid4())
-    effective_socks_username = socks_username or (proxy or {}).get("username") or _auth_name(user_id)
-    effective_socks_password = socks_password or (proxy or {}).get("password") or secrets.token_urlsafe(18)
+    # The local SOCKS inbound credentials are distinct from the upstream
+    # residential proxy credentials.  The latter are used only by the
+    # per-user outbound and must never leak into a public node link.
+    effective_socks_username = socks_username or _auth_name(user_id)
+    effective_socks_password = socks_password or secrets.token_urlsafe(18)
 
     def apply(data: dict[str, Any], registry: dict[str, Any]) -> dict[str, Any]:
         if _user_exists(data, registry, user_id):
@@ -454,41 +486,32 @@ def create_user(
                 effective_socks_username, effective_socks_password, inbound
             )
 
-            # 住宅 SOCKS 用户创建后同时返回统一的五协议连接信息。
-            # 这一步必须发生在 SOCKS 用户写入 response 之后，否则 FastAPI
-            # 虽然有 protocolsAll 字段，实际响应仍会是空对象。
-            vless_inbound = next(
-                (
-                    item
-                    for item in data.get("inbounds", [])
-                    if item.get("tag") == config.singbox.vless_tag
-                ),
-                None,
-            )
-            vmess_inbound = next(
-                (
-                    item
-                    for item in data.get("inbounds", [])
-                    if item.get("tag") == config.singbox.vmess_tag
-                ),
-                None,
-            )
-            socks_inbound = next(
-                (
-                    item
-                    for item in data.get("inbounds", [])
-                    if item.get("tag") == config.singbox.socks_tag
-                ),
-                None,
-            )
-            response["protocolsAll"] = build_all_protocols(
-                user_id,
-                user_uuid,
-                response["socks"],
-                vless_inbound=vless_inbound,
-                vmess_inbound=vmess_inbound,
-                socks_inbound=socks_inbound,
-            )
+        # Generate the dynamic protocol set after all requested inbounds are
+        # known.  Residential users get the two original proxy links in
+        # addition to the three local acceleration links; direct users get
+        # only the local links.
+        vless_inbound = next(
+            (item for item in data.get("inbounds", [])
+             if item.get("tag") == config.singbox.vless_tag), None
+        )
+        vmess_inbound = next(
+            (item for item in data.get("inbounds", [])
+             if item.get("tag") == config.singbox.vmess_tag), None
+        )
+        socks_inbound = next(
+            (item for item in data.get("inbounds", [])
+             if item.get("tag") == config.singbox.socks_tag), None
+        )
+        response["protocolsAll"] = build_all_protocols(
+            user_id,
+            user_uuid,
+            response["socks"],
+            vless_inbound=vless_inbound,
+            vmess_inbound=vmess_inbound,
+            socks_inbound=socks_inbound,
+            include_original=proxy is not None,
+            enabled_protocols=set(protocols),
+        )
 
         registry.setdefault("users", {})[user_id] = {
             "socksUsername": effective_socks_username if "socks" in protocols else None,
@@ -840,6 +863,8 @@ def get_user_connection(user_id: str) -> dict[str, Any]:
         vless_inbound=vless_inbound,
         vmess_inbound=vmess_inbound,
         socks_inbound=socks_inbound,
+        include_original=response["proxyBound"],
+        enabled_protocols=set(protocols),
     )
     if all_protocols:
         response["protocolsAll"] = all_protocols

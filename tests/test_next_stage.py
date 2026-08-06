@@ -120,7 +120,7 @@ class ManagerTestCase(unittest.TestCase):
         self.assertEqual(created["socks"]["password"], "residential-password")
         self.assertEqual(
             set(created["protocolsAll"]),
-            {"socks5", "bitbrowser", "vless", "socksAcceleration", "vmess"},
+            {"vless", "socksAcceleration", "vmess"},
         )
 
         manager.bind_proxy(
@@ -153,7 +153,10 @@ class ManagerTestCase(unittest.TestCase):
         self.assertEqual(connection["vless"], created["vless"])
         self.assertEqual(connection["vmess"], created["vmess"])
         self.assertEqual(connection["socks"], created["socks"])
-        self.assertEqual(connection["protocolsAll"], created["protocolsAll"])
+        self.assertEqual(
+            set(connection["protocolsAll"]),
+            {"socks5", "bitbrowser", "vless", "socksAcceleration", "vmess"},
+        )
         self.assertTrue(connection["proxyBound"])
 
         manager.delete_user("customer-1")
@@ -179,9 +182,9 @@ class ManagerTestCase(unittest.TestCase):
 
         # VLESS/VMess/SOCKS 加速协议使用配置的 acceleration_domain，
         # 但端口必须跟随实际 sing-box inbound，而不是硬编码默认值。
-        self.assertIn("@proxy.tkip.xin:21068?", created["protocolsAll"]["vless"])
+        self.assertIn("@192.0.2.10:21068?", created["protocolsAll"]["vless"])
         self.assertEqual(created["socks"]["port"], 5101)
-        self.assertIn("@proxy.tkip.xin:5101#", created["protocolsAll"]["socksAcceleration"])
+        self.assertIn("@192.0.2.10:5101#", created["protocolsAll"]["socksAcceleration"])
         vmess_payload = created["protocolsAll"]["vmess"].split("//", 1)[1]
         vmess_config = json.loads(__import__("base64").b64decode(vmess_payload))
         self.assertEqual(vmess_config["port"], "21069")
@@ -234,7 +237,7 @@ class ManagerTestCase(unittest.TestCase):
         self.assertEqual(connection["socks"]["username"], legacy_name)
         self.assertEqual(connection["socks"]["password"], "legacy-password")
 
-    def test_create_can_atomically_bind_proxy_and_reuse_credentials(self):
+    def test_create_can_atomically_bind_proxy_without_reusing_upstream_credentials(self):
         created = manager.create_user(
             "customer-proxy",
             ["vless", "socks"],
@@ -247,17 +250,57 @@ class ManagerTestCase(unittest.TestCase):
             },
         )
         self.assertTrue(created["proxyBound"])
-        self.assertEqual(created["socks"]["username"], "upstream-user")
-        self.assertEqual(created["socks"]["password"], "upstream-password")
+        self.assertNotEqual(created["socks"]["username"], "upstream-user")
+        self.assertNotEqual(created["socks"]["password"], "upstream-password")
+        self.assertEqual(
+            set(created["protocolsAll"]),
+            {"socks5", "bitbrowser", "vless", "socksAcceleration"},
+        )
+        for link in created["protocolsAll"].values():
+            self.assertNotIn("upstream-user", link)
+            self.assertNotIn("upstream-password", link)
 
         data = json.loads(self.config_path.read_text(encoding="utf-8"))
         self.assertEqual(data["outbounds"][0]["server"], "203.0.113.30")
         self.assertEqual(data["outbounds"][0]["server_port"], 2080)
         self.assertEqual(
             data["route"]["rules"][0]["auth_user"],
-            ["node-manager:customer-proxy", "upstream-user"],
+            ["node-manager:customer-proxy"],
         )
         self.assertTrue(manager.list_users()[0]["proxyBound"])
+
+    def test_direct_user_returns_only_three_acceleration_links(self):
+        created = manager.create_user(
+            "direct-user",
+            ["vless", "vmess", "socks"],
+        )
+        self.assertEqual(
+            set(created["protocolsAll"]),
+            {"vless", "socksAcceleration", "vmess"},
+        )
+        self.assertNotIn("socks5", created["protocolsAll"])
+        self.assertNotIn("bitbrowser", created["protocolsAll"])
+        for link in created["protocolsAll"].values():
+            self.assertTrue(link)
+
+    def test_proxy_credentials_are_used_only_by_outbound(self):
+        created = manager.create_user(
+            "proxy-isolated",
+            ["vless", "vmess", "socks"],
+            proxy={
+                "type": "socks5",
+                "server": "203.0.113.30",
+                "port": 2080,
+                "username": "upstream-user",
+                "password": "upstream-password",
+            },
+        )
+        data = json.loads(self.config_path.read_text(encoding="utf-8"))
+        outbound = next(item for item in data["outbounds"] if item["tag"] == "node-manager-out:proxy-isolated")
+        self.assertEqual(outbound["username"], "upstream-user")
+        self.assertEqual(outbound["password"], "upstream-password")
+        self.assertNotEqual(created["socks"]["username"], outbound["username"])
+        self.assertNotEqual(created["socks"]["password"], outbound["password"])
 
     def test_create_rejects_proxy_loop_to_local_socks_without_leaving_user(self):
         with self.assertRaisesRegex(manager.SingboxConfigError, "proxy loop"):
@@ -421,7 +464,7 @@ class ApiTestCase(unittest.TestCase):
         self.assertEqual(response.json()["socks"]["username"], "api-socks-user")
         self.assertEqual(
             set(response.json()["protocolsAll"]),
-            {"socks5", "bitbrowser", "vless", "socksAcceleration", "vmess"},
+            {"socksAcceleration"},
         )
 
         response = self.client.get("/api/users?page=1&pageSize=10", headers=headers)
@@ -445,7 +488,7 @@ class ApiTestCase(unittest.TestCase):
         self.assertEqual(connections.status_code, 200, connections.text)
         self.assertEqual(
             set(connections.json()["protocolsAll"]),
-            {"socks5", "bitbrowser", "vless", "socksAcceleration", "vmess"},
+            {"socksAcceleration"},
         )
 
     def test_create_user_endpoint_can_bind_proxy(self):
@@ -468,7 +511,12 @@ class ApiTestCase(unittest.TestCase):
         self.assertEqual(response.status_code, 200, response.text)
         body = response.json()
         self.assertTrue(body["proxyBound"])
-        self.assertEqual(body["socks"]["username"], "proxy-user")
+        self.assertNotEqual(body["socks"]["username"], "proxy-user")
+        self.assertNotEqual(body["socks"]["password"], "proxy-password")
+        self.assertEqual(
+            set(body["protocolsAll"]),
+            {"socks5", "bitbrowser", "socksAcceleration"},
+        )
 
         response = self.client.get("/api/users", headers=headers)
         self.assertTrue(response.json()["items"][0]["proxyBound"])

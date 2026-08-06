@@ -225,7 +225,9 @@ curl -H "Authorization: Bearer YOUR_TOKEN" \
 `socksUsername` 和 `socksPassword` 均为可选字段。不传用户名时使用
 `node-manager:{userId}`，不传密码时由服务端生成随机密码。创建请求可选携带 `proxy`，
 一次完成住宅 SOCKS5 出口绑定；不传 `proxy` 时可在以后调用绑定接口。未单独指定本节点
-SOCKS5 凭据时，会自动复用住宅出口的用户名和密码。用户列表不会返回明文密码。
+SOCKS 凭据时，服务端会生成独立的本地入站账号和随机密码，不会复用住宅出口的用户名或密码。
+绑定住宅出口后，`protocolsAll` 才会额外返回 `socks5` 和 `bitbrowser` 原始住宅链接；直连用户仅返回
+`vless`、`socksAcceleration`、`vmess` 三种 Node Manager 加速链接。用户列表不会返回明文密码。
 Spring Boot 调用创建、绑定和删除接口时应始终发送唯一 `Idempotency-Key`；相同键和相同请求会返回首次结果，响应头 `Idempotency-Replayed: true` 表示本次为重放。
 
 **Agent 能力与心跳**

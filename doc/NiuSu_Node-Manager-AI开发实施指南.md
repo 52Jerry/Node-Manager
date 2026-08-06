@@ -14,13 +14,13 @@
 **每一步做什么：**
 1. 确认 Python 3.10+ 已安装。命令：`python --version`
 2. 安装依赖：`pip install -r node-manager/requirements.txt`
-3. 确认 `config.yaml` 存在且 `node.acceleration_domain` 已配置（默认 `proxy.tkip.xin`）。
+3. 确认 `config.yaml` 存在；`node.acceleration_domain` 可选，未配置时回退到当前节点 `host`。
 4. 运行全部测试：
    ```powershell
    cd "Node Manager"
    python -m unittest discover -s tests -v
    ```
-5. 确认当前 **47 个用例全部通过**（含 `test_protocols.py` 的协议/住宅校验，以及节点身份、动态端口和安装契约回归用例）。
+5. 确认当前 **49 个用例全部通过**（含 `test_protocols.py` 的协议/住宅校验，以及节点身份、动态端口和安装契约回归用例）。
 
 **验收**：测试全绿，无 ModuleNotFoundError。
 
@@ -30,7 +30,7 @@
 
 > 已实现 `protocols.py`。核对以下行为，不符则修正。
 
-### 步骤 1.1 核验五种协议格式
+### 步骤 1.1 核验协议格式
 **改动文件**：`node-manager/protocols.py`
 **做什么**（逐项核验）：
 1. `socks5_original` → `socks://user:pass@ip:port#US-1.2.3.4`
@@ -39,10 +39,10 @@
 4. `socks_acceleration` → `socks://b64user:b64pass@域名:5001#备注`（账号密码 Base64）
 5. `vmess` → `vmess://base64(JSON)`，JSON 含 `v/ps/add/port/id/aid/scy/net/type/host/path/tls/sni/alpn/fp`
 
-**验收**：`test_protocols.py` 全部通过；生成结果与 IPVelo 11.9 节参数一致。
+**验收**：`test_protocols.py` 全部通过；住宅请求生成五种格式，直连用户只生成三种加速格式。
 
 ### 步骤 1.2 核验统一数据源 `ProtocolData`
-**做什么**：确认 `ProtocolData` 覆盖通用/IP/端口/账号/密码、加速域名/uuid、VLESS 与 VMess 专属参数，且 `generate_all(data)` 一次返回五键 `{socks5,bitbrowser,vless,socksAcceleration,vmess}`。
+**做什么**：确认 `ProtocolData` 覆盖通用/IP/端口/账号/密码、加速域名/uuid、VLESS 与 VMess 专属参数。底层 `generate_all(data)` 仍提供五种纯函数格式；用户创建接口根据是否绑定住宅出口筛选返回集合。
 
 **验收**：`test_generate_all` 断言五键齐全。
 
@@ -86,10 +86,10 @@
 **做什么**：
 1. 确认新增 `POST /api/residential/protocols`，请求体含 `ip/port/username/password/uuid?/accelerationDomain?`。
 2. 确认 `ResidentialSocksRequest.uuid` 校验为合法 UUID（非空时）。
-3. 确认响应含 `protocolsAll`（五协议）与 `meta`（国家/地区）。
+3. 确认住宅请求响应含 `protocolsAll`（五协议）与 `meta`（国家/地区）；该端点本身就是住宅信息生成端点。
 4. 确认端点要求 `Bearer` 鉴权（复用现有 auth）。
 
-**验收**：用 `curl -H "Authorization: Bearer <token>"` 调用返回五协议；非法 UUID 返回 422。
+**验收**：用 `curl -H "Authorization: Bearer <token>"` 调用住宅端点返回五协议；非法 UUID 返回 422。调用 `/api/user/create` 且不传 `proxy` 时应只返回三种加速链接。
 
 ### 步骤 3.2 入口端口来源
 
@@ -191,8 +191,8 @@
 
 ### 当前交付基线
 
-- Node Manager：47 个 Python 单元/集成测试。
-- `protocolsAll` 固定包含 `socks5`、`bitbrowser`、`vless`、`socksAcceleration`、`vmess` 五个键。
+- Node Manager：49 个 Python 单元/集成测试。
+- `protocolsAll` 按出口模式返回：无 `proxy` 时为 `vless`、`socksAcceleration`、`vmess`；有 `proxy` 时为 `socks5`、`bitbrowser`、`vless`、`socksAcceleration`、`vmess`。
 - 审计日志仅记录操作类型、用户 ID、节点元数据，不记录密码、Token 或完整连接链接。
 - 普通用户列表不返回明文凭据；连接详情仅按需读取。
 
@@ -206,7 +206,7 @@
 
 ## 本轮实施状态（2026-08-06）
 
-- Node Manager 保持五协议兼容输出：`socks5`、`bitbrowser`、`vless`、`socksAcceleration`、`vmess`；旧版 `vless/vmess/socks` 字段继续保留。
+- Node Manager 保持五协议格式兼容输出，但按出口模式动态返回：无住宅为 `vless`、`socksAcceleration`、`vmess`，有住宅才增加 `socks5`、`bitbrowser`；旧版 `vless/vmess/socks` 字段继续保留。
 - 住宅批量输入继续区分住宅出口 IP 与上游 SOCKS 地址：住宅 IP 用于 GeoIP/备注，上游地址用于出站路由，协议入口使用实际 sing-box 动态端口。
-- 当前测试基线为 **47 个用例全部通过**。新增实现必须同时补协议格式、住宅校验、动态端口和敏感信息脱敏测试。
+- 当前测试基线为 **49 个用例全部通过**。新增实现必须同时补协议格式、住宅校验、动态端口和敏感信息脱敏测试。
 - 生产安装仍建议使用 Control Plane 生成的十分钟一次性安装命令；安装令牌不写入普通日志，Node Manager API Token 仅通过环境/配置注入。

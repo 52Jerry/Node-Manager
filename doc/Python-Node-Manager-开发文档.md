@@ -178,10 +178,16 @@ reload，失败则 restart
 
 规则：
 
-- `socksUsername` 不传时，优先复用住宅用户名，否则使用 `node-manager:{userId}`。
-- `socksPassword` 不传时，优先复用住宅密码，否则生成随机密码。
+- `socksUsername` 不传时生成独立的 `node-manager:{userId}` 本地入站账号，不复用住宅用户名。
+- `socksPassword` 不传时生成独立随机密码，不复用住宅密码。
 - `proxy` 不传时先创建直连用户，后续可调用绑定接口。
 - 创建、绑定、删除接口应由 Spring Boot 发送唯一 `Idempotency-Key`。
+
+连接字段规则：
+
+- 不传 `proxy`：`protocolsAll` 只有 `vless`、`socksAcceleration`、`vmess` 三种 Node Manager 直出加速链接。
+- 传入 `proxy`：`protocolsAll` 额外包含 `socks5`、`bitbrowser` 两种原始住宅链接。
+- 住宅上游账号密码只用于 sing-box 出站配置，不会写入本地 SOCKS 入站、加速链接、普通日志或浏览器存储。
 
 ## 10. 连接和流量指标
 

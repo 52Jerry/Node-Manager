@@ -155,9 +155,10 @@ def generate_residential_protocols(
     response: Response,
     _token: str = Depends(verify_token),
 ):
-    """住宅 SOCKS 代理配置模块：校验输入并生成五种协议链接。
+    """住宅 SOCKS 代理配置模块：校验输入并生成五种协议模板。
 
-    输入校验失败返回 422；成功返回五种协议标准化输出。
+    该接口本身接收完整的住宅 SOCKS 参数，因此返回五种标准化协议。
+    节点用户创建/连接接口则按是否绑定住宅出口动态返回三种或五种协议。
     """
     try:
         cfg = validate_config(
@@ -177,7 +178,11 @@ def generate_residential_protocols(
     effective_uuid = request.uuid or str(uuid.uuid4())
     data = cfg.to_protocol_data(
         uuid=effective_uuid,
-        acceleration_domain=request.accelerationDomain or config.node.acceleration_domain,
+        acceleration_domain=(
+            request.accelerationDomain
+            or config.node.acceleration_domain
+            or config.node.host
+        ),
     )
     response.headers["Cache-Control"] = "no-store"
     return {
