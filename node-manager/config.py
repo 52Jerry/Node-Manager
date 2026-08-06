@@ -1,5 +1,6 @@
 import os
 import socket
+import hashlib
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -9,6 +10,21 @@ import yaml
 
 SYSTEM_CONFIG_PATH = Path("/etc/node-manager/config.yaml")
 LOCAL_CONFIG_PATH = Path(__file__).with_name("config.yaml")
+MACHINE_ID_PATH = Path("/etc/machine-id")
+
+
+def default_node_id() -> str:
+    """Return a stable node id that remains unique across same-named VPS hosts."""
+    hostname = socket.gethostname().strip() or "node"
+    machine_id = ""
+    try:
+        machine_id = MACHINE_ID_PATH.read_text(encoding="utf-8").strip()
+    except OSError:
+        pass
+    if machine_id:
+        suffix = hashlib.sha256(machine_id.encode("utf-8")).hexdigest()[:12]
+        return f"{hostname}-{suffix}"
+    return hostname
 
 
 def get_public_ip() -> str:
@@ -30,9 +46,10 @@ def get_public_ip() -> str:
 
 @dataclass
 class NodeConfig:
-    id: str = field(default_factory=socket.gethostname)
+    id: str = field(default_factory=default_node_id)
     name: str = "Default Node"
     host: str = field(default_factory=get_public_ip)
+    acceleration_domain: str = "proxy.tkip.xin"
 
 
 @dataclass
@@ -56,11 +73,17 @@ class SingboxConfig:
 
 
 @dataclass
+class MonitoringConfig:
+    traffic_sample_interval_seconds: float = 2.0
+
+
+@dataclass
 class Config:
     node: NodeConfig = field(default_factory=NodeConfig)
     server: ServerConfig = field(default_factory=ServerConfig)
     security: SecurityConfig = field(default_factory=SecurityConfig)
     singbox: SingboxConfig = field(default_factory=SingboxConfig)
+    monitoring: MonitoringConfig = field(default_factory=MonitoringConfig)
 
 
 def load_config() -> Config:
@@ -82,6 +105,9 @@ def load_config() -> Config:
     result.node.name = node.get("name", result.node.name)
     host = node.get("host", result.node.host)
     result.node.host = get_public_ip() if not host or str(host).lower() == "auto" else str(host)
+    result.node.acceleration_domain = str(
+        node.get("acceleration_domain", result.node.acceleration_domain)
+    )
 
     server = data.get("server", {})
     result.server.port = int(server.get("port", result.server.port))
@@ -94,6 +120,15 @@ def load_config() -> Config:
         if name in singbox:
             setattr(result.singbox, name, str(singbox[name]))
     result.singbox.api_port = int(singbox.get("api_port", result.singbox.api_port))
+
+    monitoring = data.get("monitoring", {})
+    interval = float(monitoring.get(
+        "traffic_sample_interval_seconds",
+        result.monitoring.traffic_sample_interval_seconds,
+    ))
+    if interval < 0.5 or interval > 300:
+        raise ValueError("monitoring.traffic_sample_interval_seconds must be between 0.5 and 300")
+    result.monitoring.traffic_sample_interval_seconds = interval
     return result
 
 

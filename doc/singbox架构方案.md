@@ -523,24 +523,24 @@ curl -H "Authorization: Bearer YOUR_TOKEN" -X DELETE http://node-ip:8088/api/use
 ====================================
 
 服务器信息:
-  IP: 198.13.46.231
+  IP: <NODE_MANAGER_HOST>
   主机名: tokyo-01
 
 sing-box:
   状态: active
-  API: http://198.13.46.231:9090
+  API: http://<NODE_MANAGER_HOST>:9090
   API Secret: xxxxxx
 
 Node Manager:
-  API: http://198.13.46.231:8088
+  API: http://<NODE_MANAGER_HOST>:8088
   Token: xxxxxx
-  Web UI: http://198.13.46.231:8088
-  测试: curl -H "Authorization: Bearer xxxxxx" http://198.13.46.231:8088/api/node/status
+  Web UI: http://<NODE_MANAGER_HOST>:8088
+  测试: curl -H "Authorization: Bearer <NODE_TOKEN>" http://<NODE_MANAGER_HOST>:8088/api/node/status
 
 节点链接:
-  VLESS Reality: vless://xxx@198.13.46.231:20168?...
+  VLESS Reality: vless://<UUID>@<NODE_MANAGER_HOST>:20168?...
   VMess: vmess://base64...
-  SOCKS5: 198.13.46.231:5001
+  SOCKS5: <NODE_MANAGER_HOST>:5001
 
 端口配置:
   VLESS: 20168

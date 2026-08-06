@@ -338,7 +338,21 @@ if [ -f "$CONFIG_DIR/config.yaml" ]; then
     section == "node" && /^[[:space:]]+id:/ {print $2; exit}
   ' "$CONFIG_DIR/config.yaml" | tr -d '"' | tr -d "'")"
 fi
-NODE_ID="${NODE_MANAGER_NODE_ID:-${EXISTING_NODE_ID:-$(hostname)}}"
+default_node_id() {
+  local host machine_id suffix
+  host="$(hostname)"
+  machine_id=""
+  if [ -r /etc/machine-id ]; then
+    machine_id="$(tr -d '[:space:]' < /etc/machine-id)"
+  fi
+  if [ -n "$machine_id" ] && command -v sha256sum >/dev/null 2>&1; then
+    suffix="$(printf '%s' "$machine_id" | sha256sum | awk '{print substr($1, 1, 12)}')"
+    printf '%s-%s' "$host" "$suffix"
+  else
+    printf '%s' "$host"
+  fi
+}
+NODE_ID="${NODE_MANAGER_NODE_ID:-${EXISTING_NODE_ID:-$(default_node_id)}}"
 NODE_NAME="${NODE_MANAGER_NAME:-$NODE_ID}"
 cat > "$CONFIG_DIR/config.yaml" <<EOF
 node:

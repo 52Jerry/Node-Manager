@@ -118,6 +118,10 @@ class ManagerTestCase(unittest.TestCase):
         )
         self.assertEqual(created["socks"]["username"], "residential-user")
         self.assertEqual(created["socks"]["password"], "residential-password")
+        self.assertEqual(
+            set(created["protocolsAll"]),
+            {"socks5", "bitbrowser", "vless", "socksAcceleration", "vmess"},
+        )
 
         manager.bind_proxy(
             "customer-1",
@@ -149,6 +153,7 @@ class ManagerTestCase(unittest.TestCase):
         self.assertEqual(connection["vless"], created["vless"])
         self.assertEqual(connection["vmess"], created["vmess"])
         self.assertEqual(connection["socks"], created["socks"])
+        self.assertEqual(connection["protocolsAll"], created["protocolsAll"])
         self.assertTrue(connection["proxyBound"])
 
         manager.delete_user("customer-1")
@@ -157,6 +162,29 @@ class ManagerTestCase(unittest.TestCase):
         self.assertEqual(data["outbounds"], [])
         self.assertEqual(data["route"]["rules"], [])
         self.assertEqual(manager.list_users(), [])
+
+    def test_protocol_links_follow_actual_singbox_inbound_ports(self):
+        data = base_singbox_config()
+        data["inbounds"][0]["listen_port"] = 21068
+        data["inbounds"][1]["listen_port"] = 21069
+        data["inbounds"][2]["listen_port"] = 5101
+        self._write_config(data)
+
+        created = manager.create_user(
+            "custom-ports",
+            ["vless", "vmess", "socks"],
+            socks_username="custom-ports-user",
+            socks_password="custom-ports-password",
+        )
+
+        # VLESS/VMess/SOCKS 加速协议使用配置的 acceleration_domain，
+        # 但端口必须跟随实际 sing-box inbound，而不是硬编码默认值。
+        self.assertIn("@proxy.tkip.xin:21068?", created["protocolsAll"]["vless"])
+        self.assertEqual(created["socks"]["port"], 5101)
+        self.assertIn("@proxy.tkip.xin:5101#", created["protocolsAll"]["socksAcceleration"])
+        vmess_payload = created["protocolsAll"]["vmess"].split("//", 1)[1]
+        vmess_config = json.loads(__import__("base64").b64decode(vmess_payload))
+        self.assertEqual(vmess_config["port"], "21069")
 
     def test_password_is_generated_when_omitted(self):
         created = manager.create_user(
@@ -391,6 +419,10 @@ class ApiTestCase(unittest.TestCase):
         )
         self.assertEqual(response.status_code, 200, response.text)
         self.assertEqual(response.json()["socks"]["username"], "api-socks-user")
+        self.assertEqual(
+            set(response.json()["protocolsAll"]),
+            {"socks5", "bitbrowser", "vless", "socksAcceleration", "vmess"},
+        )
 
         response = self.client.get("/api/users?page=1&pageSize=10", headers=headers)
         self.assertEqual(response.status_code, 200, response.text)
@@ -405,6 +437,16 @@ class ApiTestCase(unittest.TestCase):
         self.assertEqual(response.headers["Cache-Control"], "no-store")
         self.assertEqual(response.json()["socks"]["username"], "api-socks-user")
         self.assertTrue(response.json()["socks"]["password"])
+
+        # response_model 必须保留五协议字段，且连接详情仍然禁止缓存。
+        connections = self.client.get(
+            "/api/user/api-user/connections", headers=headers
+        )
+        self.assertEqual(connections.status_code, 200, connections.text)
+        self.assertEqual(
+            set(connections.json()["protocolsAll"]),
+            {"socks5", "bitbrowser", "vless", "socksAcceleration", "vmess"},
+        )
 
     def test_create_user_endpoint_can_bind_proxy(self):
         headers = {"Authorization": "Bearer test-token"}
@@ -592,6 +634,97 @@ class TrafficTestCase(unittest.TestCase):
         self.assertEqual(deleted["total"], 0)
 
 
+class SingboxWriteReloadTest(unittest.TestCase):
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.config_path = Path(self.temp_dir.name) / "sing-box.json"
+        self.config_path.write_text(
+            json.dumps(base_singbox_config(), indent=2) + "\n", encoding="utf-8"
+        )
+        self.path_patch = patch.object(manager, "CONFIG_PATH", self.config_path)
+        self.path_patch.start()
+
+    def tearDown(self):
+        self.path_patch.stop()
+        self.temp_dir.cleanup()
+
+    def test_identical_config_skips_validation_write_and_reload(self):
+        current = json.loads(self.config_path.read_text(encoding="utf-8"))
+        with (
+            patch.object(manager, "check_config") as check_config,
+            patch.object(manager, "reload_singbox") as reload_singbox,
+        ):
+            manager._write_and_reload(current)
+
+        check_config.assert_not_called()
+        reload_singbox.assert_not_called()
+        self.assertEqual(
+            json.loads(self.config_path.read_text(encoding="utf-8")), current
+        )
+
+
+class MonitoringConfigTest(unittest.TestCase):
+    def test_sampling_interval_accepts_supported_boundaries(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_path = Path(temp_dir) / "config.yaml"
+            config_path.write_text(
+                "node:\n  host: 192.0.2.10\nmonitoring:\n  traffic_sample_interval_seconds: 0.5\n",
+                encoding="utf-8",
+            )
+            with patch.dict(os.environ, {"NODE_MANAGER_CONFIG": str(config_path)}):
+                loaded = config_module.load_config()
+            self.assertEqual(loaded.monitoring.traffic_sample_interval_seconds, 0.5)
+
+            config_path.write_text(
+                "node:\n  host: 192.0.2.10\nmonitoring:\n  traffic_sample_interval_seconds: 300\n",
+                encoding="utf-8",
+            )
+            with patch.dict(os.environ, {"NODE_MANAGER_CONFIG": str(config_path)}):
+                loaded = config_module.load_config()
+            self.assertEqual(loaded.monitoring.traffic_sample_interval_seconds, 300)
+
+    def test_sampling_interval_rejects_values_outside_supported_range(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_path = Path(temp_dir) / "config.yaml"
+            for value in (0.49, 300.01):
+                config_path.write_text(
+                    f"node:\n  host: 192.0.2.10\nmonitoring:\n  traffic_sample_interval_seconds: {value}\n",
+                    encoding="utf-8",
+                )
+                with self.subTest(value=value), patch.dict(
+                    os.environ, {"NODE_MANAGER_CONFIG": str(config_path)}
+                ):
+                    with self.assertRaisesRegex(ValueError, "between 0.5 and 300"):
+                        config_module.load_config()
+
+
+class NodeIdentityTest(unittest.TestCase):
+    def test_default_node_id_is_stable_and_distinguishes_same_hostname(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            machine_id_path = Path(temp_dir) / "machine-id"
+            machine_id_path.write_text("machine-a\n", encoding="utf-8")
+            with patch.object(config_module, "MACHINE_ID_PATH", machine_id_path), patch.object(
+                config_module.socket, "gethostname", return_value="vultr"
+            ):
+                first = config_module.default_node_id()
+                second = config_module.default_node_id()
+            self.assertEqual(first, second)
+            self.assertEqual(first, "vultr-" + __import__("hashlib").sha256(b"machine-a").hexdigest()[:12])
+
+            machine_id_path.write_text("machine-b\n", encoding="utf-8")
+            with patch.object(config_module, "MACHINE_ID_PATH", machine_id_path), patch.object(
+                config_module.socket, "gethostname", return_value="vultr"
+            ):
+                other = config_module.default_node_id()
+            self.assertNotEqual(first, other)
+
+    def test_default_node_id_falls_back_to_hostname_without_machine_id(self):
+        with patch.object(config_module, "MACHINE_ID_PATH", Path("Z:/missing-machine-id")), patch.object(
+            config_module.socket, "gethostname", return_value="test-node"
+        ):
+            self.assertEqual(config_module.default_node_id(), "test-node")
+
+
 class InstallerContractTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -673,6 +806,11 @@ class InstallerContractTest(unittest.TestCase):
             'replacing the sing-box package default config with the Node Manager config',
             self.installer,
         )
+
+    def test_fresh_install_generates_unique_node_id_from_machine_id(self):
+        self.assertIn('default_node_id() {', self.installer)
+        self.assertIn('sha256sum', self.installer)
+        self.assertIn('NODE_ID="${NODE_MANAGER_NODE_ID:-${EXISTING_NODE_ID:-$(default_node_id)}}"', self.installer)
 
 
 if __name__ == "__main__":

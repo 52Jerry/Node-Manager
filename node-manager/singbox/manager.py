@@ -19,6 +19,7 @@ from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey
 
 from config import config
+from protocols import ProtocolData, generate_all
 from .api import SingboxAPI
 
 try:
@@ -35,6 +36,21 @@ USER_PREFIX = "node-manager:"
 USER_OUTBOUND_PREFIX = "node-manager-out:"
 singbox_api = SingboxAPI()
 thread_lock = threading.Lock()
+
+
+def _audit(action: str, user_id: str, **fields: Any) -> None:
+    """记录关键操作审计日志。绝不记录密码、Token 或完整连接 URI。
+
+    仅将非敏感元数据并入日志消息，便于排查而不泄露凭据。
+    """
+    safe: dict[str, Any] = {"action": action, "userId": user_id}
+    for key, value in fields.items():
+        if key in {"password", "token", "secret", "connection"}:
+            continue
+        if isinstance(value, str) and len(value) > 256:
+            value = value[:256] + "...(truncated)"
+        safe[key] = value
+    logger.info("audit %s modules=%s", action, json.dumps(safe, ensure_ascii=False))
 
 
 class SingboxConfigError(RuntimeError):
@@ -129,6 +145,12 @@ def _config_lock():
 def _write_and_reload(updated: dict[str, Any]) -> None:
     original = CONFIG_PATH.read_bytes()
     original_stat = CONFIG_PATH.stat()
+    try:
+        current = json.loads(original.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise SingboxConfigError(f"could not read the current sing-box config: {exc}") from exc
+    if current == updated:
+        return
     CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
     fd, temp_name = tempfile.mkstemp(prefix="config.", suffix=".json", dir=CONFIG_PATH.parent)
     temp_path = Path(temp_name)
@@ -334,6 +356,54 @@ def _socks_connection(
     }
 
 
+def _inbound_port(inbound: dict[str, Any] | None, fallback: int) -> int:
+    """Read a valid public inbound port, retaining the documented default as fallback."""
+    try:
+        port = int((inbound or {}).get("listen_port"))
+    except (TypeError, ValueError):
+        return fallback
+    return port if 1 <= port <= 65535 else fallback
+
+
+def build_all_protocols(
+    user_id: str,
+    user_uuid: str,
+    socks: dict[str, Any] | None,
+    vless_inbound: dict[str, Any] | None = None,
+    vmess_inbound: dict[str, Any] | None = None,
+    socks_inbound: dict[str, Any] | None = None,
+    vless_security: str = "reality",
+) -> dict[str, str]:
+    """基于统一数据源生成五种协议链接（对标 IPVelo）。
+
+    - 原始地址(ip) 使用节点公网地址；加速线路使用 acceleration_domain。
+    - 加速线路 SOCKS 凭据由 username/password 前端 Base64 编码。
+    """
+    if socks is None:
+        return {}
+    data = ProtocolData(
+        ip=socks["host"],
+        port=int(socks["port"]),
+        username=socks["username"],
+        password=socks["password"],
+        uuid=user_uuid or "",
+        acceleration_domain=config.node.acceleration_domain,
+        acceleration_port_socks=_inbound_port(socks_inbound, 5001),
+        vless_port=_inbound_port(vless_inbound, 20168),
+        vmess_port=_inbound_port(vmess_inbound, 20169),
+    )
+    if vless_inbound is not None:
+        try:
+            public_key, short_id, server_name = _reality_client_options(vless_inbound)
+            data.vless_pbk = public_key
+            data.vless_sid = short_id
+            data.vless_sni = server_name
+        except SingboxConfigError:
+            logger.warning("could not derive Reality client params for %s", user_id)
+    data.vless_security = vless_security
+    return generate_all(data)
+
+
 def create_user(
     user_id: str,
     protocols: list[str],
@@ -384,6 +454,42 @@ def create_user(
                 effective_socks_username, effective_socks_password, inbound
             )
 
+            # 住宅 SOCKS 用户创建后同时返回统一的五协议连接信息。
+            # 这一步必须发生在 SOCKS 用户写入 response 之后，否则 FastAPI
+            # 虽然有 protocolsAll 字段，实际响应仍会是空对象。
+            vless_inbound = next(
+                (
+                    item
+                    for item in data.get("inbounds", [])
+                    if item.get("tag") == config.singbox.vless_tag
+                ),
+                None,
+            )
+            vmess_inbound = next(
+                (
+                    item
+                    for item in data.get("inbounds", [])
+                    if item.get("tag") == config.singbox.vmess_tag
+                ),
+                None,
+            )
+            socks_inbound = next(
+                (
+                    item
+                    for item in data.get("inbounds", [])
+                    if item.get("tag") == config.singbox.socks_tag
+                ),
+                None,
+            )
+            response["protocolsAll"] = build_all_protocols(
+                user_id,
+                user_uuid,
+                response["socks"],
+                vless_inbound=vless_inbound,
+                vmess_inbound=vmess_inbound,
+                socks_inbound=socks_inbound,
+            )
+
         registry.setdefault("users", {})[user_id] = {
             "socksUsername": effective_socks_username if "socks" in protocols else None,
             "createdAt": datetime.now(timezone.utc).isoformat(),
@@ -392,6 +498,12 @@ def create_user(
             _set_proxy_binding(data, registry, user_id, proxy)
         else:
             _set_direct_binding(data, registry, user_id)
+        _audit(
+            "user.create",
+            user_id,
+            protocols=",".join(protocols),
+            proxyBound=proxy is not None,
+        )
         return response
 
     return mutate_config(apply)
@@ -501,6 +613,7 @@ def bind_proxy(user_id: str, proxy: dict[str, Any]) -> dict[str, Any]:
             raise SingboxConfigError(f"user not found: {user_id}")
 
         _set_proxy_binding(data, registry, user_id, proxy)
+        _audit("proxy.bind", user_id, server=str(proxy.get("server")), port=int(proxy.get("port")))
         return {"success": True, "userId": user_id, "message": "proxy bound"}
 
     return mutate_config(apply)
@@ -526,6 +639,7 @@ def delete_user(user_id: str) -> dict[str, Any]:
             rule for rule in route.get("rules", []) if rule.get("outbound") != outbound_tag
         ]
         registry.setdefault("users", {}).pop(user_id, None)
+        _audit("user.delete", user_id)
         return {"success": True, "userId": user_id, "message": "user deleted"}
 
     return mutate_config(apply)
@@ -649,13 +763,18 @@ def get_user_connection(user_id: str) -> dict[str, Any]:
         "vless": None,
         "vmess": None,
         "socks": None,
+        "protocolsAll": {},
         "proxyBound": False,
         "createdAt": metadata.get("createdAt"),
     }
 
+    vless_inbound: dict[str, Any] | None = None
+    vmess_inbound: dict[str, Any] | None = None
+    socks_inbound: dict[str, Any] | None = None
     for inbound in data.get("inbounds", []):
         tag = inbound.get("tag")
         if tag == config.singbox.vless_tag:
+            vless_inbound = inbound
             user = next(
                 (
                     item
@@ -669,6 +788,7 @@ def get_user_connection(user_id: str) -> dict[str, Any]:
                 protocols.append("vless")
                 response["vless"] = _vless_connection(user_id, user_uuid, inbound)
         elif tag == config.singbox.vmess_tag:
+            vmess_inbound = inbound
             user = next(
                 (
                     item
@@ -683,6 +803,7 @@ def get_user_connection(user_id: str) -> dict[str, Any]:
                 protocols.append("vmess")
                 response["vmess"] = _vmess_connection(user_id, vmess_uuid, inbound)
         elif tag == config.singbox.socks_tag and socks_username:
+            socks_inbound = inbound
             user = next(
                 (
                     item
@@ -712,6 +833,16 @@ def get_user_connection(user_id: str) -> dict[str, Any]:
     )
     response["uuid"] = user_uuid or ""
     response["proxyBound"] = bool(outbound and outbound.get("type") == "socks")
+    all_protocols = build_all_protocols(
+        user_id,
+        response["uuid"],
+        response.get("socks"),
+        vless_inbound=vless_inbound,
+        vmess_inbound=vmess_inbound,
+        socks_inbound=socks_inbound,
+    )
+    if all_protocols:
+        response["protocolsAll"] = all_protocols
     return response
 
 

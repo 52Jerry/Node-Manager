@@ -2,6 +2,11 @@ from datetime import datetime
 from typing import Literal
 
 from pydantic import BaseModel, Field, field_validator, model_validator
+import re
+
+_UUID_PATTERN = re.compile(
+    r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+)
 
 
 UserProtocol = Literal["vless", "vmess", "socks"]
@@ -13,6 +18,33 @@ class ProxyConfig(BaseModel):
     port: int = Field(ge=1, le=65535)
     username: str | None = Field(default=None, max_length=255)
     password: str | None = Field(default=None, max_length=255)
+
+
+class ResidentialSocksRequest(BaseModel):
+    """住宅 SOCKS 代理配置生成请求（对标 IPVelo 五协议）。"""
+    ip: str = Field(min_length=1)
+    port: int = Field(ge=1, le=65535)
+    username: str = Field(min_length=1)
+    password: str = Field(min_length=1)
+    countryCode: str = Field(default="XX", min_length=0, max_length=8)
+    countryName: str = ""
+    cityName: str = ""
+    uuid: str = Field(default="", max_length=64)
+    accelerationDomain: str | None = Field(default=None, max_length=255)
+
+    @field_validator("uuid")
+    @classmethod
+    def uuid_must_be_valid(cls, value: str) -> str:
+        if value and not _UUID_PATTERN.match(value):
+            raise ValueError("uuid must be a valid UUID v4 string")
+        return value
+
+
+class ResidentialProtocolsResponse(BaseModel):
+    success: bool
+    ip: str
+    port: int
+    protocolsAll: dict[str, str]
 
 
 class CreateUserRequest(BaseModel):
@@ -56,6 +88,8 @@ class CreateUserResponse(BaseModel):
     userId: str
     uuid: str
     protocols: list[UserProtocol]
+    # 五协议统一输出。使用默认空字典兼容旧版 Node Manager 响应和无 SOCKS 用户。
+    protocolsAll: dict[str, str] = Field(default_factory=dict)
     vless: str | None = None
     vmess: str | None = None
     socks: SocksConnection | None = None

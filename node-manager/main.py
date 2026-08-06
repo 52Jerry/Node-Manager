@@ -2,6 +2,7 @@ import logging
 import os
 import socket
 import subprocess
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Literal
@@ -24,10 +25,14 @@ from models.request import (
     OperationResponse,
     ProxyDetailsResponse,
     ReloadResponse,
+    ResidentialProtocolsResponse,
+    ResidentialSocksRequest,
     TrafficResponse,
     UserConnectionResponse,
     UserListResponse,
 )
+from protocols import ProtocolData, generate_all
+from residential import ResidentialConfigError, validate_config
 from monitor.status import get_node_status
 from monitor.traffic import (
     collect_traffic,
@@ -138,6 +143,49 @@ def create_user_endpoint(
     )
     response.headers["Idempotency-Replayed"] = str(replayed).lower()
     return result
+
+
+@app.post(
+    "/api/residential/protocols",
+    response_model=ResidentialProtocolsResponse,
+    tags=["residential"],
+)
+def generate_residential_protocols(
+    request: ResidentialSocksRequest,
+    response: Response,
+    _token: str = Depends(verify_token),
+):
+    """住宅 SOCKS 代理配置模块：校验输入并生成五种协议链接。
+
+    输入校验失败返回 422；成功返回五种协议标准化输出。
+    """
+    try:
+        cfg = validate_config(
+            request.ip,
+            request.port,
+            request.username,
+            request.password,
+            country_code=request.countryCode,
+            country_name=request.countryName,
+            city_name=request.cityName,
+        )
+    except ResidentialConfigError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    # 直接调用该生成接口时也必须得到可用的 VLESS/VMess UUID。
+    # 显式传入的 UUID 保持兼容；未传时由服务端一次生成并复用于两种协议。
+    effective_uuid = request.uuid or str(uuid.uuid4())
+    data = cfg.to_protocol_data(
+        uuid=effective_uuid,
+        acceleration_domain=request.accelerationDomain or config.node.acceleration_domain,
+    )
+    response.headers["Cache-Control"] = "no-store"
+    return {
+        "success": True,
+        "ip": data.ip,
+        "port": data.port,
+        "protocolsAll": generate_all(data),
+    }
 
 
 @app.get("/api/users", response_model=UserListResponse, tags=["users"])

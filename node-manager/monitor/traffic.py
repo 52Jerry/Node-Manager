@@ -8,13 +8,14 @@ from pathlib import Path
 from typing import Any
 
 from singbox.manager import USER_OUTBOUND_PREFIX, singbox_api
+from config import config
 
 
 logger = logging.getLogger(__name__)
 TRAFFIC_PATH = Path(
     os.environ.get("NODE_MANAGER_TRAFFIC_STORE", "/var/lib/node-manager/traffic.json")
 )
-SAMPLE_INTERVAL_SECONDS = 2
+SAMPLE_INTERVAL_SECONDS = config.monitoring.traffic_sample_interval_seconds
 traffic_lock = threading.Lock()
 stop_event = threading.Event()
 collector_thread: threading.Thread | None = None

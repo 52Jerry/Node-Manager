@@ -2,12 +2,12 @@
 
 当前版本：`1.4.2`
 
-部署节点：`http://198.13.46.231:8088`
+部署节点：`http://<NODE_MANAGER_HOST>:8088`
 
 在线文档：
 
-- Swagger UI：`http://198.13.46.231:8088/docs`
-- OpenAPI JSON：`http://198.13.46.231:8088/openapi.json`
+- Swagger UI：`http://<NODE_MANAGER_HOST>:8088/docs`
+- OpenAPI JSON：`http://<NODE_MANAGER_HOST>:8088/openapi.json`
 
 > `1.4.2` 将 Node Manager 定位为单服务器 Agent。它提供标准心跳快照、代理连接统计和用户连接详情，并修复全新服务器未安装 sing-box 时一键安装提前退出的问题；多节点注册、心跳调度和离线判定由 Spring Boot 控制面负责。
 
@@ -15,7 +15,7 @@
 
 ### 1.1 API Token
 
-当前生产环境 Bearer Token：
+Bearer Token（仅从服务器受控配置读取，不写入文档）：
 
 ```text
 <NODE_TOKEN>
@@ -82,7 +82,7 @@ Idempotency-Key: order-10001-create-user
 #### `GET /api/node/status`
 
 ```bash
-curl http://198.13.46.231:8088/api/node/status \
+curl http://<NODE_MANAGER_HOST>:8088/api/node/status \
   -H "Authorization: Bearer <NODE_TOKEN>"
 ```
 
@@ -92,7 +92,7 @@ curl http://198.13.46.231:8088/api/node/status \
 {
   "node": "vultr",
   "name": "sing-box-node",
-  "host": "198.13.46.231",
+  "host": "<NODE_MANAGER_HOST>",
   "singbox": "running",
   "cpu": 3.2,
   "memory": 12.6,
@@ -161,7 +161,7 @@ curl http://198.13.46.231:8088/api/node/status \
 调用示例：
 
 ```bash
-curl -X POST http://198.13.46.231:8088/api/user/create \
+curl -X POST http://<NODE_MANAGER_HOST>:8088/api/user/create \
   -H "Authorization: Bearer <NODE_TOKEN>" \
   -H "Content-Type: application/json" \
   -d '{"userId":"user-10001","protocols":["vless","vmess","socks"],"proxy":{"type":"socks5","server":"203.0.113.20","port":1080,"username":"residential-user","password":"residential-password"}}'
@@ -179,7 +179,7 @@ curl -X POST http://198.13.46.231:8088/api/user/create \
   "vmess": "vmess://...",
   "proxyBound": true,
   "socks": {
-    "host": "198.13.46.231",
+    "host": "<NODE_MANAGER_HOST>",
     "port": 5001,
     "username": "residential-user",
     "password": "residential-password"
@@ -198,7 +198,7 @@ curl -X POST http://198.13.46.231:8088/api/user/create \
 支持按用户 ID 或 SOCKS5 用户名搜索。`pageSize` 范围为 1 到 100，列表不会返回明文密码。
 
 ```bash
-curl 'http://198.13.46.231:8088/api/users?page=1&pageSize=20' \
+curl 'http://<NODE_MANAGER_HOST>:8088/api/users?page=1&pageSize=20' \
   -H "Authorization: Bearer <NODE_TOKEN>"
 ```
 
@@ -237,7 +237,7 @@ curl 'http://198.13.46.231:8088/api/users?page=1&pageSize=20' \
   "vless": "vless://...",
   "vmess": "vmess://...",
   "socks": {
-    "host": "198.13.46.231",
+    "host": "<NODE_MANAGER_HOST>",
     "port": 5001,
     "username": "residential-user",
     "password": "residential-password"
@@ -256,7 +256,7 @@ Node Manager 管理页提供“连接信息”按钮，点击后才读取并显�
 当前版本返回本机节点，支持 `online`、`offline` 状态过滤。接口结构已经为下一阶段多节点管理预留分页字段。
 
 ```bash
-curl 'http://198.13.46.231:8088/api/nodes?page=1&pageSize=20' \
+curl 'http://<NODE_MANAGER_HOST>:8088/api/nodes?page=1&pageSize=20' \
   -H "Authorization: Bearer <NODE_TOKEN>"
 ```
 
@@ -266,7 +266,7 @@ curl 'http://198.13.46.231:8088/api/nodes?page=1&pageSize=20' \
     {
       "nodeId": "vultr",
       "name": "sing-box-node",
-      "host": "198.13.46.231",
+      "host": "<NODE_MANAGER_HOST>",
       "domain": null,
       "managerVersion": "1.4.2",
       "singboxVersion": "1.13.14",
@@ -308,7 +308,7 @@ curl 'http://198.13.46.231:8088/api/nodes?page=1&pageSize=20' \
 `proxy.username` 和 `proxy.password` 当前均可为空。绑定成功后，该用户通过 VLESS、VMess 或 SOCKS5 接入的流量都会路由到同一个住宅出口。重复绑定会替换原住宅出口配置。
 
 ```bash
-curl -X POST http://198.13.46.231:8088/api/user/bind-proxy \
+curl -X POST http://<NODE_MANAGER_HOST>:8088/api/user/bind-proxy \
   -H "Authorization: Bearer <NODE_TOKEN>" \
   -H "Content-Type: application/json" \
   -d '{"userId":"user-10001","proxy":{"type":"socks5","server":"203.0.113.20","port":1080,"username":"residential-user","password":"residential-password"}}'
@@ -331,7 +331,7 @@ curl -X POST http://198.13.46.231:8088/api/user/bind-proxy \
 删除该用户在全部共享入站中的认证信息、住宅出口和路由规则。
 
 ```bash
-curl -X DELETE http://198.13.46.231:8088/api/user/delete/user-10001 \
+curl -X DELETE http://<NODE_MANAGER_HOST>:8088/api/user/delete/user-10001 \
   -H "Authorization: Bearer <NODE_TOKEN>"
 ```
 
@@ -435,7 +435,7 @@ Spring Boot 建议每 15 到 30 秒轮询一次，并在连续 3 次失败或超
 {
   "nodeId": "vultr",
   "name": "sing-box-node",
-  "host": "198.13.46.231",
+  "host": "<NODE_MANAGER_HOST>",
   "status": "online",
   "managerVersion": "1.4.2",
   "singboxVersion": "1.13.14",
@@ -472,8 +472,8 @@ Spring Boot 建议每 15 到 30 秒轮询一次，并在连续 3 次失败或超
 
 | 用途 | 示例域名 | DNS/代理方式 |
 | --- | --- | --- |
-| Node Manager API | `api.example.com` | A 记录指向 `198.13.46.231`，可使用 HTTPS 反向代理 |
-| sing-box/SOCKS 节点 | `node.example.com` | A 记录指向 `198.13.46.231`，必须使用仅 DNS 模式 |
+| Node Manager API | `api.example.com` | A 记录指向节点服务器，可使用 HTTPS 反向代理 |
+| sing-box/SOCKS 节点 | `node.example.com` | A 记录指向节点服务器，必须使用仅 DNS 模式 |
 
 ### 3.1 配置 DNS
 
@@ -481,8 +481,8 @@ Spring Boot 建议每 15 到 30 秒轮询一次，并在连续 3 次失败或超
 
 ```text
 类型  主机记录  记录值
-A     api       198.13.46.231
-A     node      198.13.46.231
+A     api       <NODE_MANAGER_HOST>
+A     node      <NODE_MANAGER_HOST>
 ```
 
 如果使用 Cloudflare：
@@ -564,3 +564,21 @@ api.example.com {
 - 待配置防火墙，仅允许 Spring Boot 控制面服务器访问 Node Manager API
 - 待配置 HTTPS 后关闭公网直接访问 `8088`
 - 待开发 Token 轮换、权限分级和敏感字段加密存储
+
+## 版本 1.4.3 补充说明
+
+### 住宅批量输入与五协议
+
+住宅批量输入的推荐格式为：
+
+```text
+住宅出口IP\t上游SOCKS地址\t端口\t用户名\t密码
+```
+
+也支持最前面带序号的六列格式；空格和 Tab 均可作为分隔符。住宅出口 IP 用于 GeoIP 和备注，上游 SOCKS 地址才是 Node Manager 连接的代理服务器。上游密码只用于出站配置，不应出现在普通列表、审计日志或安装信息中。
+
+创建住宅用户后，`protocolsAll` 返回以下五个键：`socks5`、`bitbrowser`、`vless`、`socksAcceleration`、`vmess`。VLESS、VMess 和 SOCKS 加速链接的端口读取 sing-box 对应 inbound 的 `listen_port`（默认分别为 20168、20169、5001），不会因为修改端口而继续使用旧硬编码值。
+
+### 兼容性
+
+Control Plane 仍可读取旧版 `vless/vmess/socks` 字段。新版生产配置可打开 `CONTROL_PLANE_REQUIRE_COMPLETE_PROTOCOLS_ALL=true`，强制要求五协议完整返回；旧 Node Manager 升级前可保持关闭。

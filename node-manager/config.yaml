@@ -13,3 +13,7 @@ singbox:
   config: ./singbox/config.json
   api_port: 9090
   api_secret: ""
+
+monitoring:
+  # 大批量节点可调高到 5-10 秒以降低采样开销。
+  traffic_sample_interval_seconds: 2
