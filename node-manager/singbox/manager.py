@@ -396,6 +396,7 @@ def build_all_protocols(
     vless_security: str = "reality",
     include_original: bool = False,
     enabled_protocols: set[str] | None = None,
+    proxy: dict[str, Any] | None = None,
 ) -> dict[str, str]:
     """Generate the public links for one Node Manager user.
 
@@ -403,7 +404,9 @@ def build_all_protocols(
     inbounds and are independent of any upstream residential proxy.  The two
     legacy/original links are opt-in and are only emitted when a local SOCKS
     connection exists *and* the caller explicitly requests them (residential
-    provisioning).  Upstream proxy credentials are never passed here.
+    provisioning).  When ``proxy`` is supplied the original links use the
+    upstream proxy's server/port/credentials so the resulting URIs match
+    what the residential provider (e.g. IPVelo) issued for this allocation.
     """
     enabled = enabled_protocols or {"vless", "vmess", "socks"}
     acceleration_host = _acceleration_host()
@@ -434,8 +437,24 @@ def build_all_protocols(
     data.vless_security = vless_security
     links: dict[str, str] = {}
     if include_original and socks is not None:
-        links["socks5"] = socks5_original(data)
-        links["bitbrowser"] = bitbrowser(data)
+        original_data = data
+        if proxy is not None:
+            original_data = ProtocolData(
+                ip=str(proxy.get("sourceIp") or proxy.get("server") or data.ip),
+                port=int(proxy.get("port") or data.port),
+                username=str(proxy.get("username") or data.username),
+                password=str(proxy.get("password") or data.password),
+                country_code=str(proxy.get("countryCode") or data.country_code or "XX"),
+                country_name=str(proxy.get("countryName") or data.country_name or ""),
+                city_name=str(proxy.get("cityName") or data.city_name or ""),
+                uuid=data.uuid,
+                acceleration_domain=data.acceleration_domain,
+                acceleration_port_socks=data.acceleration_port_socks,
+                vless_port=data.vless_port,
+                vmess_port=data.vmess_port,
+            )
+        links["socks5"] = socks5_original(original_data)
+        links["bitbrowser"] = bitbrowser(original_data)
     if "vless" in enabled and vless_inbound is not None and user_uuid:
         links["vless"] = vless(data)
     if "socks" in enabled and socks is not None and socks_inbound is not None:
@@ -454,12 +473,15 @@ def build_protocol_info(
     socks_inbound: dict[str, Any] | None = None,
     *,
     include_original: bool = False,
+    proxy: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build the structured protocol contract from the active sing-box config.
 
-    This deliberately mirrors ``build_all_protocols`` so the ports, Reality
-    public key and acceleration host are always identical to the legacy URI
-    fields.  The returned password is the local SOCKS password only.
+    Mirrors ``build_all_protocols`` so the ports, Reality public key and
+    acceleration host stay identical.  When ``proxy`` is supplied the
+    returned map also contains ``sourceIp``/``rawUsername``/``rawPassword``
+    that describe the upstream residential proxy's original SOCKS/BitBrowser
+    credentials, instead of leaking the local node SOCKS credentials.
     """
     acceleration_host = _acceleration_host()
     local_username = str((socks or {}).get("username") or _auth_name(user_id))
@@ -483,11 +505,30 @@ def build_protocol_info(
             data.vless_sni = server_name
         except SingboxConfigError:
             logger.warning("could not derive Reality client params for %s", user_id)
-    return protocol_info(
+    info = protocol_info(
         data,
         protocol_id=user_uuid or user_id,
         include_original=include_original and socks is not None,
     )
+    if include_original and proxy is not None:
+        upstream_server = str(proxy.get("sourceIp") or proxy.get("server") or data.ip)
+        upstream_port = proxy.get("port")
+        upstream_username = proxy.get("username")
+        upstream_password = proxy.get("password")
+        if upstream_server:
+            info["sourceIp"] = upstream_server
+        if upstream_port is not None:
+            info["rawPort"] = int(upstream_port)
+        if upstream_username:
+            info["rawUsername"] = str(upstream_username)
+        if upstream_password:
+            info["rawPassword"] = str(upstream_password)
+        info["countryCode"] = str(proxy.get("countryCode") or info.get("countryCode") or "XX")
+        if proxy.get("countryName"):
+            info["countryName"] = str(proxy["countryName"])
+        if proxy.get("cityName"):
+            info["cityName"] = str(proxy["cityName"])
+    return info
 
 
 def create_user(
@@ -568,6 +609,7 @@ def create_user(
             socks_inbound=socks_inbound,
             include_original=proxy is not None,
             enabled_protocols=set(protocols),
+            proxy=proxy,
         )
         # 兼容链接与结构化参数统一使用同一个加速地址：legacy vless/vmess
         # 直接复用 protocolsAll 的生成结果，避免两套逻辑产生差异。
@@ -583,6 +625,7 @@ def create_user(
             vmess_inbound=vmess_inbound,
             socks_inbound=socks_inbound,
             include_original=proxy is not None,
+            proxy=proxy,
         )
 
         registry.setdefault("users", {})[user_id] = {

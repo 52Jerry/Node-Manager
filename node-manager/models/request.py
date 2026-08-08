@@ -20,6 +20,19 @@ class ProxyConfig(BaseModel):
     password: str | None = Field(default=None, max_length=255)
 
 
+class ProxyDescriptor(ProxyConfig):
+    """上游代理完整描述。
+
+    与 ``ProxyConfig`` 相比增加 ``sourceIp``，表示该代理出口/入口的真实对外 IP，
+    用于生成原始链接（SOCKS5 / BitBrowser）和展示出口信息。
+    """
+
+    sourceIp: str | None = Field(default=None, max_length=255)
+    countryCode: str = Field(default="XX", max_length=8)
+    countryName: str = ""
+    cityName: str = ""
+
+
 class ResidentialSocksRequest(BaseModel):
     """住宅 SOCKS 代理配置生成请求（对标 IPVelo 五协议）。"""
     ip: str = Field(min_length=1)
