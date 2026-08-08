@@ -189,6 +189,33 @@ class ManagerTestCase(unittest.TestCase):
         vmess_config = json.loads(__import__("base64").b64decode(vmess_payload))
         self.assertEqual(vmess_config["port"], "21069")
 
+    def test_structured_protocol_info_uses_configured_domain_and_uuid(self):
+        with patch.object(manager.config.node, "acceleration_domain", "proxy.example.test"):
+            created = manager.create_user("structured-domain", ["vless", "vmess", "socks"])
+
+        info = created["protocolInfo"]
+        self.assertEqual(info["id"], created["uuid"])
+        self.assertEqual(info["accelerationDomain"], "proxy.example.test")
+        self.assertEqual(info["vlessPort"], 20168)
+        self.assertEqual(info["vmessPort"], 20169)
+        self.assertEqual(info["accelerationPortSocks"], 5001)
+        self.assertNotIn("rawProtocol", info)
+        self.assertIn("@proxy.example.test:20168?", created["vless"])
+        self.assertEqual(created["vmess"], created["protocolsAll"]["vmess"])
+        self.assertEqual(created["socks"]["host"], "proxy.example.test")
+
+    def test_structured_protocol_info_supports_ipv6_acceleration_endpoint(self):
+        with patch.object(manager.config.node, "acceleration_domain", "2001:db8::10"):
+            created = manager.create_user("structured-ipv6", ["vless", "vmess", "socks"])
+
+        info = created["protocolInfo"]
+        self.assertEqual(info["accelerationDomain"], "2001:db8::10")
+        self.assertIn("@[2001:db8::10]:20168?", created["vless"])
+        self.assertEqual(created["socks"]["host"], "2001:db8::10")
+        vmess_payload = created["vmess"].split("//", 1)[1]
+        vmess_config = json.loads(__import__("base64").b64decode(vmess_payload))
+        self.assertEqual(vmess_config["add"], "2001:db8::10")
+
     def test_password_is_generated_when_omitted(self):
         created = manager.create_user(
             "customer-2", ["socks"], socks_username="residential-user-2"

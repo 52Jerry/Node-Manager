@@ -1,5 +1,5 @@
 from datetime import datetime
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 import re
@@ -45,6 +45,7 @@ class ResidentialProtocolsResponse(BaseModel):
     ip: str
     port: int
     protocolsAll: dict[str, str]
+    protocolInfo: dict[str, Any] = Field(default_factory=dict)
 
 
 class CreateUserRequest(BaseModel):
@@ -94,6 +95,7 @@ class CreateUserResponse(BaseModel):
     vmess: str | None = None
     socks: SocksConnection | None = None
     proxyBound: bool = False
+    protocolInfo: dict[str, Any] = Field(default_factory=dict)
 
 
 class UserConnectionResponse(CreateUserResponse):

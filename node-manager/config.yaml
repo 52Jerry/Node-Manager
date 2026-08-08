@@ -2,6 +2,9 @@ node:
   id: tokyo-01
   name: 东京节点
   host: auto
+  # 加速线路对外公网地址。支持：域名、IPv4、IPv6。
+  # 未配置时自动回退到 node.host。用于 VLESS/SOCKS加速/VMess 链接的 add/host 字段。
+  acceleration_domain: ""
 
 server:
   port: 8088

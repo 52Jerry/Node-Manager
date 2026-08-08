@@ -22,6 +22,7 @@ from config import config
 from protocols import (
     ProtocolData,
     bitbrowser,
+    protocol_info,
     socks5_original,
     socks_acceleration,
     vmess,
@@ -321,11 +322,24 @@ def _reality_client_options(inbound: dict[str, Any]) -> tuple[str, str, str]:
     return _base64url(public_raw), str(short_ids[0]), str(server_name)
 
 
+def _acceleration_host() -> str:
+    """Return the configured public endpoint, accepting either IP or DNS."""
+    value = str(config.node.acceleration_domain or config.node.host or "").strip()
+    return value or str(config.node.host)
+
+
+def _uri_host(value: str) -> str:
+    raw = str(value or "").strip()
+    if ":" in raw and not raw.startswith("["):
+        return f"[{raw}]"
+    return raw
+
+
 def _vless_connection(user_id: str, user_uuid: str, inbound: dict[str, Any]) -> str:
     public_key, short_id, server_name = _reality_client_options(inbound)
     port = int(inbound["listen_port"])
     return (
-        f"vless://{user_uuid}@{config.node.host}:{port}"
+        f"vless://{user_uuid}@{_uri_host(_acceleration_host())}:{port}"
         f"?encryption=none&flow=xtls-rprx-vision&type=tcp&security=reality"
         f"&pbk={public_key}&sid={short_id}&sni={server_name}&fp=chrome"
         f"#{user_id}"
@@ -336,7 +350,7 @@ def _vmess_connection(user_id: str, user_uuid: str, inbound: dict[str, Any]) -> 
     vmess = {
         "v": "2",
         "ps": user_id,
-        "add": config.node.host,
+        "add": _acceleration_host(),
         "port": str(inbound["listen_port"]),
         "id": user_uuid,
         "aid": "0",
@@ -356,7 +370,7 @@ def _socks_connection(
     username: str, password: str, inbound: dict[str, Any]
 ) -> dict[str, Any]:
     return {
-        "host": config.node.host,
+        "host": _acceleration_host(),
         "port": int(inbound["listen_port"]),
         "username": username,
         "password": password,
@@ -392,9 +406,7 @@ def build_all_protocols(
     provisioning).  Upstream proxy credentials are never passed here.
     """
     enabled = enabled_protocols or {"vless", "vmess", "socks"}
-    acceleration_host = (config.node.acceleration_domain or config.node.host).strip()
-    if not acceleration_host:
-        acceleration_host = config.node.host
+    acceleration_host = _acceleration_host()
 
     # VLESS/VMess do not need SOCKS credentials.  For SOCKS acceleration,
     # however, use the actual local inbound credentials only.
@@ -431,6 +443,51 @@ def build_all_protocols(
     if "vmess" in enabled and vmess_inbound is not None and user_uuid:
         links["vmess"] = vmess(data)
     return links
+
+
+def build_protocol_info(
+    user_id: str,
+    user_uuid: str,
+    socks: dict[str, Any] | None,
+    vless_inbound: dict[str, Any] | None = None,
+    vmess_inbound: dict[str, Any] | None = None,
+    socks_inbound: dict[str, Any] | None = None,
+    *,
+    include_original: bool = False,
+) -> dict[str, Any]:
+    """Build the structured protocol contract from the active sing-box config.
+
+    This deliberately mirrors ``build_all_protocols`` so the ports, Reality
+    public key and acceleration host are always identical to the legacy URI
+    fields.  The returned password is the local SOCKS password only.
+    """
+    acceleration_host = _acceleration_host()
+    local_username = str((socks or {}).get("username") or _auth_name(user_id))
+    local_password = str((socks or {}).get("password") or "")
+    data = ProtocolData(
+        ip=str((socks or {}).get("host") or config.node.host),
+        port=int((socks or {}).get("port") or _inbound_port(socks_inbound, 5001)),
+        username=local_username,
+        password=local_password,
+        uuid=user_uuid or "",
+        acceleration_domain=acceleration_host,
+        acceleration_port_socks=_inbound_port(socks_inbound, 5001),
+        vless_port=_inbound_port(vless_inbound, 20168),
+        vmess_port=_inbound_port(vmess_inbound, 20169),
+    )
+    if vless_inbound is not None:
+        try:
+            public_key, short_id, server_name = _reality_client_options(vless_inbound)
+            data.vless_pbk = public_key
+            data.vless_sid = short_id
+            data.vless_sni = server_name
+        except SingboxConfigError:
+            logger.warning("could not derive Reality client params for %s", user_id)
+    return protocol_info(
+        data,
+        protocol_id=user_uuid or user_id,
+        include_original=include_original and socks is not None,
+    )
 
 
 def create_user(
@@ -511,6 +568,21 @@ def create_user(
             socks_inbound=socks_inbound,
             include_original=proxy is not None,
             enabled_protocols=set(protocols),
+        )
+        # 兼容链接与结构化参数统一使用同一个加速地址：legacy vless/vmess
+        # 直接复用 protocolsAll 的生成结果，避免两套逻辑产生差异。
+        if response["protocolsAll"].get("vless"):
+            response["vless"] = response["protocolsAll"]["vless"]
+        if response["protocolsAll"].get("vmess"):
+            response["vmess"] = response["protocolsAll"]["vmess"]
+        response["protocolInfo"] = build_protocol_info(
+            user_id,
+            user_uuid,
+            response["socks"],
+            vless_inbound=vless_inbound,
+            vmess_inbound=vmess_inbound,
+            socks_inbound=socks_inbound,
+            include_original=proxy is not None,
         )
 
         registry.setdefault("users", {})[user_id] = {
@@ -787,6 +859,7 @@ def get_user_connection(user_id: str) -> dict[str, Any]:
         "vmess": None,
         "socks": None,
         "protocolsAll": {},
+        "protocolInfo": {},
         "proxyBound": False,
         "createdAt": metadata.get("createdAt"),
     }
@@ -868,6 +941,20 @@ def get_user_connection(user_id: str) -> dict[str, Any]:
     )
     if all_protocols:
         response["protocolsAll"] = all_protocols
+        # 兼容链接与结构化参数统一使用同一个加速地址。
+        if all_protocols.get("vless"):
+            response["vless"] = all_protocols["vless"]
+        if all_protocols.get("vmess"):
+            response["vmess"] = all_protocols["vmess"]
+    response["protocolInfo"] = build_protocol_info(
+        user_id,
+        response["uuid"],
+        response.get("socks"),
+        vless_inbound=vless_inbound,
+        vmess_inbound=vmess_inbound,
+        socks_inbound=socks_inbound,
+        include_original=response["proxyBound"],
+    )
     return response
 
 

@@ -10,7 +10,16 @@ sys.path.insert(0, str(APP_ROOT))
 
 from pydantic import ValidationError
 
-from protocols import ProtocolData, generate_all, socks5_original, bitbrowser, vless, socks_acceleration, vmess
+from protocols import (
+    ProtocolData,
+    generate_all,
+    protocol_info,
+    socks5_original,
+    bitbrowser,
+    vless,
+    socks_acceleration,
+    vmess,
+)
 from residential import (
     ResidentialConfigError,
     validate_config,
@@ -75,6 +84,33 @@ class ProtocolGenerationTest(unittest.TestCase):
         self.assertEqual(config["add"], "proxy.tkip.xin")
         self.assertEqual(config["port"], "20169")
         self.assertEqual(config["id"], "9b6deb80-4b32-4496-9a5e-1a2b3c4d5e6f")
+
+    def test_protocol_info_contains_documented_fields_and_can_use_ipv6_endpoint(self):
+        data = sample_data(acceleration_domain="2001:db8::10")
+        result = protocol_info(data, protocol_id=data.uuid, include_original=False)
+
+        required = {
+            "id", "ip", "port", "username", "password", "countryCode",
+            "countryName", "cityName", "status", "expireTime", "remark",
+            "accelerationDomain", "uuid", "accelerationPortSocks",
+            "vlessPort", "vlessEncryption", "vlessSecurity", "vlessSni",
+            "vlessFp", "vlessPbk", "vlessSid", "vlessSpx", "vlessType",
+            "vlessHeaderType", "vlessFlow", "vmessPort", "vmessV", "vmessAid",
+            "vmessScy", "vmessNet", "vmessType", "vmessHost", "vmessPath",
+            "vmessTls", "vmessSni", "vmessAlpn", "vmessFp",
+        }
+        self.assertTrue(required.issubset(result))
+        self.assertEqual(result["id"], data.uuid)
+        self.assertNotIn("rawProtocol", result)
+        self.assertNotIn("rawPort", result)
+        self.assertIn("@[2001:db8::10]:20168?", vless(data))
+        self.assertIn("@[2001:db8::10]:5001#", socks_acceleration(data))
+
+    def test_protocol_info_can_include_original_fields_only_for_residential_mode(self):
+        result = protocol_info(sample_data(), protocol_id="allocation-1", include_original=True)
+        self.assertEqual(result["id"], "allocation-1")
+        self.assertEqual(result["rawProtocol"], "socks5")
+        self.assertEqual(result["rawPort"], 5001)
 
     def test_generate_all_returns_five_protocols(self):
         links = generate_all(sample_data())

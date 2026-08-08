@@ -31,7 +31,7 @@ from models.request import (
     UserConnectionResponse,
     UserListResponse,
 )
-from protocols import ProtocolData, generate_all
+from protocols import ProtocolData, generate_all, protocol_info
 from residential import ResidentialConfigError, validate_config
 from monitor.status import get_node_status
 from monitor.traffic import (
@@ -45,6 +45,7 @@ from monitor.traffic import (
 from singbox.manager import (
     SingboxConfigError,
     bind_proxy,
+    build_protocol_info,
     create_user,
     delete_user,
     ensure_user_outbounds,
@@ -189,6 +190,11 @@ def generate_residential_protocols(
         "success": True,
         "ip": data.ip,
         "port": data.port,
+        "protocolInfo": protocol_info(
+            data,
+            protocol_id=effective_uuid,
+            include_original=True,
+        ),
         "protocolsAll": generate_all(data),
     }
 

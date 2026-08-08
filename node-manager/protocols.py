@@ -29,6 +29,14 @@ def _base64url(raw: bytes) -> str:
     return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
 
 
+def _uri_host(value: str) -> str:
+    """Format an IPv6 host for URI authority syntax without double brackets."""
+    raw = str(value or "").strip()
+    if ":" in raw and not raw.startswith("["):
+        return f"[{raw}]"
+    return raw
+
+
 @dataclass
 class ProtocolData:
     """五种协议共用的统一数据源。
@@ -48,7 +56,10 @@ class ProtocolData:
     city_name: str = ""
     remark: str = ""
     # 加速线路共用
-    acceleration_domain: str = "proxy.tkip.xin"
+    # Empty means the caller must supply the current node host.  Keeping this
+    # unset prevents a fresh installation from emitting a stale deployment
+    # domain; callers may provide either an IP address or a DNS name.
+    acceleration_domain: str = ""
     uuid: str = ""
     acceleration_port_socks: int = 5001
     # VLESS 专属
@@ -97,7 +108,7 @@ class ProtocolData:
 def socks5_original(data: ProtocolData) -> str:
     """原始地址 - SOCKS5：socks://user:pass@ip:port#备注"""
     remark = f"{data.country_code}-{data.ip}"
-    return f"socks://{data.username}:{data.password}@{data.ip}:{data.port}#{remark}"
+    return f"socks://{data.username}:{data.password}@{_uri_host(data.ip)}:{data.port}#{remark}"
 
 
 def bitbrowser(data: ProtocolData) -> str:
@@ -109,7 +120,7 @@ def vless(data: ProtocolData) -> str:
     """加速线路 - VLESS：vless://uuid@域名:端口?参数#备注"""
     remark = f"[{data.country_code}] {data.ip}"
     return (
-        f"vless://{data.uuid}@{data.acceleration_domain}:{data.vless_port}"
+        f"vless://{data.uuid}@{_uri_host(data.acceleration_domain)}:{data.vless_port}"
         f"?encryption={data.vless_encryption}"
         f"&security={data.vless_security}"
         f"&sni={data.vless_sni}"
@@ -129,7 +140,7 @@ def socks_acceleration(data: ProtocolData) -> str:
     remark = f"[{data.country_code}] {data.ip}"
     return (
         f"socks://{_b64(data.username)}:{_b64(data.password)}"
-        f"@{data.acceleration_domain}:{data.acceleration_port_socks}"
+        f"@{_uri_host(data.acceleration_domain)}:{data.acceleration_port_socks}"
         f"#{_url_encode(remark)}"
     )
 
@@ -170,6 +181,71 @@ def generate_all(data: ProtocolData) -> dict[str, str]:
         "socksAcceleration": socks_acceleration(data),
         "vmess": vmess(data),
     }
+
+
+def protocol_info(
+    data: ProtocolData,
+    *,
+    protocol_id: str = "",
+    status: int = 0,
+    expire_time: str | None = None,
+    include_original: bool = True,
+) -> dict[str, Any]:
+    """Return the structured fields needed by a client to build links.
+
+    The keys intentionally use the camelCase contract documented in
+    ``IPVelo_代理连接信息生成分析文档.md``.  Complete URI strings remain
+    available through :func:`generate_all` for older Control Plane versions.
+    ``password`` is only the local SOCKS credential supplied to this method;
+    an upstream residential proxy password must never be passed here.
+    """
+    result: dict[str, Any] = {
+        "id": protocol_id or data.uuid,
+        "ip": data.ip,
+        "port": data.port,
+        "username": data.username,
+        "password": data.password,
+        "countryCode": data.country_code,
+        "countryName": data.country_name,
+        "cityName": data.city_name,
+        "status": status,
+        "expireTime": expire_time,
+        "remark": data.remark_label(),
+        "accelerationDomain": data.acceleration_domain,
+        "uuid": data.uuid,
+        "accelerationPortSocks": data.acceleration_port_socks,
+        "vlessPort": data.vless_port,
+        "vlessEncryption": data.vless_encryption,
+        "vlessSecurity": data.vless_security,
+        "vlessSni": data.vless_sni,
+        "vlessFp": data.vless_fp,
+        "vlessPbk": data.vless_pbk,
+        "vlessSid": data.vless_sid,
+        "vlessSpx": data.vless_spx,
+        "vlessType": data.vless_type,
+        "vlessHeaderType": data.vless_header_type,
+        "vlessFlow": data.vless_flow,
+        "vmessPort": data.vmess_port,
+        "vmessV": data.vmess_v,
+        "vmessAid": data.vmess_aid,
+        "vmessScy": data.vmess_scy,
+        "vmessNet": data.vmess_net,
+        "vmessType": data.vmess_type,
+        "vmessHost": data.vmess_host,
+        "vmessPath": data.vmess_path,
+        "vmessTls": data.vmess_tls,
+        "vmessSni": data.vmess_sni,
+        "vmessAlpn": data.vmess_alpn,
+        "vmessFp": data.vmess_fp,
+    }
+    if include_original:
+        result["rawPort"] = data.port
+        result["rawProtocol"] = "socks5"
+    else:
+        # Direct users only expose the three acceleration protocols.
+        result.pop("rawPort", None)
+        result.pop("rawProtocol", None)
+    return result
 
 
 def generate_all_dict(raw: dict[str, Any]) -> dict[str, str]:
