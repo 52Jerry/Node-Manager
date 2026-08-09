@@ -440,13 +440,13 @@ def build_all_protocols(
         original_data = data
         if proxy is not None:
             original_data = ProtocolData(
-                ip=str(proxy.get("sourceIp") or proxy.get("server") or data.ip),
+                ip=str(proxy.get("sourceIp") or proxy.get("source_ip") or proxy.get("server") or data.ip),
                 port=int(proxy.get("port") or data.port),
                 username=str(proxy.get("username") or data.username),
                 password=str(proxy.get("password") or data.password),
-                country_code=str(proxy.get("countryCode") or data.country_code or "XX"),
-                country_name=str(proxy.get("countryName") or data.country_name or ""),
-                city_name=str(proxy.get("cityName") or data.city_name or ""),
+                country_code=str(proxy.get("countryCode") or proxy.get("country_code") or data.country_code or "XX"),
+                country_name=str(proxy.get("countryName") or proxy.get("country_name") or data.country_name or ""),
+                city_name=str(proxy.get("cityName") or proxy.get("city_name") or data.city_name or ""),
                 uuid=data.uuid,
                 acceleration_domain=data.acceleration_domain,
                 acceleration_port_socks=data.acceleration_port_socks,
@@ -511,7 +511,7 @@ def build_protocol_info(
         include_original=include_original and socks is not None,
     )
     if include_original and proxy is not None:
-        upstream_server = str(proxy.get("sourceIp") or proxy.get("server") or data.ip)
+        upstream_server = str(proxy.get("sourceIp") or proxy.get("source_ip") or proxy.get("server") or data.ip)
         upstream_port = proxy.get("port")
         upstream_username = proxy.get("username")
         upstream_password = proxy.get("password")
@@ -523,11 +523,11 @@ def build_protocol_info(
             info["rawUsername"] = str(upstream_username)
         if upstream_password:
             info["rawPassword"] = str(upstream_password)
-        info["countryCode"] = str(proxy.get("countryCode") or info.get("countryCode") or "XX")
-        if proxy.get("countryName"):
-            info["countryName"] = str(proxy["countryName"])
-        if proxy.get("cityName"):
-            info["cityName"] = str(proxy["cityName"])
+        info["countryCode"] = str(proxy.get("countryCode") or proxy.get("country_code") or info.get("countryCode") or "XX")
+        if proxy.get("countryName") or proxy.get("country_name"):
+            info["countryName"] = str(proxy.get("countryName") or proxy.get("country_name"))
+        if proxy.get("cityName") or proxy.get("city_name"):
+            info["cityName"] = str(proxy.get("cityName") or proxy.get("city_name"))
     return info
 
 
