@@ -49,6 +49,7 @@ from singbox.manager import (
     create_user,
     delete_user,
     ensure_user_outbounds,
+    migrate_legacy_socks_usernames,
     get_user_connection,
     get_user_proxy,
     get_socks_inbound_port,
@@ -86,6 +87,9 @@ async def idempotency_error_handler(_request: Request, exc: IdempotencyConflict)
 @app.on_event("startup")
 def startup_tasks():
     try:
+        migrated_socks = migrate_legacy_socks_usernames()
+        if migrated_socks:
+            logging.getLogger(__name__).info("migrated %s legacy SOCKS usernames", migrated_socks)
         migrated = ensure_user_outbounds()
         if migrated:
             logging.getLogger(__name__).info("added traffic outbounds for %s existing users", migrated)

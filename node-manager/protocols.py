@@ -4,7 +4,7 @@
   1. SOCKS5（原始）      socks://user:pass@ip:port#备注
   2. 比特浏览器          ip:port:user:pass
   3. VLESS（加速）       vless://uuid@域名:端口?参数
-  4. SOCKS（加速）       socks://b64user:b64pass@域名:端口#备注
+  4. SOCKS（加速）       socks://user:pass@域名:端口#备注（字段 URL 编码）
   5. VMess（加速）       vmess://base64(JSON)
 
 设计原则：后端只返回一份统一数据，前端/本模块按协议模板本地拼接，
@@ -60,6 +60,10 @@ class ProtocolData:
     # unset prevents a fresh installation from emitting a stale deployment
     # domain; callers may provide either an IP address or a DNS name.
     acceleration_domain: str = ""
+    # For residential links, ``ip`` remains the exit-IP shown in the remark,
+    # while this optional host is the real upstream SOCKS endpoint clients
+    # connect to.  Direct links leave it empty.
+    endpoint_host: str = ""
     uuid: str = ""
     acceleration_port_socks: int = 5001
     # VLESS 专属
@@ -106,14 +110,23 @@ class ProtocolData:
 # ---------------------------------------------------------------------------
 
 def socks5_original(data: ProtocolData) -> str:
-    """原始地址 - SOCKS5：socks://user:pass@ip:port#备注"""
+    """原始地址 - SOCKS5：socks://user:pass@ip:port#备注。
+
+    原始住宅 SOCKS 按项目协议文档使用明文 userinfo（仅做 URI 百分号编码）。
+    将完整 ``username:password`` 做 Base64 会让 v2rayN/V2Ray 把凭据识别为
+    一个用户名，导致导入后账号密码为空。
+    """
     remark = f"{data.country_code}-{data.ip}"
-    return f"socks://{data.username}:{data.password}@{_uri_host(data.ip)}:{data.port}#{remark}"
+    from urllib.parse import quote
+    auth = f"{quote(str(data.username), safe='')}:{quote(str(data.password), safe='')}"
+    endpoint = data.endpoint_host or data.ip
+    return f"socks://{auth}@{_uri_host(endpoint)}:{data.port}#{_url_encode(remark)}"
 
 
 def bitbrowser(data: ProtocolData) -> str:
     """原始地址 - 比特浏览器：ip:port:user:pass"""
-    return f"{data.ip}:{data.port}:{data.username}:{data.password}"
+    endpoint = data.endpoint_host or data.ip
+    return f"{endpoint}:{data.port}:{data.username}:{data.password}"
 
 
 def vless(data: ProtocolData) -> str:
@@ -136,10 +149,18 @@ def vless(data: ProtocolData) -> str:
 
 
 def socks_acceleration(data: ProtocolData) -> str:
-    """加速线路 - SOCKS：socks://b64user:b64pass@域名:端口#备注"""
+    """加速线路 SOCKS。
+
+    Use the standard SOCKS URI userinfo form. Username and password are
+    encoded independently so reserved characters cannot change the URI
+    structure. SOCKS servers do not decode Base64 credentials; emitting
+    Base64 here would make authentication fail.
+    """
     remark = f"[{data.country_code}] {data.ip}"
+    from urllib.parse import quote
+    auth = f"{quote(str(data.username), safe='')}:{quote(str(data.password), safe='')}"
     return (
-        f"socks://{_b64(data.username)}:{_b64(data.password)}"
+        f"socks://{auth}"
         f"@{_uri_host(data.acceleration_domain)}:{data.acceleration_port_socks}"
         f"#{_url_encode(remark)}"
     )

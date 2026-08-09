@@ -28,6 +28,7 @@ class ProxyDescriptor(ProxyConfig):
     """
 
     sourceIp: str | None = Field(default=None, max_length=255)
+    sourceAddress: str | None = Field(default=None, max_length=255)
     countryCode: str = Field(default="XX", max_length=8)
     countryName: str = ""
     cityName: str = ""
@@ -69,7 +70,10 @@ class CreateUserRequest(BaseModel):
     )
     socksUsername: str | None = Field(default=None, min_length=1, max_length=255)
     socksPassword: str | None = Field(default=None, min_length=1, max_length=255)
-    proxy: ProxyConfig | None = None
+    # Keep residential metadata (sourceIp/sourceAddress/country) when the
+    # request comes from Control Plane.  ProxyConfig would silently discard
+    # those extra fields during Pydantic validation.
+    proxy: ProxyDescriptor | None = None
 
     @field_validator("protocols")
     @classmethod
@@ -87,7 +91,7 @@ class CreateUserRequest(BaseModel):
 
 class BindProxyRequest(BaseModel):
     userId: str = Field(min_length=1, max_length=64, pattern=r"^[A-Za-z0-9._-]+$")
-    proxy: ProxyConfig
+    proxy: ProxyDescriptor
 
 
 class SocksConnection(BaseModel):
@@ -122,6 +126,13 @@ class ProxyDetailsResponse(BaseModel):
     port: int | None = None
     username: str | None = None
     password: str | None = None
+    sourceIp: str | None = None
+    sourceAddress: str | None = None
+    sourcePort: int | None = None
+    countryCode: str | None = None
+    countryName: str | None = None
+    cityName: str | None = None
+    protocolInfo: dict[str, Any] = Field(default_factory=dict)
 
 
 class OperationResponse(BaseModel):

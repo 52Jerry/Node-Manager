@@ -178,7 +178,7 @@ reload，失败则 restart
 
 规则：
 
-- `socksUsername` 不传时生成独立的 `node-manager:{userId}` 本地入站账号，不复用住宅用户名。
+- `socksUsername` 不传时默认使用节点用户 ID 作为本地入站账号，不复用住宅用户名。
 - `socksPassword` 不传时生成独立随机密码，不复用住宅密码。
 - `proxy` 不传时先创建直连用户，后续可调用绑定接口。
 - 创建、绑定、删除接口应由 Spring Boot 发送唯一 `Idempotency-Key`。

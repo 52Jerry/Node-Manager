@@ -155,9 +155,13 @@ class ManagerTestCase(unittest.TestCase):
         self.assertEqual(connection["socks"], created["socks"])
         self.assertEqual(
             set(connection["protocolsAll"]),
-            {"socks5", "bitbrowser", "vless", "socksAcceleration", "vmess"},
+            {"vless", "socksAcceleration", "vmess"},
         )
         self.assertTrue(connection["proxyBound"])
+        self.assertNotIn("socks5", connection["protocolsAll"])
+        self.assertNotIn("bitbrowser", connection["protocolsAll"])
+        self.assertNotIn("upstream-user", str(connection))
+        self.assertNotIn("upstream-password", str(connection))
 
         manager.delete_user("customer-1")
         data = json.loads(self.config_path.read_text(encoding="utf-8"))
@@ -188,6 +192,42 @@ class ManagerTestCase(unittest.TestCase):
         vmess_payload = created["protocolsAll"]["vmess"].split("//", 1)[1]
         vmess_config = json.loads(__import__("base64").b64decode(vmess_payload))
         self.assertEqual(vmess_config["port"], "21069")
+
+    def test_residential_links_separate_exit_ip_upstream_and_node_endpoint(self):
+        """住宅出口只用于展示；原始 SOCKS 连接上游；加速协议连接本节点。"""
+        with patch.object(manager.config.node, "host", "203.0.113.20"), patch.object(
+            manager.config.node, "acceleration_domain", "203.0.113.20"
+        ):
+            created = manager.create_user(
+                "residential-user",
+                ["vless", "vmess", "socks"],
+                socks_username="residential-user",
+                socks_password="local-node-password",
+                proxy={
+                    "type": "socks5",
+                    "server": "203.0.113.30",
+                    "port": 5001,
+                    "username": "upstream-user",
+                    "password": "upstream-password",
+                    "sourceIp": "203.0.113.10",
+                    "sourceAddress": "203.0.113.30",
+                    "sourcePort": 5001,
+                    "countryCode": "US",
+                },
+            )
+
+        links = created["protocolsAll"]
+        self.assertIn("socks://upstream-user:upstream-password@203.0.113.30:5001", links["socks5"])
+        self.assertEqual(links["bitbrowser"], "203.0.113.30:5001:upstream-user:upstream-password")
+        self.assertIn("@203.0.113.20:20168?", links["vless"])
+        self.assertIn("@203.0.113.20:5001#", links["socksAcceleration"])
+        vmess_payload = links["vmess"].split("//", 1)[1]
+        vmess_config = json.loads(__import__("base64").b64decode(vmess_payload))
+        self.assertEqual(vmess_config["add"], "203.0.113.20")
+        self.assertEqual(created["protocolInfo"]["ip"], "203.0.113.10")
+        for key in ("vless", "socksAcceleration", "vmess"):
+            self.assertNotIn("upstream-user", links[key])
+            self.assertNotIn("upstream-password", links[key])
 
     def test_structured_protocol_info_uses_configured_domain_and_uuid(self):
         with patch.object(manager.config.node, "acceleration_domain", "proxy.example.test"):
@@ -261,8 +301,40 @@ class ManagerTestCase(unittest.TestCase):
         connection = manager.get_user_connection("legacy-user")
 
         self.assertEqual(connection["protocols"], ["vless", "vmess", "socks"])
-        self.assertEqual(connection["socks"]["username"], legacy_name)
+        self.assertEqual(connection["socks"]["username"], "legacy-user")
         self.assertEqual(connection["socks"]["password"], "legacy-password")
+
+    def test_legacy_socks_username_migration_updates_route_and_registry(self):
+        data = base_singbox_config()
+        legacy_name = "node-manager:migrate-user"
+        data["inbounds"][0]["users"].append(
+            {
+                "name": legacy_name,
+                "uuid": "22222222-2222-4222-8222-222222222222",
+                "flow": "xtls-rprx-vision",
+            }
+        )
+        data["inbounds"][1]["users"].append(
+            {"name": legacy_name, "uuid": "22222222-2222-4222-8222-222222222222"}
+        )
+        data["inbounds"][2]["users"].append(
+            {"username": legacy_name, "password": "keep-this-password"}
+        )
+        data["route"]["rules"].append(
+            {
+                "auth_user": [legacy_name],
+                "action": "route",
+                "outbound": "node-manager-out:migrate-user",
+            }
+        )
+        self._write_config(data)
+
+        self.assertEqual(manager.migrate_legacy_socks_usernames(), 1)
+        migrated = json.loads(self.config_path.read_text(encoding="utf-8"))
+        socks_users = next(item for item in migrated["inbounds"] if item["tag"] == "socks")["users"]
+        self.assertEqual(socks_users, [{"username": "migrate-user", "password": "keep-this-password"}])
+        self.assertEqual(migrated["route"]["rules"][-1]["auth_user"], ["migrate-user"])
+        self.assertEqual(manager.list_users()[0]["socksUsername"], "migrate-user")
 
     def test_create_can_atomically_bind_proxy_without_reusing_upstream_credentials(self):
         created = manager.create_user(
@@ -283,16 +355,23 @@ class ManagerTestCase(unittest.TestCase):
             set(created["protocolsAll"]),
             {"socks5", "bitbrowser", "vless", "socksAcceleration"},
         )
-        for link in created["protocolsAll"].values():
-            self.assertNotIn("upstream-user", link)
-            self.assertNotIn("upstream-password", link)
+        # Raw SOCKS5 and BitBrowser intentionally use the upstream
+        # residential credentials.  Only acceleration protocols must keep
+        # those credentials out of public links.
+        self.assertIn("upstream-user", created["protocolsAll"]["socks5"])
+        self.assertIn("upstream-password", created["protocolsAll"]["socks5"])
+        self.assertIn("upstream-user", created["protocolsAll"]["bitbrowser"])
+        self.assertIn("upstream-password", created["protocolsAll"]["bitbrowser"])
+        for key in ("vless", "socksAcceleration"):
+            self.assertNotIn("upstream-user", created["protocolsAll"][key])
+            self.assertNotIn("upstream-password", created["protocolsAll"][key])
 
         data = json.loads(self.config_path.read_text(encoding="utf-8"))
         self.assertEqual(data["outbounds"][0]["server"], "203.0.113.30")
         self.assertEqual(data["outbounds"][0]["server_port"], 2080)
         self.assertEqual(
-            data["route"]["rules"][0]["auth_user"],
-            ["node-manager:customer-proxy"],
+            set(data["route"]["rules"][0]["auth_user"]),
+            {"customer-proxy", "node-manager:customer-proxy"},
         )
         self.assertTrue(manager.list_users()[0]["proxyBound"])
 

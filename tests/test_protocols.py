@@ -68,13 +68,17 @@ class ProtocolGenerationTest(unittest.TestCase):
         self.assertIn("pbk=abc123", link)
         self.assertIn("sid=0123456789abcdef", link)
 
-    def test_socks_acceleration_uses_base64_credentials(self):
+    def test_socks_acceleration_uses_standard_url_encoded_credentials(self):
         link = socks_acceleration(sample_data())
         self.assertTrue(link.startswith("socks://"))
         self.assertIn("@proxy.tkip.xin:5001#", link)
-        # 凭据应为 Base64 编码
-        self.assertNotIn(":888888@proxy.tkip.xin", link)
-        self.assertIn(base64.b64encode(b"888888").decode(), link)
+        self.assertIn(":888888@proxy.tkip.xin", link)
+        self.assertIn("a1b2c3d4e5f6a7b8:888888@proxy.tkip.xin", link)
+
+    def test_original_and_acceleration_socks_use_independent_url_encoding(self):
+        data = sample_data(username="user@name", password="p:a+ss/word=")
+        self.assertIn("socks://user%40name:p%3Aa%2Bss%2Fword%3D@", socks5_original(data))
+        self.assertIn("socks://user%40name:p%3Aa%2Bss%2Fword%3D@", socks_acceleration(data))
 
     def test_vmess_format(self):
         link = vmess(sample_data())

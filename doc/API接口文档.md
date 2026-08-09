@@ -148,7 +148,7 @@ curl http://<NODE_MANAGER_HOST>:8088/api/node/status \
 | --- | --- | --- | --- |
 | `userId` | string | 是 | 1 到 64 位，仅允许字母、数字、`.`、`_`、`-` |
 | `protocols` | string[] | 否 | 可选值为 `vless`、`vmess`、`socks`；默认全部创建且不允许重复 |
-| `socksUsername` | string | 否 | 本地 SOCKS5 入站账号；未传入时生成独立的 `node-manager:{userId}` 标识；仅在包含 `socks` 协议时允许传入 |
+| `socksUsername` | string | 否 | 本地 SOCKS5 入站账号；未传入时默认使用节点用户 ID；仅在包含 `socks` 协议时允许传入 |
 | `socksPassword` | string | 否 | 本地 SOCKS5 入站密码；未传入时生成高强度随机密码；不能脱离 `socks` 协议单独传入 |
 | `proxy` | object | 否 | 创建时需要自动绑定的住宅 SOCKS5 出口；不传则只创建用户，以后可调用绑定接口 |
 | `proxy.server` | string | 是 | 住宅 SOCKS5 的 IP 或域名；仅在传入 `proxy` 时必填 |

@@ -253,10 +253,88 @@ def _registry_user(registry: dict[str, Any], user_id: str) -> dict[str, Any]:
 
 def _user_auth_names(registry: dict[str, Any], user_id: str) -> set[str]:
     names = _legacy_auth_names(user_id)
-    socks_username = _registry_user(registry, user_id).get("socksUsername")
+    socks_username = _public_socks_username(registry, user_id)
     if socks_username:
-        names.add(str(socks_username))
+        names.add(socks_username)
     return names
+
+
+def _public_socks_username(registry: dict[str, Any], user_id: str) -> str:
+    """Return the username that must be shown to SOCKS clients.
+
+    ``node-manager:<id>`` is an internal VLESS/VMess auth alias used by old
+    installations.  It is never a valid public SOCKS username.  Historical
+    registries may contain that value, so normalize it to the user id here as
+    a final compatibility guard.
+    """
+    configured = str(_registry_user(registry, user_id).get("socksUsername") or "").strip()
+    if not configured or configured == _auth_name(user_id):
+        return user_id
+    return configured
+
+
+def migrate_legacy_socks_usernames() -> int:
+    """Migrate old ``node-manager:<id>`` SOCKS users to the public user id.
+
+    The migration is idempotent and updates route auth lists and the local
+    registry in the same atomic config transaction.  Passwords are retained
+    byte-for-byte and are never written to logs.
+    """
+    def apply(data: dict[str, Any], registry: dict[str, Any]) -> int:
+        changed = 0
+        users_by_name = {
+            str(user.get("username"))
+            for inbound in data.get("inbounds", [])
+            if inbound.get("tag") == config.singbox.socks_tag
+            for user in inbound.get("users", [])
+            if user.get("username")
+        }
+        replacements: dict[str, str] = {}
+        for inbound in data.get("inbounds", []):
+            if inbound.get("tag") != config.singbox.socks_tag:
+                continue
+            for user in inbound.get("users", []):
+                username = str(user.get("username") or "")
+                if not username.startswith(USER_PREFIX):
+                    continue
+                user_id = username[len(USER_PREFIX):]
+                if not user_id or user_id in users_by_name:
+                    # A real public username already exists; do not merge two
+                    # accounts implicitly.
+                    continue
+                user["username"] = user_id
+                replacements[username] = user_id
+                changed += 1
+                item = registry.setdefault("users", {}).setdefault(user_id, {})
+                if item.get("socksUsername") in (None, "", username):
+                    item["socksUsername"] = user_id
+
+        if replacements:
+            for rule in data.get("route", {}).get("rules", []):
+                auth_users = rule.get("auth_user")
+                if not isinstance(auth_users, list):
+                    continue
+                rule["auth_user"] = [replacements.get(str(value), value) for value in auth_users]
+        return changed
+
+    return mutate_config(apply)
+
+
+def _find_user_uuid(data: dict[str, Any], registry: dict[str, Any], user_id: str) -> str:
+    """Find the UUID used by the user's VLESS/VMess inbound entries.
+
+    The proxy-details endpoint must expose the same UUID as the connection
+    endpoint.  Older installations may authenticate with either
+    ``node-manager:<id>`` or the bare user id, so inspect both aliases.
+    """
+    names = _legacy_auth_names(user_id)
+    for inbound in data.get("inbounds", []):
+        if inbound.get("tag") not in {config.singbox.vless_tag, config.singbox.vmess_tag}:
+            continue
+        for user in inbound.get("users", []):
+            if user.get("name") in names and user.get("uuid"):
+                return str(user["uuid"])
+    return ""
 
 
 def _route_auth_names(
@@ -271,7 +349,7 @@ def _route_auth_names(
     alias to every newly-created route rule.
     """
     names = {_auth_name(user_id)}
-    socks_username = _registry_user(registry, user_id).get("socksUsername")
+    socks_username = _public_socks_username(registry, user_id)
     if socks_username:
         names.add(str(socks_username))
     if any(
@@ -412,11 +490,19 @@ def build_all_protocols(
     acceleration_host = _acceleration_host()
 
     # VLESS/VMess do not need SOCKS credentials.  For SOCKS acceleration,
-    # however, use the actual local inbound credentials only.
-    local_username = str((socks or {}).get("username") or _auth_name(user_id))
+    # use the local inbound credentials.  The public default username is the
+    # node user id; the historical ``node-manager:<id>`` name remains an
+    # internal VLESS/VMess alias only.
+    local_username = str((socks or {}).get("username") or user_id)
     local_password = str((socks or {}).get("password") or "")
+    display_ip = str(
+        (proxy or {}).get("sourceIp")
+        or (proxy or {}).get("source_ip")
+        or (socks or {}).get("host")
+        or config.node.host
+    )
     data = ProtocolData(
-        ip=str((socks or {}).get("host") or config.node.host),
+        ip=display_ip,
         port=int((socks or {}).get("port") or _inbound_port(socks_inbound, 5001)),
         username=local_username,
         password=local_password,
@@ -439,9 +525,24 @@ def build_all_protocols(
     if include_original and socks is not None:
         original_data = data
         if proxy is not None:
+            upstream_server = str(
+                proxy.get("server")
+                or proxy.get("sourceAddress")
+                or proxy.get("source_address")
+                or ""
+            ).strip()
+            if not upstream_server:
+                raise SingboxConfigError("住宅 SOCKS 缺少上游服务器地址")
+            upstream_port = proxy.get("port") or proxy.get("server_port")
+            try:
+                upstream_port = int(upstream_port)
+            except (TypeError, ValueError) as exc:
+                raise SingboxConfigError("residential SOCKS upstream port is missing") from exc
+            if not 1 <= upstream_port <= 65535:
+                raise SingboxConfigError("residential SOCKS upstream port is invalid")
             original_data = ProtocolData(
-                ip=str(proxy.get("sourceIp") or proxy.get("source_ip") or proxy.get("server") or data.ip),
-                port=int(proxy.get("port") or data.port),
+                ip=data.ip,
+                port=upstream_port,
                 username=str(proxy.get("username") or data.username),
                 password=str(proxy.get("password") or data.password),
                 country_code=str(proxy.get("countryCode") or proxy.get("country_code") or data.country_code or "XX"),
@@ -452,6 +553,7 @@ def build_all_protocols(
                 acceleration_port_socks=data.acceleration_port_socks,
                 vless_port=data.vless_port,
                 vmess_port=data.vmess_port,
+                endpoint_host=upstream_server,
             )
         links["socks5"] = socks5_original(original_data)
         links["bitbrowser"] = bitbrowser(original_data)
@@ -484,10 +586,16 @@ def build_protocol_info(
     credentials, instead of leaking the local node SOCKS credentials.
     """
     acceleration_host = _acceleration_host()
-    local_username = str((socks or {}).get("username") or _auth_name(user_id))
+    local_username = str((socks or {}).get("username") or user_id)
     local_password = str((socks or {}).get("password") or "")
+    display_ip = str(
+        (proxy or {}).get("sourceIp")
+        or (proxy or {}).get("source_ip")
+        or (socks or {}).get("host")
+        or config.node.host
+    )
     data = ProtocolData(
-        ip=str((socks or {}).get("host") or config.node.host),
+        ip=display_ip,
         port=int((socks or {}).get("port") or _inbound_port(socks_inbound, 5001)),
         username=local_username,
         password=local_password,
@@ -511,14 +619,32 @@ def build_protocol_info(
         include_original=include_original and socks is not None,
     )
     if include_original and proxy is not None:
-        upstream_server = str(proxy.get("sourceIp") or proxy.get("source_ip") or proxy.get("server") or data.ip)
-        upstream_port = proxy.get("port")
+        upstream_server = str(
+            proxy.get("server")
+            or proxy.get("sourceAddress")
+            or proxy.get("source_address")
+            or ""
+        ).strip()
+        if not upstream_server:
+            raise SingboxConfigError("住宅 SOCKS 缺少上游服务器地址")
+        upstream_port = proxy.get("port") or proxy.get("server_port")
+        try:
+            upstream_port = int(upstream_port)
+        except (TypeError, ValueError) as exc:
+            raise SingboxConfigError("residential SOCKS upstream port is missing") from exc
+        if not 1 <= upstream_port <= 65535:
+            raise SingboxConfigError("residential SOCKS upstream port is invalid")
         upstream_username = proxy.get("username")
         upstream_password = proxy.get("password")
+        source_ip = proxy.get("sourceIp") or proxy.get("source_ip")
+        if source_ip:
+            info["sourceIp"] = str(source_ip)
         if upstream_server:
-            info["sourceIp"] = upstream_server
+            info["sourceAddress"] = upstream_server
+            info["rawServer"] = upstream_server
         if upstream_port is not None:
             info["rawPort"] = int(upstream_port)
+            info["sourcePort"] = int(upstream_port)
         if upstream_username:
             info["rawUsername"] = str(upstream_username)
         if upstream_password:
@@ -542,7 +668,9 @@ def create_user(
     # The local SOCKS inbound credentials are distinct from the upstream
     # residential proxy credentials.  The latter are used only by the
     # per-user outbound and must never leak into a public node link.
-    effective_socks_username = socks_username or _auth_name(user_id)
+    # Do not expose the internal VLESS/VMess auth prefix in public SOCKS
+    # links.  Explicit credentials still take precedence for compatibility.
+    effective_socks_username = socks_username or user_id
     effective_socks_password = socks_password or secrets.token_urlsafe(18)
 
     def apply(data: dict[str, Any], registry: dict[str, Any]) -> dict[str, Any]:
@@ -633,6 +761,7 @@ def create_user(
             "createdAt": datetime.now(timezone.utc).isoformat(),
         }
         if proxy is not None:
+            _save_proxy_metadata(registry, user_id, proxy)
             _set_proxy_binding(data, registry, user_id, proxy)
         else:
             _set_direct_binding(data, registry, user_id)
@@ -650,13 +779,33 @@ def create_user(
 def _set_proxy_binding(
     data: dict[str, Any], registry: dict[str, Any], user_id: str, proxy: dict[str, Any]
 ) -> None:
-    _validate_proxy_does_not_loop_to_local_socks(data, proxy)
+    # The proxy server is the real upstream SOCKS endpoint.  ``sourceIp`` is
+    # only residential exit metadata and must never be used as the outbound
+    # server when the two addresses differ.
+    server = str(
+        proxy.get("server")
+        or proxy.get("sourceAddress")
+        or proxy.get("source_address")
+        or ""
+    ).strip()
+    if not server:
+        raise SingboxConfigError("住宅 SOCKS 缺少上游服务器地址")
+    try:
+        port = int(proxy.get("port") or proxy.get("server_port") or proxy.get("sourcePort"))
+    except (TypeError, ValueError) as exc:
+        raise SingboxConfigError("住宅 SOCKS 上游端口无效") from exc
+    if not 1 <= port <= 65535:
+        raise SingboxConfigError("住宅 SOCKS 上游端口无效")
+    normalized_proxy = dict(proxy)
+    normalized_proxy["server"] = server
+    normalized_proxy["port"] = port
+    _validate_proxy_does_not_loop_to_local_socks(data, normalized_proxy)
     outbound_tag = f"{USER_OUTBOUND_PREFIX}{user_id}"
     outbound = {
         "type": "socks",
         "tag": outbound_tag,
-        "server": proxy["server"],
-        "server_port": proxy["port"],
+        "server": server,
+        "server_port": port,
     }
     if proxy.get("username"):
         outbound["username"] = proxy["username"]
@@ -671,6 +820,23 @@ def _set_proxy_binding(
     rules[:] = [rule for rule in rules if rule.get("outbound") != outbound_tag]
     auth_names = sorted(_route_auth_names(data, registry, user_id))
     rules.insert(0, {"auth_user": auth_names, "action": "route", "outbound": outbound_tag})
+
+
+def _save_proxy_metadata(registry: dict[str, Any], user_id: str, proxy: dict[str, Any]) -> None:
+    """Persist non-secret residential metadata for refresh/restart recovery."""
+    item = registry.setdefault("users", {}).setdefault(user_id, {})
+    fields = {
+        "sourceIp": ("sourceIp", "source_ip"),
+        "sourceAddress": ("sourceAddress", "source_address", "server"),
+        "sourcePort": ("sourcePort", "source_port", "port", "server_port"),
+        "countryCode": ("countryCode", "country_code"),
+        "countryName": ("countryName", "country_name"),
+        "cityName": ("cityName", "city_name"),
+    }
+    for target, keys in fields.items():
+        value = next((proxy.get(key) for key in keys if proxy.get(key) not in (None, "")), None)
+        if value is not None:
+            item[target] = value
 
 
 def _canonical_ip(value: str) -> str | None:
@@ -733,11 +899,9 @@ def _validate_proxy_does_not_loop_to_local_socks(
 
     proxy_addresses = _resolve_host_addresses(str(proxy.get("server") or ""))
     if proxy_addresses and proxy_addresses.intersection(_local_host_addresses()):
-        logger.warning(
-            "upstream SOCKS points to this node's own SOCKS inbound (%s:%d); "
-            "allowing binding because Node Manager routes traffic through a "
-            "separate outbound chain, which is not a proxy loop.",
-            proxy.get("server"), proxy_port,
+        raise SingboxConfigError(
+            f"proxy loop: upstream SOCKS points to this node's own SOCKS inbound "
+            f"({proxy.get('server')}:{proxy_port})"
         )
 
 
@@ -765,6 +929,7 @@ def bind_proxy(user_id: str, proxy: dict[str, Any]) -> dict[str, Any]:
         if not _user_exists(data, registry, user_id):
             raise SingboxConfigError(f"user not found: {user_id}")
 
+        _save_proxy_metadata(registry, user_id, proxy)
         _set_proxy_binding(data, registry, user_id, proxy)
         _audit("proxy.bind", user_id, server=str(proxy.get("server")), port=int(proxy.get("port")))
         return {"success": True, "userId": user_id, "message": "proxy bound"}
@@ -875,7 +1040,10 @@ def list_users() -> list[dict[str, Any]]:
             if protocol not in item["protocols"]:
                 item["protocols"].append(protocol)
             if protocol == "socks":
-                item["socksUsername"] = auth_value
+                # Never expose the internal node-manager:<id> alias.  Prefer
+                # the registry's configured public username and normalize
+                # legacy configs to the bare user id.
+                item["socksUsername"] = _public_socks_username(registry, user_id)
 
     protocol_order = {"vless": 0, "vmess": 1, "socks": 2}
     outbounds = {item.get("tag"): item for item in data.get("outbounds", [])}
@@ -884,7 +1052,7 @@ def list_users() -> list[dict[str, Any]]:
         metadata = _registry_user(registry, user_id)
         outbound = outbounds.get(f"{USER_OUTBOUND_PREFIX}{user_id}")
         item["protocols"].sort(key=protocol_order.get)
-        item["socksUsername"] = item.get("socksUsername") or metadata.get("socksUsername")
+        item["socksUsername"] = item.get("socksUsername") or _public_socks_username(registry, user_id)
         item["proxyBound"] = bool(outbound and outbound.get("type") == "socks")
         item["proxyServer"] = (
             f"{outbound.get('server')}:{outbound.get('server_port')}"
@@ -905,7 +1073,7 @@ def get_user_connection(user_id: str) -> dict[str, Any]:
 
     metadata = _registry_user(registry, user_id)
     auth_name = _auth_name(user_id)
-    socks_username = metadata.get("socksUsername") or auth_name
+    socks_username = _public_socks_username(registry, user_id)
     protocols: list[str] = []
     user_uuid: str | None = None
     response: dict[str, Any] = {
@@ -962,14 +1130,14 @@ def get_user_connection(user_id: str) -> dict[str, Any]:
                 (
                     item
                     for item in inbound.get("users", [])
-                    if item.get("username") == socks_username
+                    if item.get("username") in _user_auth_names(registry, user_id)
                 ),
                 None,
             )
             if user:
                 protocols.append("socks")
                 response["socks"] = _socks_connection(
-                    str(user.get("username") or ""),
+                    socks_username,
                     str(user.get("password") or ""),
                     inbound,
                 )
@@ -987,6 +1155,24 @@ def get_user_connection(user_id: str) -> dict[str, Any]:
     )
     response["uuid"] = user_uuid or ""
     response["proxyBound"] = bool(outbound and outbound.get("type") == "socks")
+    proxy = None
+    if response["proxyBound"]:
+        proxy = {
+            "type": "socks5",
+            "server": outbound.get("server"),
+            "port": outbound.get("server_port"),
+            "username": outbound.get("username"),
+            "password": outbound.get("password"),
+            **{
+                key: metadata[key]
+                for key in (
+                    "sourceIp", "sourceAddress", "sourcePort",
+                    "countryCode", "countryName", "cityName",
+                )
+                if metadata.get(key) is not None
+            },
+        }
+        response["proxyServer"] = f"{outbound.get('server')}:{outbound.get('server_port')}"
     all_protocols = build_all_protocols(
         user_id,
         response["uuid"],
@@ -994,8 +1180,11 @@ def get_user_connection(user_id: str) -> dict[str, Any]:
         vless_inbound=vless_inbound,
         vmess_inbound=vmess_inbound,
         socks_inbound=socks_inbound,
-        include_original=response["proxyBound"],
+        # 普通连接接口只返回 Node Manager 的三种加速协议。原始住宅
+        # SOCKS/BitBrowser 凭据只能通过显式的 /proxy 接口获取。
+        include_original=False,
         enabled_protocols=set(protocols),
+        proxy=proxy,
     )
     if all_protocols:
         response["protocolsAll"] = all_protocols
@@ -1011,7 +1200,9 @@ def get_user_connection(user_id: str) -> dict[str, Any]:
         vless_inbound=vless_inbound,
         vmess_inbound=vmess_inbound,
         socks_inbound=socks_inbound,
-        include_original=response["proxyBound"],
+        # 不把上游住宅 SOCKS 凭据带入普通连接详情。
+        include_original=False,
+        proxy=proxy,
     )
     return response
 
@@ -1032,21 +1223,61 @@ def get_user_proxy(user_id: str) -> dict[str, Any]:
         ),
         None,
     )
+    metadata = _registry_user(registry, user_id)
     if not outbound or outbound.get("type") not in {"socks", "socks5"}:
         return {
             "userId": user_id,
             "proxyBound": False,
+            "nodeHost": config.node.host,
             "server": None,
             "port": None,
             "username": None,
             "password": None,
+            "sourceIp": metadata.get("sourceIp"),
+            "sourceAddress": metadata.get("sourceAddress"),
+            "sourcePort": metadata.get("sourcePort"),
+            "countryCode": metadata.get("countryCode"),
+            "countryName": metadata.get("countryName"),
+            "cityName": metadata.get("cityName"),
+            "protocolInfo": {},
         }
 
+    # This endpoint is intentionally explicit: it is the only proxy-details
+    # response that may contain the upstream credentials.  The regular user
+    # list, connection response, audit log and registry metadata never expose
+    # these values.
+    user_uuid = _find_user_uuid(data, registry, user_id)
+    protocol_info_data = build_protocol_info(
+        user_id,
+        user_uuid,
+        {
+            "host": str(outbound.get("server") or metadata.get("sourceAddress") or ""),
+            "port": int(outbound.get("server_port") or metadata.get("sourcePort") or 5001),
+            "username": user_id,
+            "password": "",
+        },
+        include_original=True,
+        proxy={
+            "server": outbound.get("server"),
+            "port": outbound.get("server_port"),
+            "username": outbound.get("username"),
+            "password": outbound.get("password"),
+            **metadata,
+        },
+    )
     return {
         "userId": user_id,
         "proxyBound": True,
+        "nodeHost": config.node.host,
         "server": outbound.get("server"),
         "port": outbound.get("server_port"),
         "username": outbound.get("username"),
         "password": outbound.get("password"),
+        "sourceIp": metadata.get("sourceIp"),
+        "sourceAddress": metadata.get("sourceAddress") or outbound.get("server"),
+        "sourcePort": metadata.get("sourcePort") or outbound.get("server_port"),
+        "countryCode": metadata.get("countryCode"),
+        "countryName": metadata.get("countryName"),
+        "cityName": metadata.get("cityName"),
+        "protocolInfo": protocol_info_data,
     }

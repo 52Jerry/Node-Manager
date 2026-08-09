@@ -35,7 +35,7 @@ node:
 | 值类型 | 示例 | 说明 |
 | --- | --- | --- |
 | 域名 | `proxy.tkip.xin` | 直接作为 VLESS/VMess/SOCKS 的 `add`/`host` |
-| IPv4 | `198.13.46.231` | 直接使用 |
+| IPv4 | `203.0.113.20` | 直接使用（文档示例） |
 | IPv6 | `2001:db8::10` | 生成 URI 时自动加方括号 `[2001:db8::10]` |
 | 空（未配置） | `""` | 回退到 `node.host`（自动获取的公网 IP） |
 
@@ -121,8 +121,8 @@ const vless = `vless://${p.uuid}@${bracket(p.accelerationDomain)}:${p.vlessPort}
   `&spx=${p.vlessSpx}&type=${p.vlessType}&headerType=${p.vlessHeaderType}` +
   `&flow=${p.vlessFlow}#${encodeURIComponent(p.remark)}`;
 
-// SOCKS 加速（账号密码 Base64）
-const socksAcc = `socks://${b64(p.username)}:${b64(p.password)}` +
+// SOCKS 加速（标准 SOCKS URI：账号密码分别 URL 编码）
+const socksAcc = `socks://${encodeURIComponent(p.username)}:${encodeURIComponent(p.password)}` +
   `@${bracket(p.accelerationDomain)}:${p.accelerationPortSocks}#${p.remark}`;
 
 // VMess 加速
@@ -165,4 +165,4 @@ function bracket(h){ return h.includes(':') && !h.startsWith('[') ? `[${h}]` : h
 | `test_protocol_info_contains_documented_fields_and_can_use_ipv6_endpoint` | 字段清单完整、IPv6 端点 |
 | `test_protocol_info_can_include_original_fields_only_for_residential_mode` | 住宅才含 raw* 字段 |
 | `test_proxy_credentials_are_used_only_by_outbound` | 上游凭据不出现在节点链接 |
-| `test_socks_acceleration_uses_base64_credentials` | SOCKS 加速账号密码 Base64 |
+| `test_socks_acceleration_uses_standard_url_encoded_credentials` | SOCKS 加速账号密码分别 URL 编码 |
