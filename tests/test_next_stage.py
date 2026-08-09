@@ -675,7 +675,7 @@ class ApiTestCase(unittest.TestCase):
         body = response.json()
         self.assertEqual(body["total"], 1)
         self.assertEqual(body["items"][0]["nodeId"], "test-node")
-        self.assertEqual(body["items"][0]["managerVersion"], "1.4.2")
+        self.assertEqual(body["items"][0]["managerVersion"], "1.4.10")
         self.assertEqual(body["items"][0]["singboxVersion"], "1.13.14")
         self.assertEqual(body["items"][0]["connections"], 3)
         self.assertEqual(body["items"][0]["systemConnections"], 8)
@@ -947,6 +947,11 @@ class InstallerContractTest(unittest.TestCase):
             'apt_get install -y ca-certificates curl jq openssl python3 python3-pip python3-venv ufw',
             self.installer,
         )
+
+    def test_force_update_switch_can_refresh_same_application_version(self):
+        self.assertIn('FORCE_NODE_MANAGER_UPDATE="${NODE_MANAGER_FORCE_UPDATE:-0}"', self.installer)
+        self.assertIn('NODE_MANAGER_FORCE_UPDATE must be 0 or 1', self.installer)
+        self.assertIn('Node Manager force update requested; installing application $APP_VERSION', self.installer)
 
     def test_packaged_default_config_is_replaced_but_user_config_is_preserved(self):
         self.assertIn('is_packaged_default_singbox_config()', self.installer)

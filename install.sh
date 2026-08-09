@@ -13,6 +13,7 @@ SINGBOX_TEMP_DIR=""
 APP_VERSION=""
 INSTALLED_APP_VERSION=""
 UPDATE_NODE_MANAGER=1
+FORCE_NODE_MANAGER_UPDATE="${NODE_MANAGER_FORCE_UPDATE:-0}"
 FRESH_SINGBOX_CONFIG=0
 TEST_USER_ID="node-manager-test"
 TEST_USER_UUID=""
@@ -39,6 +40,10 @@ trap cleanup EXIT
 command -v apt-get >/dev/null 2>&1 || fail "only Debian and Ubuntu are supported"
 case "$APT_LOCK_TIMEOUT_SECONDS" in
   ''|*[!0-9]*) fail "APT_LOCK_TIMEOUT_SECONDS must be a non-negative integer" ;;
+esac
+case "$FORCE_NODE_MANAGER_UPDATE" in
+  0|1) ;;
+  *) fail "NODE_MANAGER_FORCE_UPDATE must be 0 or 1" ;;
 esac
 
 apt_get() {
@@ -91,7 +96,10 @@ APP_VERSION="$(tr -d '[:space:]' < "$VERSION_FILE")"
 if [ -f "$APP_DIR/VERSION" ]; then
   INSTALLED_APP_VERSION="$(tr -d '[:space:]' < "$APP_DIR/VERSION")"
 fi
-if [ "$INSTALLED_APP_VERSION" = "$APP_VERSION" ]; then
+if [ "$FORCE_NODE_MANAGER_UPDATE" = "1" ]; then
+  UPDATE_NODE_MANAGER=1
+  log "Node Manager force update requested; installing application $APP_VERSION"
+elif [ "$INSTALLED_APP_VERSION" = "$APP_VERSION" ]; then
   UPDATE_NODE_MANAGER=0
   log "Node Manager $APP_VERSION is already installed; keeping the current application"
 elif [ -n "$INSTALLED_APP_VERSION" ]; then

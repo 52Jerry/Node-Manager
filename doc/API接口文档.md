@@ -1,6 +1,6 @@
 # Python Node Manager API 接口文档
 
-当前版本：`1.4.2`
+当前版本：`1.4.10`
 
 部署节点：`http://<NODE_MANAGER_HOST>:8088`
 

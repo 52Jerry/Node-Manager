@@ -66,7 +66,7 @@ logging.basicConfig(
 
 app = FastAPI(
     title="Python Node Manager API",
-    version="1.4.2",
+    version="1.4.10",
     description="Single-node sing-box agent API for a Spring Boot multi-node control plane.",
 )
 
