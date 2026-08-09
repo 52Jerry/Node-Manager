@@ -8,8 +8,8 @@
   5. VMess（加速）       vmess://base64(JSON)
 
 设计原则：后端只返回一份统一数据，前端/本模块按协议模板本地拼接，
-不额外发起 API 请求。加速线路的 SOCKS 认证信息由 username/password
-Base64 编码生成，无需单独存储。
+不额外发起 API 请求。SOCKS URI 的用户名和密码分别进行 URL 百分号编码，
+避免保留字符破坏 URI 的 userinfo 结构；只有 VMess 的完整 JSON 载荷使用 Base64。
 """
 from __future__ import annotations
 
@@ -20,7 +20,7 @@ from typing import Any
 
 
 def _b64(raw: str) -> str:
-    """标准 Base64 编码字符串（用于 SOCKS 加速认证与 VMess 配置）。"""
+    """标准 Base64 编码字符串（仅用于 VMess JSON 配置）。"""
     return base64.b64encode(raw.encode("utf-8")).decode("ascii")
 
 

@@ -134,9 +134,13 @@ const vmessConfig = {
 };
 const vmess = `vmess://${b64(JSON.stringify(vmessConfig))}`;
 
-// 原始地址（仅住宅节点有 rawProtocol）
-const socks5 = `socks://${p.username}:${p.password}@${p.ip}:${p.rawPort}#${p.countryCode}-${p.ip}`;
-const bitbrowser = `${p.ip}:${p.rawPort}:${p.username}:${p.password}`;
+// 原始住宅地址（仅住宅节点有 rawProtocol/raw* 字段）。
+// p.ip/sourceIp 是住宅出口展示 IP，不是客户端连接的 SOCKS 服务器。
+// 客户端必须连接实际上游 SOCKS 接入地址 sourceAddress:sourcePort，
+// 并对账号和密码分别进行 URL 编码。
+const socks5 = `socks://${encodeURIComponent(p.rawUsername)}:${encodeURIComponent(p.rawPassword)}` +
+  `@${bracket(p.sourceAddress)}:${p.sourcePort}#${p.countryCode}-${p.sourceIp || p.ip}`;
+const bitbrowser = `${p.sourceAddress}:${p.sourcePort}:${p.rawUsername}:${p.rawPassword}`;
 
 function b64(s){ return btoa(unescape(encodeURIComponent(s))); }
 function bracket(h){ return h.includes(':') && !h.startsWith('[') ? `[${h}]` : h; }
