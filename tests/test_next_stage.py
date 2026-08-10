@@ -138,6 +138,30 @@ class ManagerTestCase(unittest.TestCase):
             data["route"]["rules"][0]["auth_user"],
             ["node-manager:customer-1", "residential-user"],
         )
+        vless_user = next(
+            user
+            for user in next(item for item in data["inbounds"] if item["tag"] == "vless-reality")["users"]
+            if user["name"] == "node-manager:customer-1"
+        )
+        vmess_user = next(
+            user
+            for user in next(item for item in data["inbounds"] if item["tag"] == "vmess")["users"]
+            if user["name"] == "node-manager:customer-1"
+        )
+        socks_user = next(
+            user
+            for user in next(item for item in data["inbounds"] if item["tag"] == "socks")["users"]
+            if user["username"] == "residential-user"
+        )
+        self.assertEqual(vless_user["uuid"], created["uuid"])
+        self.assertEqual(vmess_user["uuid"], created["uuid"])
+        self.assertEqual(socks_user["password"], "residential-password")
+        outbound = next(
+            item for item in data["outbounds"] if item["tag"] == "node-manager-out:customer-1"
+        )
+        self.assertEqual(outbound["server"], "203.0.113.20")
+        self.assertEqual(outbound["server_port"], 1080)
+        self.assertEqual(data["route"]["rules"][0]["outbound"], outbound["tag"])
 
         users = manager.list_users()
         self.assertEqual(len(users), 1)
@@ -217,7 +241,10 @@ class ManagerTestCase(unittest.TestCase):
             )
 
         links = created["protocolsAll"]
-        self.assertIn("socks://upstream-user:upstream-password@203.0.113.30:5001", links["socks5"])
+        raw_auth = __import__("base64").b64encode(
+            b"upstream-user:upstream-password"
+        ).decode("ascii")
+        self.assertIn(f"socks://{raw_auth}@203.0.113.30:5001", links["socks5"])
         self.assertEqual(links["bitbrowser"], "203.0.113.30:5001:upstream-user:upstream-password")
         self.assertIn("@203.0.113.20:20168?", links["vless"])
         self.assertIn("@203.0.113.20:5001#", links["socksAcceleration"])
@@ -358,8 +385,11 @@ class ManagerTestCase(unittest.TestCase):
         # Raw SOCKS5 and BitBrowser intentionally use the upstream
         # residential credentials.  Only acceleration protocols must keep
         # those credentials out of public links.
-        self.assertIn("upstream-user", created["protocolsAll"]["socks5"])
-        self.assertIn("upstream-password", created["protocolsAll"]["socks5"])
+        raw_auth = created["protocolsAll"]["socks5"].split("socks://", 1)[1].split("@", 1)[0]
+        self.assertEqual(
+            __import__("base64").b64decode(raw_auth).decode("utf-8"),
+            "upstream-user:upstream-password",
+        )
         self.assertIn("upstream-user", created["protocolsAll"]["bitbrowser"])
         self.assertIn("upstream-password", created["protocolsAll"]["bitbrowser"])
         for key in ("vless", "socksAcceleration"):

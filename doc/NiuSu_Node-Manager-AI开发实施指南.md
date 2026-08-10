@@ -33,10 +33,10 @@
 ### 步骤 1.1 核验协议格式
 **改动文件**：`node-manager/protocols.py`
 **做什么**（逐项核验）：
-1. `socks5_original` → `socks://user:pass@ip:port#US-1.2.3.4`
+1. `socks5_original` → `socks://Base64(user:pass)@ip:port#US-1.2.3.4`
 2. `bitbrowser` → `ip:port:user:pass`
 3. `vless` → `vless://uuid@域名:20168?encryption=none&security=reality&sni=...&pbk=...&sid=...&spx=...&type=tcp&headerType=none&flow=xtls-rprx-vision#备注`
-4. `socks_acceleration` → `socks://user:pass@域名:5001#备注`（账号密码分别 URL 编码）
+4. `socks_acceleration` → `socks://Base64(user:pass)@域名:5001#备注`（完整凭据 Base64）
 5. `vmess` → `vmess://base64(JSON)`，JSON 含 `v/ps/add/port/id/aid/scy/net/type/host/path/tls/sni/alpn/fp`
 
 **验收**：`test_protocols.py` 全部通过；住宅请求生成五种格式，直连用户只生成三种加速格式。

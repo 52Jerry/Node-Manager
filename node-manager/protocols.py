@@ -1,15 +1,16 @@
 """多协议代理配置生成模块（对标 IPVelo 五种协议）。
 
 基于同一份住宅 SOCKS 代理数据，生成五种标准化协议链接：
-  1. SOCKS5（原始）      socks://user:pass@ip:port#备注
+  1. SOCKS5（原始）      socks://Base64(user:pass)@ip:port#备注
   2. 比特浏览器          ip:port:user:pass
   3. VLESS（加速）       vless://uuid@域名:端口?参数
-  4. SOCKS（加速）       socks://user:pass@域名:端口#备注（字段 URL 编码）
+  4. SOCKS（加速）       socks://Base64(user:pass)@域名:端口#备注
   5. VMess（加速）       vmess://base64(JSON)
 
 设计原则：后端只返回一份统一数据，前端/本模块按协议模板本地拼接，
-不额外发起 API 请求。SOCKS URI 的用户名和密码分别进行 URL 百分号编码，
-避免保留字符破坏 URI 的 userinfo 结构；只有 VMess 的完整 JSON 载荷使用 Base64。
+不额外发起 API 请求。SOCKS URI 的完整 ``username:password`` 使用标准 Base64
+编码后放入 ``@`` 前的 userinfo；服务器端仍使用分开的原始用户名和密码认证。
+URI 备注和其他参数继续按 URI 规则编码，只有 VMess 的完整 JSON 载荷也使用 Base64。
 """
 from __future__ import annotations
 
@@ -20,8 +21,20 @@ from typing import Any
 
 
 def _b64(raw: str) -> str:
-    """标准 Base64 编码字符串（仅用于 VMess JSON 配置）。"""
+    """Encode a UTF-8 string with standard Base64 (without line breaks)."""
     return base64.b64encode(raw.encode("utf-8")).decode("ascii")
+
+
+def _socks_uri_auth(username: str, password: str) -> str:
+    """Return the V2Ray/V2RayN SOCKS userinfo representation.
+
+    The sing-box server still receives the username and password as separate
+    fields.  Only the share URI uses the client-compatible convention of
+    Base64-encoding the complete ``username:password`` pair before ``@``.
+    Keeping this conversion at the presentation boundary prevents the encoded
+    value from ever being written into the server's authentication config.
+    """
+    return _b64(f"{username}:{password}")
 
 
 def _base64url(raw: bytes) -> str:
@@ -112,13 +125,12 @@ class ProtocolData:
 def socks5_original(data: ProtocolData) -> str:
     """原始地址 - SOCKS5：socks://user:pass@ip:port#备注。
 
-    原始住宅 SOCKS 按项目协议文档使用明文 userinfo（仅做 URI 百分号编码）。
-    将完整 ``username:password`` 做 Base64 会让 v2rayN/V2Ray 把凭据识别为
-    一个用户名，导致导入后账号密码为空。
+    V2Ray/V2RayN 兼容完整凭据 Base64 userinfo：先编码
+    ``username:password``，再放到 URI 的 ``@`` 前。该格式只用于分享链接，
+    不改变服务器端 SOCKS 的实际用户名和密码字段。
     """
     remark = f"{data.country_code}-{data.ip}"
-    from urllib.parse import quote
-    auth = f"{quote(str(data.username), safe='')}:{quote(str(data.password), safe='')}"
+    auth = _socks_uri_auth(str(data.username), str(data.password))
     endpoint = data.endpoint_host or data.ip
     return f"socks://{auth}@{_uri_host(endpoint)}:{data.port}#{_url_encode(remark)}"
 
@@ -151,14 +163,13 @@ def vless(data: ProtocolData) -> str:
 def socks_acceleration(data: ProtocolData) -> str:
     """加速线路 SOCKS。
 
-    Use the standard SOCKS URI userinfo form. Username and password are
-    encoded independently so reserved characters cannot change the URI
-    structure. SOCKS servers do not decode Base64 credentials; emitting
-    Base64 here would make authentication fail.
+    Use the V2Ray/V2RayN-compatible Base64 userinfo form. The complete
+    ``username:password`` pair is encoded as one value for the share URI;
+    sing-box itself continues to authenticate with the original separate
+    username/password fields.
     """
     remark = f"[{data.country_code}] {data.ip}"
-    from urllib.parse import quote
-    auth = f"{quote(str(data.username), safe='')}:{quote(str(data.password), safe='')}"
+    auth = _socks_uri_auth(str(data.username), str(data.password))
     return (
         f"socks://{auth}"
         f"@{_uri_host(data.acceleration_domain)}:{data.acceleration_port_socks}"

@@ -121,8 +121,8 @@ const vless = `vless://${p.uuid}@${bracket(p.accelerationDomain)}:${p.vlessPort}
   `&spx=${p.vlessSpx}&type=${p.vlessType}&headerType=${p.vlessHeaderType}` +
   `&flow=${p.vlessFlow}#${encodeURIComponent(p.remark)}`;
 
-// SOCKS 加速（标准 SOCKS URI：账号密码分别 URL 编码）
-const socksAcc = `socks://${encodeURIComponent(p.username)}:${encodeURIComponent(p.password)}` +
+// SOCKS 加速（当前 NiuSu 契约：完整 username:password 使用 Base64）
+const socksAcc = `socks://${b64(`${p.username}:${p.password}`)}` +
   `@${bracket(p.accelerationDomain)}:${p.accelerationPortSocks}#${p.remark}`;
 
 // VMess 加速
@@ -137,8 +137,8 @@ const vmess = `vmess://${b64(JSON.stringify(vmessConfig))}`;
 // 原始住宅地址（仅住宅节点有 rawProtocol/raw* 字段）。
 // p.ip/sourceIp 是住宅出口展示 IP，不是客户端连接的 SOCKS 服务器。
 // 客户端必须连接实际上游 SOCKS 接入地址 sourceAddress:sourcePort，
-// 并对账号和密码分别进行 URL 编码。
-const socks5 = `socks://${encodeURIComponent(p.rawUsername)}:${encodeURIComponent(p.rawPassword)}` +
+// 原始 SOCKS 分享链接也使用完整 username:password Base64。
+const socks5 = `socks://${b64(`${p.rawUsername}:${p.rawPassword}`)}` +
   `@${bracket(p.sourceAddress)}:${p.sourcePort}#${p.countryCode}-${p.sourceIp || p.ip}`;
 const bitbrowser = `${p.sourceAddress}:${p.sourcePort}:${p.rawUsername}:${p.rawPassword}`;
 
@@ -169,4 +169,4 @@ function bracket(h){ return h.includes(':') && !h.startsWith('[') ? `[${h}]` : h
 | `test_protocol_info_contains_documented_fields_and_can_use_ipv6_endpoint` | 字段清单完整、IPv6 端点 |
 | `test_protocol_info_can_include_original_fields_only_for_residential_mode` | 住宅才含 raw* 字段 |
 | `test_proxy_credentials_are_used_only_by_outbound` | 上游凭据不出现在节点链接 |
-| `test_socks_acceleration_uses_standard_url_encoded_credentials` | SOCKS 加速账号密码分别 URL 编码 |
+| `test_socks_acceleration_uses_v2ray_compatible_base64_credentials` | SOCKS 加速完整 username:password 使用 Base64 |

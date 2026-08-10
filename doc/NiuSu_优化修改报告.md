@@ -48,7 +48,7 @@ def generate_all(data: ProtocolData) -> dict[str, str]:
     }
 ```
 
-**改进点**：统一数据源 `ProtocolData` 复用一套参数；加速地址与原始地址分离；SOCKS 加速凭据按标准 URI 规则分别 URL 编码，避免客户端把编码文本当成实际账号密码。
+**改进点**：统一数据源 `ProtocolData` 复用一套参数；加速地址与原始地址分离；SOCKS 分享链接将完整 `username:password` 使用 Base64 编码，避免特殊字符破坏 userinfo，同时不改变服务端分开的认证字段。
 
 ### 3.2 连接接口返回五协议（接口增强）
 **优化前**：`GET /api/user/{id}/connections` 仅返回 `vless/vmess/socks` 三字段。

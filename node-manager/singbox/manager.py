@@ -876,17 +876,12 @@ def _local_host_addresses() -> set[str]:
 def _validate_proxy_does_not_loop_to_local_socks(
     data: dict[str, Any], proxy: dict[str, Any]
 ) -> None:
-    """Warn if the upstream SOCKS points back to this very node's SOCKS inbound.
+    """Reject an upstream SOCKS endpoint that points to this node's own inbound.
 
-    Historically this was treated as a hard error, but a VPS may legitimately host
-    both the Node Manager and the upstream residential SOCKS (e.g. IPVelo assigns
-    the same VPS IP as the access point).  In that case the traffic flow is:
-
-        client -> VLESS(20168) -> sing-box route -> outbound SOCKS(5001, loopback) -> exit
-
-    which *does not* create a proxy loop because the outbound is a separate
-    sing-box chain.  We therefore allow same-host bindings and emit a warning
-    only, so the UI can still display a soft notice without blocking the user.
+    The user outbound is routed into the public SOCKS inbound again in this case,
+    so every request recursively re-enters the same route and never reaches an
+    external upstream. Same-host bindings are therefore rejected when the port
+    and resolved address identify the local SOCKS service.
     """
     socks_inbound = _find_inbound(data, config.singbox.socks_tag)
     try:

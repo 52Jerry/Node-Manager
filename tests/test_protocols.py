@@ -53,7 +53,8 @@ def sample_data(**overrides):
 class ProtocolGenerationTest(unittest.TestCase):
     def test_socks5_original_format(self):
         link = socks5_original(sample_data())
-        self.assertTrue(link.startswith("socks://a1b2c3d4e5f6a7b8:888888@149.52.53.230:5001#"))
+        encoded = base64.b64encode(b"a1b2c3d4e5f6a7b8:888888").decode("ascii")
+        self.assertTrue(link.startswith(f"socks://{encoded}@149.52.53.230:5001#"))
         self.assertIn("#US-149.52.53.230", link)
 
     def test_bitbrowser_format(self):
@@ -68,17 +69,23 @@ class ProtocolGenerationTest(unittest.TestCase):
         self.assertIn("pbk=abc123", link)
         self.assertIn("sid=0123456789abcdef", link)
 
-    def test_socks_acceleration_uses_standard_url_encoded_credentials(self):
+    def test_socks_acceleration_uses_v2ray_compatible_base64_credentials(self):
         link = socks_acceleration(sample_data())
         self.assertTrue(link.startswith("socks://"))
         self.assertIn("@proxy.tkip.xin:5001#", link)
-        self.assertIn(":888888@proxy.tkip.xin", link)
-        self.assertIn("a1b2c3d4e5f6a7b8:888888@proxy.tkip.xin", link)
+        encoded = link.split("socks://", 1)[1].split("@", 1)[0]
+        self.assertEqual(
+            base64.b64decode(encoded).decode("utf-8"),
+            "a1b2c3d4e5f6a7b8:888888",
+        )
 
-    def test_original_and_acceleration_socks_use_independent_url_encoding(self):
+    def test_original_and_acceleration_socks_encode_complete_credentials(self):
         data = sample_data(username="user@name", password="p:a+ss/word=")
-        self.assertIn("socks://user%40name:p%3Aa%2Bss%2Fword%3D@", socks5_original(data))
-        self.assertIn("socks://user%40name:p%3Aa%2Bss%2Fword%3D@", socks_acceleration(data))
+        expected = base64.b64encode(b"user@name:p:a+ss/word=").decode("ascii")
+        for link in (socks5_original(data), socks_acceleration(data)):
+            encoded = link.split("socks://", 1)[1].split("@", 1)[0]
+            self.assertEqual(base64.b64decode(encoded).decode("utf-8"), "user@name:p:a+ss/word=")
+            self.assertIn(f"socks://{expected}@", link)
 
     def test_vmess_format(self):
         link = vmess(sample_data())
