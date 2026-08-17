@@ -22,6 +22,7 @@ from config import config
 from protocols import (
     ProtocolData,
     bitbrowser,
+    normalize_country_code,
     protocol_info,
     socks5_original,
     socks_acceleration,
@@ -89,6 +90,36 @@ def read_registry() -> dict[str, Any]:
     if not isinstance(registry, dict) or not isinstance(registry.get("users"), dict):
         raise SingboxConfigError("the user registry has an invalid structure")
     return registry
+
+
+def get_user_policy(user_id: str) -> dict[str, int | None]:
+    with _config_lock():
+        metadata = _registry_user(read_registry(), user_id)
+    return {
+        "trafficLimitBytes": _positive_policy_value(metadata.get("trafficLimitBytes")),
+        "maxSourceIps": _positive_policy_value(metadata.get("maxSourceIps")),
+    }
+
+
+def get_user_policies() -> dict[str, dict[str, int | None]]:
+    with _config_lock():
+        registry = read_registry()
+    return {
+        user_id: {
+            "trafficLimitBytes": _positive_policy_value(item.get("trafficLimitBytes")),
+            "maxSourceIps": _positive_policy_value(item.get("maxSourceIps")),
+        }
+        for user_id, item in registry.get("users", {}).items()
+        if isinstance(item, dict)
+    }
+
+
+def _positive_policy_value(value: Any) -> int | None:
+    try:
+        normalized = int(value or 0)
+    except (TypeError, ValueError):
+        return None
+    return normalized if normalized > 0 else None
 
 
 def check_config(config_path: str | Path) -> tuple[bool, str]:
@@ -501,11 +532,27 @@ def build_all_protocols(
         or (socks or {}).get("host")
         or config.node.host
     )
+    country_code = str(
+        (proxy or {}).get("countryCode")
+        or (proxy or {}).get("country_code")
+        or "XX"
+    )
     data = ProtocolData(
         ip=display_ip,
         port=int((socks or {}).get("port") or _inbound_port(socks_inbound, 5001)),
         username=local_username,
         password=local_password,
+        country_code=country_code,
+        country_name=str(
+            (proxy or {}).get("countryName")
+            or (proxy or {}).get("country_name")
+            or ""
+        ),
+        city_name=str(
+            (proxy or {}).get("cityName")
+            or (proxy or {}).get("city_name")
+            or ""
+        ),
         uuid=user_uuid or "",
         acceleration_domain=acceleration_host,
         acceleration_port_socks=_inbound_port(socks_inbound, 5001),
@@ -594,11 +641,27 @@ def build_protocol_info(
         or (socks or {}).get("host")
         or config.node.host
     )
+    country_code = str(
+        (proxy or {}).get("countryCode")
+        or (proxy or {}).get("country_code")
+        or "XX"
+    )
     data = ProtocolData(
         ip=display_ip,
         port=int((socks or {}).get("port") or _inbound_port(socks_inbound, 5001)),
         username=local_username,
         password=local_password,
+        country_code=country_code,
+        country_name=str(
+            (proxy or {}).get("countryName")
+            or (proxy or {}).get("country_name")
+            or ""
+        ),
+        city_name=str(
+            (proxy or {}).get("cityName")
+            or (proxy or {}).get("city_name")
+            or ""
+        ),
         uuid=user_uuid or "",
         acceleration_domain=acceleration_host,
         acceleration_port_socks=_inbound_port(socks_inbound, 5001),
@@ -649,7 +712,11 @@ def build_protocol_info(
             info["rawUsername"] = str(upstream_username)
         if upstream_password:
             info["rawPassword"] = str(upstream_password)
-        info["countryCode"] = str(proxy.get("countryCode") or proxy.get("country_code") or info.get("countryCode") or "XX")
+        info["countryCode"] = normalize_country_code(
+            proxy.get("countryCode")
+            or proxy.get("country_code")
+            or info.get("countryCode")
+        )
         if proxy.get("countryName") or proxy.get("country_name"):
             info["countryName"] = str(proxy.get("countryName") or proxy.get("country_name"))
         if proxy.get("cityName") or proxy.get("city_name"):
@@ -663,6 +730,8 @@ def create_user(
     socks_username: str | None = None,
     socks_password: str | None = None,
     proxy: dict[str, Any] | None = None,
+    traffic_limit_bytes: int | None = None,
+    max_source_ips: int | None = None,
 ) -> dict[str, Any]:
     user_uuid = str(uuid.uuid4())
     # The local SOCKS inbound credentials are distinct from the upstream
@@ -759,6 +828,8 @@ def create_user(
         registry.setdefault("users", {})[user_id] = {
             "socksUsername": effective_socks_username if "socks" in protocols else None,
             "createdAt": datetime.now(timezone.utc).isoformat(),
+            "trafficLimitBytes": _positive_policy_value(traffic_limit_bytes),
+            "maxSourceIps": _positive_policy_value(max_source_ips),
         }
         if proxy is not None:
             _save_proxy_metadata(registry, user_id, proxy)
@@ -772,6 +843,28 @@ def create_user(
             proxyBound=proxy is not None,
         )
         return response
+
+    return mutate_config(apply)
+
+
+def update_user_policy(user_id: str, updates: dict[str, Any]) -> dict[str, Any]:
+    supported = {"trafficLimitBytes", "maxSourceIps"}
+    unknown = set(updates) - supported
+    if unknown:
+        raise SingboxConfigError(f"unsupported policy fields: {', '.join(sorted(unknown))}")
+
+    def apply(data: dict[str, Any], registry: dict[str, Any]) -> dict[str, Any]:
+        if not _user_exists(data, registry, user_id):
+            raise SingboxConfigError(f"user not found: {user_id}")
+        item = registry.setdefault("users", {}).setdefault(user_id, {})
+        for field in supported & set(updates):
+            item[field] = _positive_policy_value(updates[field])
+        policy = {
+            "trafficLimitBytes": _positive_policy_value(item.get("trafficLimitBytes")),
+            "maxSourceIps": _positive_policy_value(item.get("maxSourceIps")),
+        }
+        _audit("user.policy.update", user_id, **policy)
+        return {"success": True, "userId": user_id, **policy}
 
     return mutate_config(apply)
 
@@ -836,7 +929,7 @@ def _save_proxy_metadata(registry: dict[str, Any], user_id: str, proxy: dict[str
     for target, keys in fields.items():
         value = next((proxy.get(key) for key in keys if proxy.get(key) not in (None, "")), None)
         if value is not None:
-            item[target] = value
+            item[target] = normalize_country_code(value) if target == "countryCode" else value
 
 
 def _canonical_ip(value: str) -> str | None:
@@ -930,6 +1023,27 @@ def bind_proxy(user_id: str, proxy: dict[str, Any]) -> dict[str, Any]:
         return {"success": True, "userId": user_id, "message": "proxy bound"}
 
     return mutate_config(apply)
+
+
+def update_proxy_metadata(user_id: str, metadata: dict[str, Any]) -> dict[str, Any]:
+    """Update persisted residential metadata without changing the active route."""
+    with _config_lock():
+        data = read_config()
+        registry = read_registry()
+        if not _user_exists(data, registry, user_id):
+            raise SingboxConfigError(f"user not found: {user_id}")
+
+        updated_registry = copy.deepcopy(registry)
+        _save_proxy_metadata(updated_registry, user_id, metadata)
+        _write_registry(updated_registry)
+
+    _audit(
+        "proxy.metadata.update",
+        user_id,
+        sourceIp=str(metadata.get("sourceIp") or ""),
+        countryCode=str(metadata.get("countryCode") or ""),
+    )
+    return {"success": True, "userId": user_id, "message": "proxy metadata updated"}
 
 
 def delete_user(user_id: str) -> dict[str, Any]:
@@ -1055,6 +1169,8 @@ def list_users() -> list[dict[str, Any]]:
             else None
         )
         item["createdAt"] = metadata.get("createdAt")
+        item["trafficLimitBytes"] = _positive_policy_value(metadata.get("trafficLimitBytes"))
+        item["maxSourceIps"] = _positive_policy_value(metadata.get("maxSourceIps"))
         item["status"] = "active"
         result.append(item)
 

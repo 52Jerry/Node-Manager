@@ -74,6 +74,8 @@ class CreateUserRequest(BaseModel):
     # request comes from Control Plane.  ProxyConfig would silently discard
     # those extra fields during Pydantic validation.
     proxy: ProxyDescriptor | None = None
+    trafficLimitBytes: int | None = Field(default=None, ge=0)
+    maxSourceIps: int | None = Field(default=None, ge=0, le=1000)
 
     @field_validator("protocols")
     @classmethod
@@ -89,9 +91,35 @@ class CreateUserRequest(BaseModel):
         return self
 
 
+class UpdateUserPolicyRequest(BaseModel):
+    trafficLimitBytes: int | None = Field(default=None, ge=0)
+    maxSourceIps: int | None = Field(default=None, ge=0, le=1000)
+
+    @model_validator(mode="after")
+    def at_least_one_policy_is_required(self):
+        if not self.model_fields_set:
+            raise ValueError("at least one policy field is required")
+        return self
+
+
 class BindProxyRequest(BaseModel):
     userId: str = Field(min_length=1, max_length=64, pattern=r"^[A-Za-z0-9._-]+$")
     proxy: ProxyDescriptor
+
+
+class ProxyMetadataUpdateRequest(BaseModel):
+    sourceIp: str | None = Field(default=None, max_length=255)
+    sourceAddress: str | None = Field(default=None, max_length=255)
+    sourcePort: int | None = Field(default=None, ge=1, le=65535)
+    countryCode: str | None = Field(default=None, max_length=8)
+    countryName: str | None = Field(default=None, max_length=255)
+    cityName: str | None = Field(default=None, max_length=255)
+
+    @model_validator(mode="after")
+    def at_least_one_metadata_field_is_required(self):
+        if not self.model_fields_set:
+            raise ValueError("at least one proxy metadata field is required")
+        return self
 
 
 class SocksConnection(BaseModel):
@@ -161,6 +189,10 @@ class TrafficResponse(BaseModel):
     available: bool = False
     source: str = "clash-api-sampled"
     collectedAt: datetime | None = None
+    trafficLimitBytes: int | None = None
+    maxSourceIps: int | None = None
+    activeSourceIps: list[str] = Field(default_factory=list)
+    status: Literal["active", "traffic_limited", "device_limited"] = "active"
 
 
 class ReloadResponse(BaseModel):
@@ -176,7 +208,10 @@ class UserSummary(BaseModel):
     upload: int = 0
     download: int = 0
     total: int = 0
-    status: Literal["active"] = "active"
+    trafficLimitBytes: int | None = None
+    maxSourceIps: int | None = None
+    activeSourceIps: list[str] = Field(default_factory=list)
+    status: Literal["active", "traffic_limited", "device_limited"] = "active"
     createdAt: datetime | None = None
 
 

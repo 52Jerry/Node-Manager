@@ -6,9 +6,11 @@ from .request import (
     CreateUserResponse,
     NodeStatusResponse,
     OperationResponse,
+    ProxyMetadataUpdateRequest,
     ReloadResponse,
     TrafficResponse,
     TrafficTotals,
+    UpdateUserPolicyRequest,
     UserConnectionResponse,
     UserListResponse,
 )

@@ -24,10 +24,12 @@ from models.request import (
     NodeStatusResponse,
     OperationResponse,
     ProxyDetailsResponse,
+    ProxyMetadataUpdateRequest,
     ReloadResponse,
     ResidentialProtocolsResponse,
     ResidentialSocksRequest,
     TrafficResponse,
+    UpdateUserPolicyRequest,
     UserConnectionResponse,
     UserListResponse,
 )
@@ -52,6 +54,8 @@ from singbox.manager import (
     migrate_legacy_socks_usernames,
     get_user_connection,
     get_user_proxy,
+    update_proxy_metadata,
+    update_user_policy,
     get_socks_inbound_port,
     is_api_available,
     list_users,
@@ -144,6 +148,8 @@ def create_user_endpoint(
             socks_username=request.socksUsername,
             socks_password=request.socksPassword,
             proxy=request.proxy.model_dump() if request.proxy else None,
+            traffic_limit_bytes=request.trafficLimitBytes,
+            max_source_ips=request.maxSourceIps,
         ),
     )
     response.headers["Idempotency-Replayed"] = str(replayed).lower()
@@ -231,6 +237,10 @@ def get_users(
             upload=traffic["upload"],
             download=traffic["download"],
             total=traffic["total"],
+            trafficLimitBytes=traffic["trafficLimitBytes"],
+            maxSourceIps=traffic["maxSourceIps"],
+            activeSourceIps=traffic["activeSourceIps"],
+            status=traffic["status"],
         )
     return {"items": page_items, "page": page, "pageSize": pageSize, "total": total}
 
@@ -286,6 +296,21 @@ def bind_proxy_endpoint(
     return result
 
 
+@app.patch(
+    "/api/user/{userId}/proxy-metadata",
+    response_model=OperationResponse,
+    tags=["users"],
+)
+def update_proxy_metadata_endpoint(
+    userId: str,
+    request: ProxyMetadataUpdateRequest,
+    _token: str = Depends(verify_token),
+):
+    if not userId or len(userId) > 64:
+        raise HTTPException(status_code=422, detail="invalid userId")
+    return update_proxy_metadata(userId, request.model_dump(exclude_unset=True))
+
+
 @app.delete("/api/user/delete/{userId}", response_model=OperationResponse, tags=["users"])
 def delete_user_endpoint(
     userId: str,
@@ -322,6 +347,17 @@ def get_user_traffic_endpoint(userId: str, _token: str = Depends(verify_token)):
     return get_user_traffic(userId)
 
 
+@app.patch("/api/user/{userId}/policy", tags=["users"])
+def update_user_policy_endpoint(
+    userId: str,
+    request: UpdateUserPolicyRequest,
+    _token: str = Depends(verify_token),
+):
+    if not userId or len(userId) > 64:
+        raise HTTPException(status_code=422, detail="invalid userId")
+    return update_user_policy(userId, request.model_dump(exclude_unset=True))
+
+
 @app.post("/api/singbox/reload", response_model=ReloadResponse, tags=["sing-box"])
 def singbox_reload(_token: str = Depends(verify_token)):
     return ReloadResponse(success=reload_singbox())
@@ -344,7 +380,11 @@ def get_agent_info(_token: str = Depends(verify_token)):
             "user.list",
             "user.connections",
             "proxy.bind",
+            "proxy.metadata.update",
             "traffic.sampled",
+            "traffic.quota",
+            "user.source-ip-limit",
+            "user.policy.update",
             "node.heartbeat",
             "request.idempotency",
         ],

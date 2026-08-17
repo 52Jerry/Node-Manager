@@ -36,6 +36,21 @@ class SingboxAPI:
             logger.warning("Sing-box connection metrics are not available: %s", exc)
             return None
 
+    def close_connection(self, connection_id: str) -> bool:
+        try:
+            response = requests.delete(
+                f"{self.base_url}/connections/{connection_id}",
+                headers=self.headers,
+                timeout=3,
+            )
+            if response.status_code in {200, 204, 404}:
+                return True
+            logger.error("Failed to close connection %s: %s", connection_id, response.text)
+            return False
+        except Exception as exc:
+            logger.warning("Could not close sing-box connection %s: %s", connection_id, exc)
+            return False
+
     def add_proxy(self, proxy_data):
         try:
             response = requests.put(

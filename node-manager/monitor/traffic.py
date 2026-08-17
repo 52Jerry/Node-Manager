@@ -1,4 +1,5 @@
 import json
+import ipaddress
 import logging
 import os
 import tempfile
@@ -7,7 +8,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from singbox.manager import USER_OUTBOUND_PREFIX, singbox_api
+from singbox.manager import USER_OUTBOUND_PREFIX, get_user_policies, singbox_api
 from config import config
 
 
@@ -67,6 +68,68 @@ def _connection_user_id(connection: dict[str, Any]) -> str | None:
     return None
 
 
+def _connection_source_ip(connection: dict[str, Any]) -> str | None:
+    metadata = connection.get("metadata")
+    candidates = []
+    if isinstance(metadata, dict):
+        candidates.extend((metadata.get("sourceIP"), metadata.get("source_ip")))
+    candidates.extend((connection.get("sourceIP"), connection.get("source_ip")))
+    for value in candidates:
+        if not value:
+            continue
+        try:
+            return ipaddress.ip_address(str(value).strip().strip("[]")).compressed.lower()
+        except ValueError:
+            continue
+    return None
+
+
+def _enforce_policies(
+    store: dict[str, Any], connections_by_user: dict[str, list[dict[str, Any]]]
+) -> None:
+    policies = get_user_policies()
+    for user_id in set(store["users"]) | set(policies) | set(connections_by_user):
+        connections = connections_by_user.get(user_id, [])
+        user = store["users"].setdefault(user_id, {})
+        policy = policies.get(user_id, {})
+        traffic_limit = policy.get("trafficLimitBytes")
+        max_source_ips = policy.get("maxSourceIps")
+        user["trafficLimitBytes"] = traffic_limit
+        user["maxSourceIps"] = max_source_ips
+        user["status"] = "active"
+
+        if traffic_limit and int(user.get("upload") or 0) + int(user.get("download") or 0) >= traffic_limit:
+            user["status"] = "traffic_limited"
+            for connection in connections:
+                singbox_api.close_connection(str(connection["id"]))
+            continue
+
+        current_ips = {
+            source_ip
+            for connection in connections
+            if (source_ip := connection.get("sourceIp")) is not None
+        }
+        previous_ips = [
+            source_ip for source_ip in user.get("activeSourceIps", []) if source_ip in current_ips
+        ]
+        if max_source_ips and len(current_ips) > max_source_ips:
+            allowed = list(dict.fromkeys(previous_ips))[:max_source_ips]
+            allowed.extend(
+                source_ip
+                for source_ip in sorted(current_ips)
+                if source_ip not in allowed and len(allowed) < max_source_ips
+            )
+            allowed_set = set(allowed)
+            for connection in connections:
+                source_ip = connection.get("sourceIp")
+                if source_ip is not None and source_ip not in allowed_set:
+                    singbox_api.close_connection(str(connection["id"]))
+            user["activeSourceIps"] = sorted(allowed_set)
+            user["status"] = "device_limited"
+        else:
+            user["activeSourceIps"] = sorted(current_ips)
+
+
 def collect_traffic() -> bool:
     snapshot = singbox_api.get_connections()
     if not isinstance(snapshot, dict) or not isinstance(snapshot.get("connections"), list):
@@ -76,6 +139,7 @@ def collect_traffic() -> bool:
         store = _read_store()
         previous_connections = store.get("connections", {})
         active_connections: dict[str, Any] = {}
+        connections_by_user: dict[str, list[dict[str, Any]]] = {}
         collected_at = _now()
         for connection in snapshot["connections"]:
             if not isinstance(connection, dict):
@@ -89,6 +153,7 @@ def collect_traffic() -> bool:
             previous = previous_connections.get(connection_id, {})
             previous_upload = int(previous.get("upload") or 0)
             previous_download = int(previous.get("download") or 0)
+            source_ip = _connection_source_ip(connection)
             user = store["users"].setdefault(
                 user_id, {"upload": 0, "download": 0, "updatedAt": collected_at}
             )
@@ -101,7 +166,12 @@ def collect_traffic() -> bool:
                 "userId": user_id,
                 "upload": upload,
                 "download": download,
+                "sourceIp": source_ip,
             }
+            connections_by_user.setdefault(user_id, []).append(
+                {"id": connection_id, "sourceIp": source_ip}
+            )
+        _enforce_policies(store, connections_by_user)
         store["connections"] = active_connections
         store["collectedAt"] = collected_at
         _write_store(store)
@@ -128,6 +198,10 @@ def get_user_traffic(
         "available": available,
         "source": "clash-api-sampled",
         "collectedAt": store.get("collectedAt"),
+        "trafficLimitBytes": user.get("trafficLimitBytes"),
+        "maxSourceIps": user.get("maxSourceIps"),
+        "activeSourceIps": user.get("activeSourceIps", []),
+        "status": user.get("status", "active"),
     }
 
 

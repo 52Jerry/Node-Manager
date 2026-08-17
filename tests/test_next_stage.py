@@ -5,6 +5,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from urllib.parse import unquote
 from unittest.mock import patch
 
 from fastapi.testclient import TestClient
@@ -236,7 +237,7 @@ class ManagerTestCase(unittest.TestCase):
                     "sourceIp": "203.0.113.10",
                     "sourceAddress": "203.0.113.30",
                     "sourcePort": 5001,
-                    "countryCode": "US",
+                    "countryCode": "us",
                 },
             )
 
@@ -248,13 +249,72 @@ class ManagerTestCase(unittest.TestCase):
         self.assertEqual(links["bitbrowser"], "203.0.113.30:5001:upstream-user:upstream-password")
         self.assertIn("@203.0.113.20:20168?", links["vless"])
         self.assertIn("@203.0.113.20:5001#", links["socksAcceleration"])
+        self.assertEqual(
+            unquote(links["vless"].rsplit("#", 1)[1]), "[US] 203.0.113.10"
+        )
+        self.assertEqual(
+            unquote(links["socksAcceleration"].rsplit("#", 1)[1]),
+            "[US] 203.0.113.10",
+        )
         vmess_payload = links["vmess"].split("//", 1)[1]
         vmess_config = json.loads(__import__("base64").b64decode(vmess_payload))
         self.assertEqual(vmess_config["add"], "203.0.113.20")
+        self.assertEqual(vmess_config["ps"], "[US] 203.0.113.10")
+        self.assertEqual(created["protocolInfo"]["countryCode"], "US")
         self.assertEqual(created["protocolInfo"]["ip"], "203.0.113.10")
         for key in ("vless", "socksAcceleration", "vmess"):
             self.assertNotIn("upstream-user", links[key])
             self.assertNotIn("upstream-password", links[key])
+
+        refreshed = manager.get_user_connection("residential-user")
+        self.assertEqual(refreshed["protocolInfo"]["countryCode"], "US")
+        self.assertEqual(
+            unquote(refreshed["protocolsAll"]["vless"].rsplit("#", 1)[1]),
+            "[US] 203.0.113.10",
+        )
+
+    def test_proxy_metadata_backfill_repairs_legacy_alias_without_changing_route(self):
+        manager.create_user(
+            "legacy-country",
+            ["vless", "vmess", "socks"],
+            proxy={
+                "type": "socks5",
+                "server": "proxy.example.test",
+                "port": 1080,
+                "username": "upstream-user",
+                "password": "upstream-password",
+                "sourceIp": "207.152.99.183",
+            },
+        )
+        before_config = json.loads(self.config_path.read_text(encoding="utf-8"))
+        before = manager.get_user_connection("legacy-country")
+        self.assertEqual(
+            unquote(before["protocolsAll"]["vless"].rsplit("#", 1)[1]),
+            "[XX] 207.152.99.183",
+        )
+
+        manager.update_proxy_metadata(
+            "legacy-country",
+            {
+                "sourceIp": "207.152.99.183",
+                "countryCode": "us",
+                "countryName": "美国",
+            },
+        )
+
+        after_config = json.loads(self.config_path.read_text(encoding="utf-8"))
+        after = manager.get_user_connection("legacy-country")
+        registry = json.loads(self.registry_path.read_text(encoding="utf-8"))
+        self.assertEqual(after_config, before_config)
+        self.assertEqual(registry["users"]["legacy-country"]["countryCode"], "US")
+        self.assertEqual(after["protocolInfo"]["countryCode"], "US")
+        self.assertEqual(
+            unquote(after["protocolsAll"]["vless"].rsplit("#", 1)[1]),
+            "[US] 207.152.99.183",
+        )
+        vmess_payload = after["protocolsAll"]["vmess"].split("//", 1)[1]
+        vmess_config = json.loads(__import__("base64").b64decode(vmess_payload))
+        self.assertEqual(vmess_config["ps"], "[US] 207.152.99.183")
 
     def test_structured_protocol_info_uses_configured_domain_and_uuid(self):
         with patch.object(manager.config.node, "acceleration_domain", "proxy.example.test"):
@@ -543,6 +603,24 @@ class ManagerTestCase(unittest.TestCase):
                 socksUsername="not-applicable",
             )
 
+    def test_user_policy_is_saved_and_can_be_updated(self):
+        manager.create_user(
+            "limited-user",
+            ["socks"],
+            traffic_limit_bytes=1024,
+            max_source_ips=2,
+        )
+        self.assertEqual(
+            manager.get_user_policy("limited-user"),
+            {"trafficLimitBytes": 1024, "maxSourceIps": 2},
+        )
+
+        updated = manager.update_user_policy(
+            "limited-user", {"trafficLimitBytes": 0, "maxSourceIps": 1}
+        )
+        self.assertIsNone(updated["trafficLimitBytes"])
+        self.assertEqual(updated["maxSourceIps"], 1)
+
 
 class ApiTestCase(unittest.TestCase):
     def setUp(self):
@@ -627,6 +705,86 @@ class ApiTestCase(unittest.TestCase):
             {"socksAcceleration"},
         )
 
+    def test_create_and_update_user_policy_endpoints(self):
+        headers = {"Authorization": "Bearer test-token"}
+        response = self.client.post(
+            "/api/user/create",
+            headers=headers,
+            json={
+                "userId": "policy-user",
+                "protocols": ["socks"],
+                "trafficLimitBytes": 4096,
+                "maxSourceIps": 2,
+            },
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+
+        users = self.client.get("/api/users", headers=headers)
+        self.assertEqual(users.status_code, 200, users.text)
+        item = users.json()["items"][0]
+        self.assertEqual(item["trafficLimitBytes"], 4096)
+        self.assertEqual(item["maxSourceIps"], 2)
+
+        updated = self.client.patch(
+            "/api/user/policy-user/policy",
+            headers=headers,
+            json={"trafficLimitBytes": 0, "maxSourceIps": 1},
+        )
+        self.assertEqual(updated.status_code, 200, updated.text)
+        self.assertIsNone(updated.json()["trafficLimitBytes"])
+        self.assertEqual(updated.json()["maxSourceIps"], 1)
+
+    def test_delete_user_clears_traffic_before_recreating_same_id(self):
+        headers = {"Authorization": "Bearer test-token"}
+        payload = {
+            "userId": "recreated-user",
+            "protocols": ["socks"],
+            "trafficLimitBytes": 100,
+        }
+        created = self.client.post("/api/user/create", headers=headers, json=payload)
+        self.assertEqual(created.status_code, 200, created.text)
+
+        self.traffic_path.write_text(
+            json.dumps(
+                {
+                    "version": 1,
+                    "users": {
+                        "recreated-user": {
+                            "upload": 75,
+                            "download": 50,
+                            "status": "traffic_limited",
+                        }
+                    },
+                    "connections": {
+                        "old-connection": {
+                            "userId": "recreated-user",
+                            "upload": 75,
+                            "download": 50,
+                        }
+                    },
+                    "collectedAt": "2026-08-17T00:00:00+00:00",
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        deleted = self.client.delete(
+            "/api/user/delete/recreated-user", headers=headers
+        )
+        self.assertEqual(deleted.status_code, 200, deleted.text)
+        self.assertEqual(
+            traffic.get_user_traffic("recreated-user", refresh=False)["total"], 0
+        )
+
+        recreated = self.client.post("/api/user/create", headers=headers, json=payload)
+        self.assertEqual(recreated.status_code, 200, recreated.text)
+        current = self.client.get(
+            "/api/user/recreated-user/traffic", headers=headers
+        )
+        self.assertEqual(current.status_code, 200, current.text)
+        self.assertEqual(current.json()["total"], 0)
+        self.assertEqual(current.json()["status"], "active")
+
     def test_create_user_endpoint_can_bind_proxy(self):
         headers = {"Authorization": "Bearer test-token"}
         response = self.client.post(
@@ -656,6 +814,44 @@ class ApiTestCase(unittest.TestCase):
 
         response = self.client.get("/api/users", headers=headers)
         self.assertTrue(response.json()["items"][0]["proxyBound"])
+
+    def test_proxy_metadata_endpoint_persists_country_for_existing_user(self):
+        headers = {"Authorization": "Bearer test-token"}
+        created = self.client.post(
+            "/api/user/create",
+            headers=headers,
+            json={
+                "userId": "metadata-user",
+                "protocols": ["vless", "vmess", "socks"],
+                "proxy": {
+                    "server": "proxy.example.test",
+                    "port": 1080,
+                    "sourceIp": "207.152.99.183",
+                },
+            },
+        )
+        self.assertEqual(created.status_code, 200, created.text)
+
+        updated = self.client.patch(
+            "/api/user/metadata-user/proxy-metadata",
+            headers=headers,
+            json={
+                "sourceIp": "207.152.99.183",
+                "countryCode": "US",
+                "countryName": "美国",
+            },
+        )
+        self.assertEqual(updated.status_code, 200, updated.text)
+
+        connection = self.client.get(
+            "/api/user/metadata-user/connections", headers=headers
+        )
+        self.assertEqual(connection.status_code, 200, connection.text)
+        self.assertEqual(connection.json()["protocolInfo"]["countryCode"], "US")
+        self.assertEqual(
+            unquote(connection.json()["protocolsAll"]["vless"].rsplit("#", 1)[1]),
+            "[US] 207.152.99.183",
+        )
 
     def test_create_user_is_idempotent(self):
         headers = {
@@ -816,6 +1012,73 @@ class TrafficTestCase(unittest.TestCase):
         traffic.delete_user_traffic("traffic-user")
         deleted = traffic.get_user_traffic("traffic-user", refresh=False)
         self.assertEqual(deleted["total"], 0)
+
+    def test_traffic_quota_closes_user_connections(self):
+        snapshot = {
+            "connections": [
+                {
+                    "id": "quota-connection",
+                    "upload": 400,
+                    "download": 700,
+                    "chains": ["node-manager-out:quota-user"],
+                    "metadata": {"sourceIP": "198.51.100.10"},
+                }
+            ]
+        }
+        with (
+            patch.object(traffic.singbox_api, "get_connections", return_value=snapshot),
+            patch.object(
+                traffic,
+                "get_user_policies",
+                return_value={
+                    "quota-user": {"trafficLimitBytes": 1000, "maxSourceIps": None}
+                },
+            ),
+            patch.object(traffic.singbox_api, "close_connection", return_value=True) as close,
+        ):
+            self.assertTrue(traffic.collect_traffic())
+
+        close.assert_called_once_with("quota-connection")
+        result = traffic.get_user_traffic("quota-user", refresh=False)
+        self.assertEqual(result["status"], "traffic_limited")
+        self.assertEqual(result["trafficLimitBytes"], 1000)
+
+    def test_source_ip_limit_closes_only_excess_ip_connections(self):
+        snapshot = {
+            "connections": [
+                {
+                    "id": "first-device",
+                    "upload": 10,
+                    "download": 20,
+                    "chains": ["node-manager-out:device-user"],
+                    "metadata": {"sourceIP": "198.51.100.10"},
+                },
+                {
+                    "id": "second-device",
+                    "upload": 30,
+                    "download": 40,
+                    "chains": ["node-manager-out:device-user"],
+                    "metadata": {"sourceIP": "198.51.100.11"},
+                },
+            ]
+        }
+        with (
+            patch.object(traffic.singbox_api, "get_connections", return_value=snapshot),
+            patch.object(
+                traffic,
+                "get_user_policies",
+                return_value={
+                    "device-user": {"trafficLimitBytes": None, "maxSourceIps": 1}
+                },
+            ),
+            patch.object(traffic.singbox_api, "close_connection", return_value=True) as close,
+        ):
+            self.assertTrue(traffic.collect_traffic())
+
+        close.assert_called_once_with("second-device")
+        result = traffic.get_user_traffic("device-user", refresh=False)
+        self.assertEqual(result["activeSourceIps"], ["198.51.100.10"])
+        self.assertEqual(result["status"], "device_limited")
 
 
 class SingboxWriteReloadTest(unittest.TestCase):

@@ -50,6 +50,14 @@ def _uri_host(value: str) -> str:
     return raw
 
 
+def normalize_country_code(value: str | None) -> str:
+    """Return an uppercase ISO alpha-2 code, or ``XX`` when unavailable."""
+    normalized = str(value or "").strip().upper()
+    if len(normalized) == 2 and normalized.isascii() and normalized.isalpha():
+        return normalized
+    return "XX"
+
+
 @dataclass
 class ProtocolData:
     """五种协议共用的统一数据源。
@@ -129,7 +137,7 @@ def socks5_original(data: ProtocolData) -> str:
     ``username:password``，再放到 URI 的 ``@`` 前。该格式只用于分享链接，
     不改变服务器端 SOCKS 的实际用户名和密码字段。
     """
-    remark = f"{data.country_code}-{data.ip}"
+    remark = f"{normalize_country_code(data.country_code)}-{data.ip}"
     auth = _socks_uri_auth(str(data.username), str(data.password))
     endpoint = data.endpoint_host or data.ip
     return f"socks://{auth}@{_uri_host(endpoint)}:{data.port}#{_url_encode(remark)}"
@@ -143,7 +151,7 @@ def bitbrowser(data: ProtocolData) -> str:
 
 def vless(data: ProtocolData) -> str:
     """加速线路 - VLESS：vless://uuid@域名:端口?参数#备注"""
-    remark = f"[{data.country_code}] {data.ip}"
+    remark = f"[{normalize_country_code(data.country_code)}] {data.ip}"
     return (
         f"vless://{data.uuid}@{_uri_host(data.acceleration_domain)}:{data.vless_port}"
         f"?encryption={data.vless_encryption}"
@@ -168,7 +176,7 @@ def socks_acceleration(data: ProtocolData) -> str:
     sing-box itself continues to authenticate with the original separate
     username/password fields.
     """
-    remark = f"[{data.country_code}] {data.ip}"
+    remark = f"[{normalize_country_code(data.country_code)}] {data.ip}"
     auth = _socks_uri_auth(str(data.username), str(data.password))
     return (
         f"socks://{auth}"
@@ -181,7 +189,7 @@ def vmess(data: ProtocolData) -> str:
     """加速线路 - VMess：vmess://base64(JSON 配置)"""
     config = {
         "v": data.vmess_v,
-        "ps": f"[{data.country_code}] {data.ip}",
+        "ps": f"[{normalize_country_code(data.country_code)}] {data.ip}",
         "add": data.acceleration_domain,
         "port": str(data.vmess_port),
         "id": data.uuid,
@@ -237,7 +245,7 @@ def protocol_info(
         "port": data.port,
         "username": data.username,
         "password": data.password,
-        "countryCode": data.country_code,
+        "countryCode": normalize_country_code(data.country_code),
         "countryName": data.country_name,
         "cityName": data.city_name,
         "status": status,

@@ -3,6 +3,7 @@ import json
 import sys
 import unittest
 from pathlib import Path
+from urllib.parse import unquote
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 APP_ROOT = PROJECT_ROOT / "node-manager"
@@ -68,6 +69,7 @@ class ProtocolGenerationTest(unittest.TestCase):
         self.assertIn("sni=www.microsoft.com", link)
         self.assertIn("pbk=abc123", link)
         self.assertIn("sid=0123456789abcdef", link)
+        self.assertEqual(unquote(link.rsplit("#", 1)[1]), "[US] 149.52.53.230")
 
     def test_socks_acceleration_uses_v2ray_compatible_base64_credentials(self):
         link = socks_acceleration(sample_data())
@@ -78,6 +80,7 @@ class ProtocolGenerationTest(unittest.TestCase):
             base64.b64decode(encoded).decode("utf-8"),
             "a1b2c3d4e5f6a7b8:888888",
         )
+        self.assertEqual(unquote(link.rsplit("#", 1)[1]), "[US] 149.52.53.230")
 
     def test_original_and_acceleration_socks_encode_complete_credentials(self):
         data = sample_data(username="user@name", password="p:a+ss/word=")
@@ -95,6 +98,18 @@ class ProtocolGenerationTest(unittest.TestCase):
         self.assertEqual(config["add"], "proxy.tkip.xin")
         self.assertEqual(config["port"], "20169")
         self.assertEqual(config["id"], "9b6deb80-4b32-4496-9a5e-1a2b3c4d5e6f")
+        self.assertEqual(config["ps"], "[US] 149.52.53.230")
+
+    def test_acceleration_alias_normalizes_lowercase_country_code(self):
+        data = sample_data(country_code="us")
+        self.assertEqual(unquote(vless(data).rsplit("#", 1)[1]), "[US] 149.52.53.230")
+        self.assertEqual(
+            unquote(socks_acceleration(data).rsplit("#", 1)[1]),
+            "[US] 149.52.53.230",
+        )
+        vmess_config = json.loads(base64.b64decode(vmess(data).split("//", 1)[1]))
+        self.assertEqual(vmess_config["ps"], "[US] 149.52.53.230")
+        self.assertEqual(protocol_info(data)["countryCode"], "US")
 
     def test_protocol_info_contains_documented_fields_and_can_use_ipv6_endpoint(self):
         data = sample_data(acceleration_domain="2001:db8::10")
