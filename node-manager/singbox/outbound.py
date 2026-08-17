@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 from typing import Dict, Optional
 
 def create_socks_outbound(user_id: str, proxy_data: Dict) -> Dict:

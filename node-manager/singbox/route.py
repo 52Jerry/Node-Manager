@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 from typing import Dict
 
 def create_user_route(user_id: str) -> Dict:

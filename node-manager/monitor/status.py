@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import psutil
 
 from singbox.manager import is_singbox_running, singbox_api
