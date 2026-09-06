@@ -43,6 +43,7 @@ from monitor.traffic import (
     delete_user_traffic,
     get_traffic_totals,
     get_user_traffic,
+    get_traffic_store_snapshot,
     start_traffic_collector,
     stop_traffic_collector,
 )
@@ -56,6 +57,7 @@ from singbox.manager import (
     migrate_legacy_socks_usernames,
     get_user_connection,
     get_user_proxy,
+    get_user_policies,
     update_proxy_metadata,
     update_user_policy,
     get_socks_inbound_port,
@@ -72,7 +74,7 @@ logging.basicConfig(
 
 app = FastAPI(
     title="Python Node Manager API",
-    version="1.4.10",
+    version="1.4.11",
     description="Single-node sing-box agent API for a Spring Boot multi-node control plane.",
 )
 
@@ -216,6 +218,9 @@ def get_users(
     page: int = Query(default=1, ge=1),
     pageSize: int = Query(default=20, ge=1, le=100),
     keyword: str | None = Query(default=None, max_length=64),
+    sort: Literal["createdAsc", "createdDesc", "userIdAsc", "userIdDesc"] = Query(
+        default="createdDesc"
+    ),
     _token: str = Depends(verify_token),
 ):
     items = list_users()
@@ -227,13 +232,22 @@ def get_users(
             if normalized in item["userId"].casefold()
             or normalized in (item.get("socksUsername") or "").casefold()
         ]
+    items = _sort_users(items, sort)
     total = len(items)
     start = (page - 1) * pageSize
     page_items = items[start:start + pageSize]
-    traffic_available = collect_traffic()
+    # Traffic is sampled by the background collector. Do not block every user
+    # list request on a live sing-box /connections call.
+    traffic_available = None
+    policies = get_user_policies()
+    traffic_store = get_traffic_store_snapshot()
     for item in page_items:
         traffic = get_user_traffic(
-            item["userId"], refresh=False, available=traffic_available
+            item["userId"],
+            refresh=False,
+            available=traffic_available,
+            policy=policies.get(item["userId"], {}),
+            store=traffic_store,
         )
         item.update(
             upload=traffic["upload"],
@@ -245,6 +259,34 @@ def get_users(
             status=traffic["status"],
         )
     return {"items": page_items, "page": page, "pageSize": pageSize, "total": total}
+
+
+def _sort_users(items: list[dict], sort: str) -> list[dict]:
+    """Sort before pagination so large nodes do not require control-plane scans."""
+    if sort in {"userIdAsc", "userIdDesc"}:
+        return sorted(
+            items,
+            key=lambda item: str(item.get("userId") or "").casefold(),
+            reverse=sort == "userIdDesc",
+        )
+
+    def created_key(item: dict) -> tuple[bool, float, str]:
+        value = item.get("createdAt")
+        timestamp = 0.0
+        has_timestamp = False
+        if value:
+            try:
+                timestamp = datetime.fromisoformat(
+                    str(value).replace("Z", "+00:00")
+                ).timestamp()
+                has_timestamp = True
+            except (TypeError, ValueError, OverflowError):
+                pass
+        # Missing legacy timestamps stay at the end and remain deterministic.
+        normalized_timestamp = timestamp if sort == "createdAsc" else -timestamp
+        return (not has_timestamp, normalized_timestamp, str(item.get("userId") or "").casefold())
+
+    return sorted(items, key=created_key)
 
 
 @app.get(
@@ -424,7 +466,9 @@ def get_agent_heartbeat(_token: str = Depends(verify_token)):
         "systemConnections": current["systemConnections"],
         "userCount": len(list_users()),
         "socksPort": get_socks_inbound_port(),
-        "traffic": get_traffic_totals(),
+        # The collector samples traffic in the background. Avoid an extra
+        # synchronous sing-box request on every control-plane heartbeat.
+        "traffic": get_traffic_totals(refresh=False),
         "reportedAt": datetime.now(timezone.utc),
     }
 

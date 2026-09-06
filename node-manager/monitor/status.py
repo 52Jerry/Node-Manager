@@ -6,7 +6,9 @@ from singbox.manager import is_singbox_running, singbox_api
 
 
 def get_cpu_usage() -> float:
-    return psutil.cpu_percent(interval=1)
+    # A one-second blocking sample made every heartbeat and manual refresh
+    # visibly slow. A short sample is sufficient for the dashboard metric.
+    return psutil.cpu_percent(interval=0.1)
 
 
 def get_memory_usage() -> float:

@@ -10,6 +10,8 @@ env/
 .env.production
 node_modules/
 *.log
+*.tar.gz
+.codex-known-hosts
 logs/
 *.tmp
 *.swp

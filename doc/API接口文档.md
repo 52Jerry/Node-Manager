@@ -1,6 +1,6 @@
 # Python Node Manager API 接口文档
 
-当前版本：`1.4.10`
+当前版本：`1.4.11`
 
 部署节点：`http://<NODE_MANAGER_HOST>:8088`
 
@@ -201,9 +201,10 @@ curl -X POST http://<NODE_MANAGER_HOST>:8088/api/user/create \
 
 ### 2.4 用户列表
 
-#### `GET /api/users?page=1&pageSize=20&keyword=user`
+#### `GET /api/users?page=1&pageSize=20&keyword=user&sort=createdDesc`
 
 支持按用户 ID 或 SOCKS5 用户名搜索。`pageSize` 范围为 1 到 100，列表不会返回明文密码。
+`sort` 支持 `createdAsc`、`createdDesc`、`userIdAsc`、`userIdDesc`，排序在节点侧分页前执行。
 
 ```bash
 curl 'http://<NODE_MANAGER_HOST>:8088/api/users?page=1&pageSize=20' \

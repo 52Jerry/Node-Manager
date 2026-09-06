@@ -285,6 +285,10 @@ singbox:
   config: /etc/sing-box/config.json  # sing-box配置路径
   api_port: 9090                    # Clash API端口
   api_secret: ""                    # Clash API密钥
+
+monitoring:
+  traffic_sample_interval_seconds: 2  # 流量采样周期
+  device_active_window_seconds: 60    # 在线设备来源 IP 活跃窗口
 ```
 
 ### sing-box 端口规划
@@ -304,6 +308,8 @@ singbox:
 
 ### Clash API 指标采集
 Clash API 仅监听 `127.0.0.1`，用于连接和流量指标采集：
+
+用户达到流量额度或超过最大来源 IP 数后，Node Manager 会同步 sing-box 拒绝规则并关闭已有连接，防止客户端通过重连绕过限制。来源 IP 在最近的设备活跃窗口内计为在线设备，默认 60 秒。
 
 ```json
 {

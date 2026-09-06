@@ -45,6 +45,9 @@ LOCK_PATH = Path("/run/lock/node-manager-singbox.lock")
 REGISTRY_PATH = Path(os.environ.get("NODE_MANAGER_USER_REGISTRY", "/var/lib/node-manager/users.json"))
 USER_PREFIX = "node-manager:"
 USER_OUTBOUND_PREFIX = "node-manager-out:"
+ENFORCEMENT_TRAFFIC_KEY = "enforcementTrafficBlocked"
+ENFORCEMENT_SOURCE_CIDRS_KEY = "enforcementBlockedSourceCidrs"
+ENFORCEMENT_AUTH_USERS_KEY = "enforcementAuthUsers"
 singbox_api = SingboxAPI()
 thread_lock = threading.Lock()
 
@@ -114,6 +117,35 @@ def get_user_policies() -> dict[str, dict[str, int | None]]:
         for user_id, item in registry.get("users", {}).items()
         if isinstance(item, dict)
     }
+
+
+def get_user_auth_map() -> dict[str, str]:
+    """Map sing-box authentication names back to control-plane user IDs."""
+    with _config_lock():
+        data = read_config()
+        registry = read_registry()
+
+    configured_auth_names = {
+        str(value)
+        for inbound in data.get("inbounds", [])
+        if isinstance(inbound, dict)
+        for user in inbound.get("users", [])
+        if isinstance(user, dict)
+        for value in (user.get("name"), user.get("username"))
+        if value
+    }
+    result: dict[str, str] = {}
+    for user_id in _discover_user_ids(data, registry):
+        auth_names = {
+            _auth_name(user_id),
+            _public_socks_username(registry, user_id),
+        }
+        if user_id in configured_auth_names:
+            auth_names.add(user_id)
+        for auth_name in auth_names:
+            if auth_name:
+                result[str(auth_name)] = user_id
+    return result
 
 
 def _positive_policy_value(value: Any) -> int | None:
@@ -252,12 +284,19 @@ def mutate_config(mutator: Callable[[dict[str, Any], dict[str, Any]], Any]) -> A
         updated = copy.deepcopy(current)
         updated_registry = copy.deepcopy(registry)
         result = mutator(updated, updated_registry)
+        config_changed = current != updated
+        registry_changed = registry != updated_registry
+        if not config_changed and not registry_changed:
+            return result
         original_registry = REGISTRY_PATH.read_bytes() if REGISTRY_PATH.exists() else None
-        _write_registry(updated_registry)
+        if registry_changed:
+            _write_registry(updated_registry)
         try:
-            _write_and_reload(updated)
+            if config_changed:
+                _write_and_reload(updated)
         except Exception:
-            _restore_registry(original_registry)
+            if registry_changed:
+                _restore_registry(original_registry)
             raise
         return result
 
@@ -871,6 +910,193 @@ def update_user_policy(user_id: str, updates: dict[str, Any]) -> dict[str, Any]:
     return mutate_config(apply)
 
 
+def _source_ip_cidr(value: str) -> str | None:
+    try:
+        address = ipaddress.ip_address(str(value).strip())
+    except ValueError:
+        return None
+    suffix = 32 if address.version == 4 else 128
+    return f"{address.compressed.lower()}/{suffix}"
+
+
+def _same_rule(rule: dict[str, Any], expected: dict[str, Any]) -> bool:
+    return all(rule.get(key) == value for key, value in expected.items()) and set(rule) == set(expected)
+
+
+def _managed_enforcement_rules(metadata: dict[str, Any]) -> list[dict[str, Any]]:
+    auth_users = metadata.get(ENFORCEMENT_AUTH_USERS_KEY)
+    if not isinstance(auth_users, list) or not auth_users:
+        return []
+
+    managed_rules = []
+    if metadata.get(ENFORCEMENT_TRAFFIC_KEY) is True:
+        managed_rules.append({"auth_user": auth_users, "action": "reject"})
+    source_cidrs = metadata.get(ENFORCEMENT_SOURCE_CIDRS_KEY)
+    if isinstance(source_cidrs, list) and source_cidrs:
+        managed_rules.append(
+            {
+                "auth_user": auth_users,
+                "source_ip_cidr": source_cidrs,
+                "action": "reject",
+            }
+        )
+    return managed_rules
+
+
+def _after_managed_enforcement_rules(
+    rules: list[dict[str, Any]], metadata: dict[str, Any]
+) -> int:
+    managed_rules = _managed_enforcement_rules(metadata)
+    managed_indexes = [
+        index
+        for index, rule in enumerate(rules)
+        if isinstance(rule, dict)
+        and any(_same_rule(rule, managed) for managed in managed_rules)
+    ]
+    return max(managed_indexes, default=-1) + 1
+
+
+def _remove_managed_enforcement_rules(
+    rules: list[dict[str, Any]], metadata: dict[str, Any]
+) -> None:
+    managed_rules = _managed_enforcement_rules(metadata)
+    if not managed_rules:
+        return
+    rules[:] = [
+        rule
+        for rule in rules
+        if not isinstance(rule, dict)
+        or not any(_same_rule(rule, managed) for managed in managed_rules)
+    ]
+
+
+def sync_user_enforcements(enforcements: dict[str, dict[str, Any]]) -> bool:
+    """Persist traffic and source-IP blocks as sing-box reject rules.
+
+    The registry stores the exact rule identity so later policy changes can
+    remove only rules created by Node Manager. Reapplying the same desired
+    state is a no-op and does not reload sing-box.
+    """
+
+    def apply(data: dict[str, Any], registry: dict[str, Any]) -> bool:
+        changed = False
+        rules = data.setdefault("route", {}).setdefault("rules", [])
+        registry_users = registry.setdefault("users", {})
+        existing_auth_names = {
+            str(value)
+            for inbound in data.get("inbounds", [])
+            if isinstance(inbound, dict)
+            for user in inbound.get("users", [])
+            if isinstance(user, dict)
+            for value in (user.get("name"), user.get("username"))
+            if value
+        }
+        legacy_user_ids = {
+            str(value)
+            for value in existing_auth_names
+            if value in registry_users
+        }
+
+        for user_id, desired in enforcements.items():
+            metadata = registry_users.get(user_id)
+            if not isinstance(metadata, dict):
+                continue
+
+            traffic_blocked = bool(desired.get("trafficBlocked"))
+            source_cidrs = sorted(
+                {
+                    cidr
+                    for source_ip in desired.get("blockedSourceIps") or []
+                    if (cidr := _source_ip_cidr(str(source_ip))) is not None
+                }
+            )
+            raw_current_auth_users = metadata.get(ENFORCEMENT_AUTH_USERS_KEY)
+            current_auth_users = sorted(
+                str(value) for value in raw_current_auth_users if value
+            ) if isinstance(raw_current_auth_users, list) else []
+            raw_current_source_cidrs = metadata.get(ENFORCEMENT_SOURCE_CIDRS_KEY)
+            current_source_cidrs = sorted(
+                str(value) for value in raw_current_source_cidrs if value
+            ) if isinstance(raw_current_source_cidrs, list) else []
+            current_traffic_blocked = metadata.get(ENFORCEMENT_TRAFFIC_KEY) is True
+            has_enforcement = traffic_blocked or bool(source_cidrs) or current_traffic_blocked or bool(current_source_cidrs)
+            if not has_enforcement and not current_auth_users:
+                continue
+
+            desired_auth_users = {
+                _auth_name(user_id),
+                _public_socks_username(registry, user_id),
+            }
+            if user_id in legacy_user_ids:
+                desired_auth_users.add(user_id)
+            desired_auth_users = sorted(value for value in desired_auth_users if value)
+            if not existing_auth_names.intersection(_user_auth_names(registry, user_id)):
+                continue
+            if (
+                current_traffic_blocked == traffic_blocked
+                and current_source_cidrs == source_cidrs
+                and current_auth_users == (desired_auth_users if traffic_blocked or source_cidrs else [])
+            ):
+                # The collector evaluates every registered user on every pass.
+                # Avoid copying and rescanning the full sing-box route list when
+                # this user's persisted enforcement state is already current.
+                continue
+
+            before_rules = copy.deepcopy(rules)
+            before_metadata = copy.deepcopy(metadata)
+            managed_rules = _managed_enforcement_rules(metadata)
+            managed_indexes = [
+                index
+                for index, rule in enumerate(rules)
+                if isinstance(rule, dict)
+                and any(_same_rule(rule, managed) for managed in managed_rules)
+            ]
+            insert_at = min(managed_indexes, default=0)
+            _remove_managed_enforcement_rules(rules, metadata)
+            insert_at = min(insert_at, len(rules))
+
+            auth_users = desired_auth_users
+
+            if traffic_blocked:
+                rules.insert(insert_at, {"auth_user": auth_users, "action": "reject"})
+                source_cidrs = []
+            elif source_cidrs:
+                rules.insert(
+                    insert_at,
+                    {
+                        "auth_user": auth_users,
+                        "source_ip_cidr": source_cidrs,
+                        "action": "reject",
+                    },
+                )
+
+            if traffic_blocked or source_cidrs:
+                metadata[ENFORCEMENT_AUTH_USERS_KEY] = auth_users
+            else:
+                metadata.pop(ENFORCEMENT_AUTH_USERS_KEY, None)
+            if traffic_blocked:
+                metadata[ENFORCEMENT_TRAFFIC_KEY] = True
+            else:
+                metadata.pop(ENFORCEMENT_TRAFFIC_KEY, None)
+            if source_cidrs:
+                metadata[ENFORCEMENT_SOURCE_CIDRS_KEY] = source_cidrs
+            else:
+                metadata.pop(ENFORCEMENT_SOURCE_CIDRS_KEY, None)
+
+            user_changed = before_rules != rules or before_metadata != metadata
+            changed = changed or user_changed
+            if user_changed:
+                _audit(
+                    "user.enforcement.sync",
+                    user_id,
+                    trafficBlocked=traffic_blocked,
+                    blockedSourceIps=len(source_cidrs),
+                )
+        return changed
+
+    return mutate_config(apply)
+
+
 def _set_proxy_binding(
     data: dict[str, Any], registry: dict[str, Any], user_id: str, proxy: dict[str, Any]
 ) -> None:
@@ -914,7 +1140,13 @@ def _set_proxy_binding(
     rules = route.setdefault("rules", [])
     rules[:] = [rule for rule in rules if rule.get("outbound") != outbound_tag]
     auth_names = sorted(_route_auth_names(data, registry, user_id))
-    rules.insert(0, {"auth_user": auth_names, "action": "route", "outbound": outbound_tag})
+    insert_at = _after_managed_enforcement_rules(
+        rules, _registry_user(registry, user_id)
+    )
+    rules.insert(
+        insert_at,
+        {"auth_user": auth_names, "action": "route", "outbound": outbound_tag},
+    )
 
 
 def _save_proxy_metadata(registry: dict[str, Any], user_id: str, proxy: dict[str, Any]) -> None:
@@ -1004,8 +1236,11 @@ def _set_direct_binding(data: dict[str, Any], registry: dict[str, Any], user_id:
     route = data.setdefault("route", {})
     rules = route.setdefault("rules", [])
     if not any(rule.get("outbound") == outbound_tag for rule in rules):
+        insert_at = _after_managed_enforcement_rules(
+            rules, _registry_user(registry, user_id)
+        )
         rules.insert(
-            0,
+            insert_at,
             {
                 "auth_user": sorted(_route_auth_names(data, registry, user_id)),
                 "action": "route",
@@ -1064,6 +1299,9 @@ def delete_user(user_id: str) -> dict[str, Any]:
         outbound_tag = f"{USER_OUTBOUND_PREFIX}{user_id}"
         data["outbounds"] = [item for item in data.get("outbounds", []) if item.get("tag") != outbound_tag]
         route = data.get("route", {})
+        _remove_managed_enforcement_rules(
+            route.setdefault("rules", []), _registry_user(registry, user_id)
+        )
         route["rules"] = [
             rule for rule in route.get("rules", []) if rule.get("outbound") != outbound_tag
         ]

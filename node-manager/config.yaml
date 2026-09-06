@@ -20,3 +20,5 @@ singbox:
 monitoring:
   # 大批量节点可调高到 5-10 秒以降低采样开销。
   traffic_sample_interval_seconds: 2
+  # 来源 IP 在最近 60 秒有代理活动时计为在线设备，减少短连接导致的抖动。
+  device_active_window_seconds: 60

@@ -80,6 +80,7 @@ class SingboxConfig:
 @dataclass
 class MonitoringConfig:
     traffic_sample_interval_seconds: float = 2.0
+    device_active_window_seconds: float = 60.0
 
 
 @dataclass
@@ -134,6 +135,15 @@ def load_config() -> Config:
     if interval < 0.5 or interval > 300:
         raise ValueError("monitoring.traffic_sample_interval_seconds must be between 0.5 and 300")
     result.monitoring.traffic_sample_interval_seconds = interval
+    device_window = float(monitoring.get(
+        "device_active_window_seconds",
+        result.monitoring.device_active_window_seconds,
+    ))
+    if device_window < 1 or device_window > 3600:
+        raise ValueError(
+            "monitoring.device_active_window_seconds must be between 1 and 3600"
+        )
+    result.monitoring.device_active_window_seconds = device_window
     return result
 
 

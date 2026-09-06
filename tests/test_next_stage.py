@@ -621,6 +621,92 @@ class ManagerTestCase(unittest.TestCase):
         self.assertIsNone(updated["trafficLimitBytes"])
         self.assertEqual(updated["maxSourceIps"], 1)
 
+    def test_user_enforcement_rules_are_persistent_idempotent_and_removable(self):
+        manager.create_user(
+            "limited-user",
+            ["socks"],
+            socks_username="limited-login",
+        )
+
+        manager.sync_user_enforcements(
+            {"limited-user": {"trafficBlocked": True, "blockedSourceIps": []}}
+        )
+        blocked = json.loads(self.config_path.read_text(encoding="utf-8"))
+        self.assertEqual(
+            blocked["route"]["rules"][0],
+            {
+                "auth_user": ["limited-login", "node-manager:limited-user"],
+                "action": "reject",
+            },
+        )
+        self.assertEqual(blocked["route"]["rules"][1]["action"], "route")
+
+        with patch.object(manager, "_write_and_reload") as reload_config:
+            manager.sync_user_enforcements(
+                {"limited-user": {"trafficBlocked": True, "blockedSourceIps": []}}
+            )
+        reload_config.assert_not_called()
+
+        manager.sync_user_enforcements(
+            {"limited-user": {"trafficBlocked": False, "blockedSourceIps": []}}
+        )
+        unblocked = json.loads(self.config_path.read_text(encoding="utf-8"))
+        self.assertFalse(
+            any(rule.get("action") == "reject" for rule in unblocked["route"]["rules"])
+        )
+
+    def test_multiple_enforcement_rules_are_idempotent_across_input_order(self):
+        manager.create_user("limited-a", ["socks"])
+        manager.create_user("limited-b", ["socks"])
+        desired = {"trafficBlocked": True, "blockedSourceIps": []}
+        manager.sync_user_enforcements(
+            {"limited-a": desired, "limited-b": desired}
+        )
+
+        with patch.object(manager, "_write_and_reload") as reload_config:
+            manager.sync_user_enforcements(
+                {"limited-b": desired, "limited-a": desired}
+            )
+
+        reload_config.assert_not_called()
+
+    def test_source_ip_enforcement_survives_proxy_rebinding_and_user_deletion(self):
+        manager.create_user("device-user", ["socks"])
+        manager.sync_user_enforcements(
+            {
+                "device-user": {
+                    "trafficBlocked": False,
+                    "blockedSourceIps": ["198.51.100.20", "2001:db8::20"],
+                }
+            }
+        )
+        manager.bind_proxy(
+            "device-user",
+            {"server": "203.0.113.20", "port": 1080},
+        )
+
+        rebound = json.loads(self.config_path.read_text(encoding="utf-8"))
+        self.assertEqual(rebound["route"]["rules"][0]["action"], "reject")
+        self.assertEqual(
+            rebound["route"]["rules"][0]["source_ip_cidr"],
+            ["198.51.100.20/32", "2001:db8::20/128"],
+        )
+        self.assertEqual(rebound["route"]["rules"][1]["action"], "route")
+
+        manager.delete_user("device-user")
+        deleted = json.loads(self.config_path.read_text(encoding="utf-8"))
+        self.assertFalse(
+            any(rule.get("action") == "reject" for rule in deleted["route"]["rules"])
+        )
+
+    def test_user_auth_map_includes_protocol_and_custom_socks_names(self):
+        manager.create_user(
+            "mapped-user", ["vless", "socks"], socks_username="mapped-login"
+        )
+        auth_map = manager.get_user_auth_map()
+        self.assertEqual(auth_map["node-manager:mapped-user"], "mapped-user")
+        self.assertEqual(auth_map["mapped-login"], "mapped-user")
+
 
 class ApiTestCase(unittest.TestCase):
     def setUp(self):
@@ -703,6 +789,34 @@ class ApiTestCase(unittest.TestCase):
         self.assertEqual(
             set(connections.json()["protocolsAll"]),
             {"socksAcceleration"},
+        )
+
+    def test_list_users_supports_node_side_user_id_sorting(self):
+        headers = {"Authorization": "Bearer test-token"}
+        for user_id in ("sort-z", "sort-a"):
+            response = self.client.post(
+                "/api/user/create",
+                headers=headers,
+                json={"userId": user_id, "protocols": ["socks"]},
+            )
+            self.assertEqual(response.status_code, 200, response.text)
+
+        response = self.client.get(
+            "/api/users?page=1&pageSize=2&sort=userIdAsc", headers=headers
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(
+            [item["userId"] for item in response.json()["items"]],
+            ["sort-a", "sort-z"],
+        )
+
+        response = self.client.get(
+            "/api/users?page=1&pageSize=2&sort=userIdDesc", headers=headers
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(
+            [item["userId"] for item in response.json()["items"]],
+            ["sort-z", "sort-a"],
         )
 
     def test_create_and_update_user_policy_endpoints(self):
@@ -901,7 +1015,7 @@ class ApiTestCase(unittest.TestCase):
         body = response.json()
         self.assertEqual(body["total"], 1)
         self.assertEqual(body["items"][0]["nodeId"], "test-node")
-        self.assertEqual(body["items"][0]["managerVersion"], "1.4.10")
+        self.assertEqual(body["items"][0]["managerVersion"], "1.4.13")
         self.assertEqual(body["items"][0]["singboxVersion"], "1.13.14")
         self.assertEqual(body["items"][0]["connections"], 3)
         self.assertEqual(body["items"][0]["systemConnections"], 8)
@@ -968,9 +1082,20 @@ class TrafficTestCase(unittest.TestCase):
         self.temp_dir = tempfile.TemporaryDirectory()
         self.traffic_path = Path(self.temp_dir.name) / "traffic.json"
         self.path_patch = patch.object(traffic, "TRAFFIC_PATH", self.traffic_path)
+        self.policy_patch = patch.object(traffic, "get_user_policies", return_value={})
+        self.auth_map_patch = patch.object(traffic, "get_user_auth_map", return_value={})
+        self.enforcement_patch = patch.object(
+            traffic, "sync_user_enforcements", return_value=True
+        )
         self.path_patch.start()
+        self.policy_patch.start()
+        self.auth_map = self.auth_map_patch.start()
+        self.enforcement = self.enforcement_patch.start()
 
     def tearDown(self):
+        self.enforcement_patch.stop()
+        self.auth_map_patch.stop()
+        self.policy_patch.stop()
         self.path_patch.stop()
         self.temp_dir.cleanup()
 
@@ -1013,6 +1138,55 @@ class TrafficTestCase(unittest.TestCase):
         deleted = traffic.get_user_traffic("traffic-user", refresh=False)
         self.assertEqual(deleted["total"], 0)
 
+    def test_user_traffic_can_reuse_one_store_snapshot(self):
+        self.traffic_path.write_text(
+            json.dumps(
+                {
+                    "version": 1,
+                    "users": {
+                        "snapshot-a": {"upload": 10, "download": 20},
+                        "snapshot-b": {"upload": 30, "download": 40},
+                    },
+                    "connections": {},
+                    "collectedAt": "2026-09-06T00:00:00+00:00",
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        with patch.object(traffic, "_read_store", wraps=traffic._read_store) as read_store:
+            snapshot = traffic.get_traffic_store_snapshot()
+            first = traffic.get_user_traffic("snapshot-a", refresh=False, store=snapshot)
+            second = traffic.get_user_traffic("snapshot-b", refresh=False, store=snapshot)
+
+        self.assertEqual(first["total"], 30)
+        self.assertEqual(second["total"], 70)
+        read_store.assert_called_once_with()
+
+    def test_delete_traffic_uses_the_collection_transaction_lock(self):
+        self.traffic_path.write_text(
+            json.dumps(
+                {
+                    "version": 1,
+                    "users": {"deleted-user": {"upload": 10, "download": 20}},
+                    "connections": {
+                        "deleted-connection": {"userId": "deleted-user"}
+                    },
+                    "collectedAt": "2026-09-04T00:00:00+00:00",
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        with patch.object(traffic, "collection_lock") as collection_lock:
+            traffic.delete_user_traffic("deleted-user")
+
+        collection_lock.__enter__.assert_called_once_with()
+        deleted = traffic.get_user_traffic("deleted-user", refresh=False)
+        self.assertEqual(deleted["total"], 0)
+        stored = json.loads(self.traffic_path.read_text(encoding="utf-8"))
+        self.assertNotIn("deleted-connection", stored["connections"])
+
     def test_traffic_quota_closes_user_connections(self):
         snapshot = {
             "connections": [
@@ -1039,9 +1213,74 @@ class TrafficTestCase(unittest.TestCase):
             self.assertTrue(traffic.collect_traffic())
 
         close.assert_called_once_with("quota-connection")
+        self.enforcement.assert_called_once_with(
+            {"quota-user": {"trafficBlocked": True, "blockedSourceIps": []}}
+        )
         result = traffic.get_user_traffic("quota-user", refresh=False)
         self.assertEqual(result["status"], "traffic_limited")
         self.assertEqual(result["trafficLimitBytes"], 1000)
+
+    def test_raising_traffic_quota_clears_the_persistent_block(self):
+        snapshot = {
+            "connections": [
+                {
+                    "id": "quota-recovery-connection",
+                    "upload": 400,
+                    "download": 700,
+                    "chains": ["node-manager-out:quota-recovery-user"],
+                    "metadata": {"sourceIP": "198.51.100.12"},
+                }
+            ]
+        }
+        with (
+            patch.object(
+                traffic.singbox_api,
+                "get_connections",
+                side_effect=[snapshot, snapshot],
+            ),
+            patch.object(
+                traffic,
+                "get_user_policies",
+                side_effect=[
+                    {
+                        "quota-recovery-user": {
+                            "trafficLimitBytes": 1000,
+                            "maxSourceIps": None,
+                        }
+                    },
+                    {
+                        "quota-recovery-user": {
+                            "trafficLimitBytes": 2000,
+                            "maxSourceIps": None,
+                        }
+                    },
+                ],
+            ),
+            patch.object(traffic.singbox_api, "close_connection", return_value=True),
+        ):
+            self.assertTrue(traffic.collect_traffic())
+            self.assertTrue(traffic.collect_traffic())
+
+        self.assertEqual(
+            self.enforcement.call_args_list[0].args[0],
+            {
+                "quota-recovery-user": {
+                    "trafficBlocked": True,
+                    "blockedSourceIps": [],
+                }
+            },
+        )
+        self.assertEqual(
+            self.enforcement.call_args_list[1].args[0],
+            {
+                "quota-recovery-user": {
+                    "trafficBlocked": False,
+                    "blockedSourceIps": [],
+                }
+            },
+        )
+        result = traffic.get_user_traffic("quota-recovery-user", refresh=False)
+        self.assertEqual(result["status"], "active")
 
     def test_source_ip_limit_closes_only_excess_ip_connections(self):
         snapshot = {
@@ -1079,6 +1318,169 @@ class TrafficTestCase(unittest.TestCase):
         result = traffic.get_user_traffic("device-user", refresh=False)
         self.assertEqual(result["activeSourceIps"], ["198.51.100.10"])
         self.assertEqual(result["status"], "device_limited")
+        self.enforcement.assert_called_once_with(
+            {
+                "device-user": {
+                    "trafficBlocked": False,
+                    "blockedSourceIps": ["198.51.100.11"],
+                }
+            }
+        )
+
+    def test_custom_auth_metadata_is_attributed_to_the_registered_user(self):
+        self.auth_map.return_value = {"customer-login": "metadata-user"}
+        snapshot = {
+            "connections": [
+                {
+                    "id": "metadata-connection",
+                    "upload": 25,
+                    "download": 75,
+                    "metadata": {
+                        "inboundUser": "customer-login",
+                        "sourceIP": "198.51.100.30",
+                    },
+                }
+            ]
+        }
+        with (
+            patch.object(traffic.singbox_api, "get_connections", return_value=snapshot),
+            patch.object(traffic, "get_user_policies", return_value={}),
+        ):
+            self.assertTrue(traffic.collect_traffic())
+
+        result = traffic.get_user_traffic("metadata-user", refresh=False)
+        self.assertEqual(result["total"], 100)
+        self.assertEqual(result["activeSourceIps"], ["198.51.100.30"])
+
+    def test_recent_device_remains_online_until_activity_window_expires(self):
+        policies = {"window-user": {"trafficLimitBytes": None, "maxSourceIps": 2}}
+        first = {
+            "connections": [
+                {
+                    "id": "window-connection",
+                    "upload": 0,
+                    "download": 0,
+                    "chains": ["node-manager-out:window-user"],
+                    "metadata": {"sourceIP": "198.51.100.40"},
+                }
+            ]
+        }
+        with (
+            patch.object(
+                traffic.singbox_api,
+                "get_connections",
+                side_effect=[first, {"connections": []}, {"connections": []}],
+            ),
+            patch.object(traffic, "get_user_policies", return_value=policies),
+            patch.object(traffic.time, "time", side_effect=[1000, 1059, 1061]),
+            patch.object(traffic, "DEVICE_ACTIVE_WINDOW_SECONDS", 60),
+        ):
+            self.assertTrue(traffic.collect_traffic())
+            self.assertTrue(traffic.collect_traffic())
+            recent = traffic.get_user_traffic("window-user", refresh=False)
+            self.assertEqual(recent["activeSourceIps"], ["198.51.100.40"])
+            self.assertTrue(traffic.collect_traffic())
+
+        expired = traffic.get_user_traffic("window-user", refresh=False)
+        self.assertEqual(expired["activeSourceIps"], [])
+
+    def test_rejected_device_stays_blocked_while_allowed_device_is_online(self):
+        policies = {"sticky-user": {"trafficLimitBytes": None, "maxSourceIps": 1}}
+        both_devices = {
+            "connections": [
+                {
+                    "id": "allowed-device",
+                    "upload": 0,
+                    "download": 0,
+                    "chains": ["node-manager-out:sticky-user"],
+                    "metadata": {"sourceIP": "198.51.100.50"},
+                },
+                {
+                    "id": "rejected-device",
+                    "upload": 0,
+                    "download": 0,
+                    "chains": ["node-manager-out:sticky-user"],
+                    "metadata": {"sourceIP": "198.51.100.51"},
+                },
+            ]
+        }
+        allowed_only = {
+            "connections": [
+                {
+                    "id": "allowed-device",
+                    "upload": 0,
+                    "download": 0,
+                    "chains": ["node-manager-out:sticky-user"],
+                    "metadata": {"sourceIP": "198.51.100.50"},
+                }
+            ]
+        }
+        with (
+            patch.object(
+                traffic.singbox_api,
+                "get_connections",
+                side_effect=[both_devices, allowed_only],
+            ),
+            patch.object(traffic, "get_user_policies", return_value=policies),
+            patch.object(traffic.time, "time", side_effect=[1000, 1061]),
+            patch.object(traffic.singbox_api, "close_connection", return_value=True),
+        ):
+            self.assertTrue(traffic.collect_traffic())
+            self.assertTrue(traffic.collect_traffic())
+
+        result = traffic.get_user_traffic("sticky-user", refresh=False)
+        self.assertEqual(result["activeSourceIps"], ["198.51.100.50"])
+        self.assertEqual(result["status"], "device_limited")
+        self.assertEqual(
+            self.enforcement.call_args_list[-1].args[0]["sticky-user"]["blockedSourceIps"],
+            ["198.51.100.51"],
+        )
+
+    def test_device_slot_and_rejected_ip_are_released_after_activity_window(self):
+        policies = {"release-user": {"trafficLimitBytes": None, "maxSourceIps": 1}}
+        both_devices = {
+            "connections": [
+                {
+                    "id": "release-allowed",
+                    "upload": 0,
+                    "download": 0,
+                    "chains": ["node-manager-out:release-user"],
+                    "metadata": {"sourceIP": "198.51.100.60"},
+                },
+                {
+                    "id": "release-rejected",
+                    "upload": 0,
+                    "download": 0,
+                    "chains": ["node-manager-out:release-user"],
+                    "metadata": {"sourceIP": "198.51.100.61"},
+                },
+            ]
+        }
+        with (
+            patch.object(
+                traffic.singbox_api,
+                "get_connections",
+                side_effect=[both_devices, {"connections": []}],
+            ),
+            patch.object(traffic, "get_user_policies", return_value=policies),
+            patch.object(traffic.time, "time", side_effect=[1000, 1061]),
+            patch.object(traffic.singbox_api, "close_connection", return_value=True),
+        ):
+            self.assertTrue(traffic.collect_traffic())
+            self.assertTrue(traffic.collect_traffic())
+
+        result = traffic.get_user_traffic("release-user", refresh=False)
+        self.assertEqual(result["activeSourceIps"], [])
+        self.assertEqual(result["status"], "active")
+        self.assertEqual(
+            self.enforcement.call_args_list[-1].args[0],
+            {
+                "release-user": {
+                    "trafficBlocked": False,
+                    "blockedSourceIps": [],
+                }
+            },
+        )
 
 
 class SingboxWriteReloadTest(unittest.TestCase):
@@ -1142,6 +1544,34 @@ class MonitoringConfigTest(unittest.TestCase):
                     os.environ, {"NODE_MANAGER_CONFIG": str(config_path)}
                 ):
                     with self.assertRaisesRegex(ValueError, "between 0.5 and 300"):
+                        config_module.load_config()
+
+    def test_device_active_window_accepts_supported_boundaries(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_path = Path(temp_dir) / "config.yaml"
+            for value in (1, 3600):
+                config_path.write_text(
+                    f"node:\n  host: 192.0.2.10\nmonitoring:\n  device_active_window_seconds: {value}\n",
+                    encoding="utf-8",
+                )
+                with self.subTest(value=value), patch.dict(
+                    os.environ, {"NODE_MANAGER_CONFIG": str(config_path)}
+                ):
+                    loaded = config_module.load_config()
+                self.assertEqual(loaded.monitoring.device_active_window_seconds, value)
+
+    def test_device_active_window_rejects_values_outside_supported_range(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_path = Path(temp_dir) / "config.yaml"
+            for value in (0.99, 3600.01):
+                config_path.write_text(
+                    f"node:\n  host: 192.0.2.10\nmonitoring:\n  device_active_window_seconds: {value}\n",
+                    encoding="utf-8",
+                )
+                with self.subTest(value=value), patch.dict(
+                    os.environ, {"NODE_MANAGER_CONFIG": str(config_path)}
+                ):
+                    with self.assertRaisesRegex(ValueError, "between 1 and 3600"):
                         config_module.load_config()
 
 
