@@ -269,6 +269,15 @@ class TrafficTotals(BaseModel):
     collectedAt: datetime | None = None
 
 
+class DeadOutboundInfo(BaseModel):
+    """死掉的上游代理信息，用于心跳上报到控制中心。"""
+    userId: str
+    server: str
+    port: int
+    tag: str
+    failCount: int
+
+
 class AgentHeartbeatResponse(BaseModel):
     nodeId: str
     name: str
@@ -285,4 +294,5 @@ class AgentHeartbeatResponse(BaseModel):
     userCount: int
     socksPort: int | None = Field(default=None, ge=1, le=65535)
     traffic: TrafficTotals
+    deadOutbounds: list[DeadOutboundInfo] = Field(default_factory=list)
     reportedAt: datetime

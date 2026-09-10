@@ -47,6 +47,11 @@ from monitor.traffic import (
     start_traffic_collector,
     stop_traffic_collector,
 )
+from monitor.health_check import (
+    start_health_checker,
+    stop_health_checker,
+    get_dead_outbounds,
+)
 from singbox.manager import (
     SingboxConfigError,
     bind_proxy,
@@ -104,10 +109,12 @@ def startup_tasks():
     except Exception:
         logging.getLogger(__name__).exception("could not migrate existing user traffic outbounds")
     start_traffic_collector()
+    start_health_checker()
 
 
 @app.on_event("shutdown")
 def shutdown_tasks():
+    stop_health_checker()
     stop_traffic_collector()
 
 
@@ -469,6 +476,7 @@ def get_agent_heartbeat(_token: str = Depends(verify_token)):
         # The collector samples traffic in the background. Avoid an extra
         # synchronous sing-box request on every control-plane heartbeat.
         "traffic": get_traffic_totals(refresh=False),
+        "deadOutbounds": get_dead_outbounds(),
         "reportedAt": datetime.now(timezone.utc),
     }
 
