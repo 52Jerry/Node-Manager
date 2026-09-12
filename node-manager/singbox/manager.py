@@ -13,7 +13,7 @@ import tempfile
 import threading
 import uuid
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable
 
@@ -48,6 +48,12 @@ USER_OUTBOUND_PREFIX = "node-manager-out:"
 ENFORCEMENT_TRAFFIC_KEY = "enforcementTrafficBlocked"
 ENFORCEMENT_SOURCE_CIDRS_KEY = "enforcementBlockedSourceCidrs"
 ENFORCEMENT_AUTH_USERS_KEY = "enforcementAuthUsers"
+EXPIRATION_AUTH_USERS_KEY = "expirationAuthUsers"
+EXPIRATION_BLOCKED_KEY = "expirationBlocked"
+DEFAULT_USER_LIFETIME = timedelta(days=30)
+RESTORE_WINDOW = timedelta(hours=72)
+expiration_stop = threading.Event()
+expiration_thread: threading.Thread | None = None
 singbox_api = SingboxAPI()
 thread_lock = threading.Lock()
 
@@ -81,7 +87,7 @@ def read_config() -> dict[str, Any]:
 
 
 def _empty_registry() -> dict[str, Any]:
-    return {"version": 1, "users": {}}
+    return {"version": 2, "users": {}, "expiredUsers": {}}
 
 
 def read_registry() -> dict[str, Any]:
@@ -94,7 +100,120 @@ def read_registry() -> dict[str, Any]:
         raise SingboxConfigError(f"could not read the user registry: {exc}") from exc
     if not isinstance(registry, dict) or not isinstance(registry.get("users"), dict):
         raise SingboxConfigError("the user registry has an invalid structure")
+    registry.setdefault("version", 2)
+    registry.setdefault("expiredUsers", {})
+    if not isinstance(registry.get("expiredUsers"), dict):
+        raise SingboxConfigError("the expired user registry has an invalid structure")
     return registry
+
+
+def _as_utc(value: Any) -> datetime | None:
+    if value is None:
+        return None
+    try:
+        parsed = value if isinstance(value, datetime) else datetime.fromisoformat(
+            str(value).replace("Z", "+00:00")
+        )
+    except (TypeError, ValueError):
+        return None
+    return (parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)).astimezone(timezone.utc)
+
+
+def _iso(value: datetime) -> str:
+    return value.astimezone(timezone.utc).isoformat()
+
+
+def _expiration_status(metadata: dict[str, Any], now: datetime | None = None) -> str:
+    expires_at = _as_utc(metadata.get("expiresAt"))
+    return "EXPIRED" if expires_at is not None and expires_at <= (now or datetime.now(timezone.utc)) else "ACTIVE"
+
+
+def _config_mtime() -> datetime:
+    """返回旧配置迁移时可用的最早本地时间依据。"""
+    try:
+        return datetime.fromtimestamp(CONFIG_PATH.stat().st_mtime, timezone.utc)
+    except OSError:
+        return datetime.now(timezone.utc)
+
+
+def _config_user_ids(data: dict[str, Any], registry: dict[str, Any]) -> set[str]:
+    """从受管入站发现注册表缺失的旧用户。"""
+    user_ids = set(registry.get("users", {}))
+    protocol_tags = {
+        config.singbox.vless_tag,
+        config.singbox.vmess_tag,
+        config.singbox.socks_tag,
+    }
+    socks_names = {
+        str(item.get("socksUsername"))
+        for item in registry.get("users", {}).values()
+        if isinstance(item, dict) and item.get("socksUsername")
+    }
+    managed_protocol_names: set[str] = set()
+    for inbound in data.get("inbounds", []):
+        if not isinstance(inbound, dict) or inbound.get("tag") not in protocol_tags:
+            continue
+        for user in inbound.get("users", []):
+            if not isinstance(user, dict):
+                continue
+            values = [user.get("name"), user.get("username")]
+            for value in values:
+                if not value:
+                    continue
+                text = str(value)
+                user_id = _extract_user_id(text)
+                if user_id:
+                    user_ids.add(user_id)
+                elif inbound.get("tag") in {
+                    config.singbox.vless_tag,
+                    config.singbox.vmess_tag,
+                }:
+                    # A few older configs used the bare user ID for the
+                    # VLESS/VMess name. These protocol entries are managed
+                    # identities, so they are safe to use as migration hints.
+                    user_ids.add(text)
+                    managed_protocol_names.add(text)
+
+    for inbound in data.get("inbounds", []):
+        if not isinstance(inbound, dict) or inbound.get("tag") != config.singbox.socks_tag:
+            continue
+        for user in inbound.get("users", []):
+            if not isinstance(user, dict) or not user.get("username"):
+                continue
+            text = str(user["username"])
+            if text in socks_names:
+                mapped_user_id = next(
+                    user_id
+                    for user_id, metadata in registry.get("users", {}).items()
+                    if isinstance(metadata, dict)
+                    and str(metadata.get("socksUsername")) == text
+                )
+                user_ids.add(mapped_user_id)
+            elif text in managed_protocol_names:
+                user_ids.add(text)
+    return user_ids
+
+
+def migrate_user_expirations() -> int:
+    """为旧版本用户补齐创建时间后 30 天的默认有效期。"""
+    fallback_created_at = _config_mtime()
+
+    def apply(data: dict[str, Any], registry: dict[str, Any]) -> int:
+        changed = 0
+        registry["version"] = max(int(registry.get("version") or 1), 2)
+        registry.setdefault("expiredUsers", {})
+        users = registry.setdefault("users", {})
+        for user_id in _config_user_ids(data, registry):
+            metadata = users.setdefault(user_id, {})
+            if not isinstance(metadata, dict) or _as_utc(metadata.get("expiresAt")) is not None:
+                continue
+            created_at = _as_utc(metadata.get("createdAt")) or fallback_created_at
+            metadata["createdAt"] = _iso(created_at)
+            metadata["expiresAt"] = _iso(created_at + DEFAULT_USER_LIFETIME)
+            changed += 1
+        return changed
+
+    return mutate_config(apply)
 
 
 def get_user_policy(user_id: str) -> dict[str, int | None]:
@@ -773,6 +892,7 @@ def create_user(
     proxy: dict[str, Any] | None = None,
     traffic_limit_bytes: int | None = None,
     max_source_ips: int | None = None,
+    expires_at: datetime | None = None,
 ) -> dict[str, Any]:
     user_uuid = str(uuid.uuid4())
     # The local SOCKS inbound credentials are distinct from the upstream
@@ -782,6 +902,10 @@ def create_user(
     # links.  Explicit credentials still take precedence for compatibility.
     effective_socks_username = socks_username or user_id
     effective_socks_password = socks_password or secrets.token_urlsafe(18)
+    created_at = datetime.now(timezone.utc)
+    effective_expires_at = _as_utc(expires_at) or (created_at + DEFAULT_USER_LIFETIME)
+    if effective_expires_at <= created_at:
+        raise SingboxConfigError("expiresAt must be in the future")
 
     def apply(data: dict[str, Any], registry: dict[str, Any]) -> dict[str, Any]:
         if _user_exists(data, registry, user_id):
@@ -799,6 +923,8 @@ def create_user(
             "vmess": None,
             "socks": None,
             "proxyBound": proxy is not None,
+            "expiresAt": _iso(effective_expires_at),
+            "expirationStatus": "ACTIVE",
         }
 
         if "vless" in protocols:
@@ -868,7 +994,8 @@ def create_user(
 
         registry.setdefault("users", {})[user_id] = {
             "socksUsername": effective_socks_username if "socks" in protocols else None,
-            "createdAt": datetime.now(timezone.utc).isoformat(),
+            "createdAt": _iso(created_at),
+            "expiresAt": _iso(effective_expires_at),
             "trafficLimitBytes": _positive_policy_value(traffic_limit_bytes),
             "maxSourceIps": _positive_policy_value(max_source_ips),
         }
@@ -910,6 +1037,253 @@ def update_user_policy(user_id: str, updates: dict[str, Any]) -> dict[str, Any]:
     return mutate_config(apply)
 
 
+def _remove_expiration_rule(data: dict[str, Any], metadata: dict[str, Any]) -> None:
+    rules = data.setdefault("route", {}).setdefault("rules", [])
+    raw_auth_users = metadata.get(EXPIRATION_AUTH_USERS_KEY)
+    if isinstance(raw_auth_users, list) and raw_auth_users:
+        expected = {"auth_user": sorted(str(value) for value in raw_auth_users if value), "action": "reject"}
+        # Traffic enforcement can have the same sing-box rule shape. The
+        # expiration rule is inserted before enforcement rules, so remove
+        # only its first matching occurrence instead of all equal rules.
+        for index, rule in enumerate(rules):
+            if isinstance(rule, dict) and rule == expected:
+                rules.pop(index)
+                break
+    metadata.pop(EXPIRATION_AUTH_USERS_KEY, None)
+    metadata.pop(EXPIRATION_BLOCKED_KEY, None)
+
+
+def _add_expiration_rule(data: dict[str, Any], registry: dict[str, Any], user_id: str) -> bool:
+    metadata = _registry_user(registry, user_id)
+    auth_users = sorted(_user_auth_names(registry, user_id))
+    rules = data.setdefault("route", {}).setdefault("rules", [])
+    expected = {"auth_user": auth_users, "action": "reject"}
+    if metadata.get(EXPIRATION_BLOCKED_KEY) is True and metadata.get(EXPIRATION_AUTH_USERS_KEY) == auth_users and expected in rules:
+        return False
+    _remove_expiration_rule(data, metadata)
+    rules.insert(0, expected)
+    metadata[EXPIRATION_AUTH_USERS_KEY] = auth_users
+    metadata[EXPIRATION_BLOCKED_KEY] = True
+    return True
+
+
+def _connection_matches_user(
+    connection: dict[str, Any], registry: dict[str, Any], user_id: str
+) -> bool:
+    """判断 sing-box 活跃连接是否属于指定用户。"""
+    outbound_tag = f"{USER_OUTBOUND_PREFIX}{user_id}"
+    if outbound_tag in (connection.get("chains") or []):
+        return True
+
+    auth_names = _user_auth_names(registry, user_id)
+    candidates: list[Any] = []
+    metadata = connection.get("metadata")
+    if isinstance(metadata, dict):
+        candidates.extend(
+            metadata.get(field)
+            for field in ("inboundUser", "inbound_user", "authUser", "auth_user", "user")
+        )
+    candidates.extend(
+        connection.get(field)
+        for field in ("inboundUser", "inbound_user", "authUser", "auth_user", "user")
+    )
+    return any(value is not None and str(value) in auth_names for value in candidates)
+
+
+def _connections_to_close_for_expired_users(
+    registry: dict[str, Any], user_ids: set[str]
+) -> set[str]:
+    """获取到期用户的现有连接，API 不可用时留待下一轮重试。"""
+    if not user_ids:
+        return set()
+    snapshot = singbox_api.get_connections()
+    if not isinstance(snapshot, dict) or not isinstance(snapshot.get("connections"), list):
+        logger.warning("could not inspect sing-box connections for expired users")
+        return set()
+
+    connection_ids: set[str] = set()
+    for connection in snapshot["connections"]:
+        if not isinstance(connection, dict) or not connection.get("id"):
+            continue
+        if any(_connection_matches_user(connection, registry, user_id) for user_id in user_ids):
+            connection_ids.add(str(connection["id"]))
+    return connection_ids
+
+
+def _archive_user(data: dict[str, Any], registry: dict[str, Any], user_id: str, now: datetime) -> None:
+    metadata = _registry_user(registry, user_id)
+    auth_names = _user_auth_names(registry, user_id)
+    protocols: list[str] = []
+    protocol_tags = {
+        config.singbox.vless_tag: "vless",
+        config.singbox.vmess_tag: "vmess",
+        config.singbox.socks_tag: "socks",
+    }
+    for inbound in data.get("inbounds", []):
+        protocol = protocol_tags.get(inbound.get("tag"))
+        if protocol and any(
+            user.get("name") in auth_names or user.get("username") in auth_names
+            for user in inbound.get("users", [])
+        ):
+            protocols.append(protocol)
+        inbound["users"] = [
+            user for user in inbound.get("users", [])
+            if user.get("name") not in auth_names and user.get("username") not in auth_names
+        ]
+    outbound_tag = f"{USER_OUTBOUND_PREFIX}{user_id}"
+    data["outbounds"] = [item for item in data.get("outbounds", []) if item.get("tag") != outbound_tag]
+    route = data.setdefault("route", {})
+    _remove_expiration_rule(data, metadata)
+    _remove_managed_enforcement_rules(route.setdefault("rules", []), metadata)
+    route["rules"] = [rule for rule in route.get("rules", []) if rule.get("outbound") != outbound_tag]
+    expired_at = _as_utc(metadata.get("expiresAt")) or now
+    registry.setdefault("expiredUsers", {})[user_id] = {
+        "userId": user_id,
+        "createdAt": metadata.get("createdAt"),
+        "expiresAt": metadata.get("expiresAt"),
+        "expiredAt": _iso(expired_at),
+        "archivedAt": _iso(now),
+        "status": "ARCHIVED",
+        "protocols": sorted(set(protocols)),
+    }
+    registry.setdefault("users", {}).pop(user_id, None)
+    _audit("user.expired.archive", user_id, protocols=",".join(sorted(set(protocols))))
+
+
+def process_user_expirations(now: datetime | None = None) -> int:
+    current_time = _as_utc(now) or datetime.now(timezone.utc)
+    with _config_lock():
+        current_registry = read_registry()
+    expired_user_ids = {
+        user_id
+        for user_id, metadata in current_registry.get("users", {}).items()
+        if isinstance(metadata, dict)
+        and (expires_at := _as_utc(metadata.get("expiresAt"))) is not None
+        and expires_at <= current_time
+    }
+    connections_to_close = _connections_to_close_for_expired_users(
+        current_registry, expired_user_ids
+    )
+
+    def apply(data: dict[str, Any], registry: dict[str, Any]) -> int:
+        changed = 0
+        for user_id, metadata in list(registry.get("users", {}).items()):
+            if not isinstance(metadata, dict):
+                continue
+            expires_at = _as_utc(metadata.get("expiresAt"))
+            if expires_at is None:
+                created_at = _as_utc(metadata.get("createdAt")) or current_time
+                metadata["createdAt"] = _iso(created_at)
+                metadata["expiresAt"] = _iso(created_at + DEFAULT_USER_LIFETIME)
+                expires_at = created_at + DEFAULT_USER_LIFETIME
+                changed += 1
+            if expires_at > current_time:
+                continue
+            if current_time >= expires_at + RESTORE_WINDOW:
+                _archive_user(data, registry, user_id, current_time)
+                changed += 1
+            elif _add_expiration_rule(data, registry, user_id):
+                changed += 1
+        return changed
+
+    changed = mutate_config(apply)
+    for connection_id in connections_to_close:
+        if not singbox_api.close_connection(connection_id):
+            logger.warning("could not close expired user connection %s", connection_id)
+    return changed
+
+
+def update_user_expiration(user_id: str, expires_at: datetime) -> dict[str, Any]:
+    new_expiry = _as_utc(expires_at)
+    now = datetime.now(timezone.utc)
+    if new_expiry is None or new_expiry <= now:
+        raise SingboxConfigError("expiresAt must be in the future")
+
+    def apply(data: dict[str, Any], registry: dict[str, Any]) -> dict[str, Any]:
+        if not _user_exists(data, registry, user_id):
+            raise SingboxConfigError(f"user not found: {user_id}")
+        metadata = _registry_user(registry, user_id)
+        old_expiry = _as_utc(metadata.get("expiresAt"))
+        if old_expiry is not None and now >= old_expiry + RESTORE_WINDOW:
+            raise SingboxConfigError("user restore window has expired")
+        metadata["expiresAt"] = _iso(new_expiry)
+        _remove_expiration_rule(data, metadata)
+        _audit("user.expiration.update", user_id, expiresAt=metadata["expiresAt"])
+        return {"success": True, "userId": user_id, "expiresAt": metadata["expiresAt"], "expirationStatus": "ACTIVE"}
+
+    return mutate_config(apply)
+
+
+def restore_user(user_id: str, expires_at: datetime) -> dict[str, Any]:
+    new_expiry = _as_utc(expires_at)
+    now = datetime.now(timezone.utc)
+    if new_expiry is None or new_expiry <= now:
+        raise SingboxConfigError("expiresAt must be in the future")
+
+    def apply(data: dict[str, Any], registry: dict[str, Any]) -> dict[str, Any]:
+        metadata = _registry_user(registry, user_id)
+        old_expiry = _as_utc(metadata.get("expiresAt"))
+        if not _user_exists(data, registry, user_id):
+            if user_id in registry.get("expiredUsers", {}):
+                raise SingboxConfigError("user is archived and must be recreated")
+            raise SingboxConfigError(f"user not found: {user_id}")
+        if old_expiry is None or now >= old_expiry + RESTORE_WINDOW:
+            raise SingboxConfigError("user restore window has expired")
+        metadata["expiresAt"] = _iso(new_expiry)
+        _remove_expiration_rule(data, metadata)
+        _audit("user.expiration.restore", user_id, expiresAt=metadata["expiresAt"])
+        return {"success": True, "userId": user_id, "expiresAt": metadata["expiresAt"], "expirationStatus": "ACTIVE"}
+
+    return mutate_config(apply)
+
+
+def list_expired_users() -> list[dict[str, Any]]:
+    with _config_lock():
+        registry = read_registry()
+    now = datetime.now(timezone.utc)
+    items: list[dict[str, Any]] = []
+    for user_id, metadata in registry.get("users", {}).items():
+        if not isinstance(metadata, dict) or _expiration_status(metadata, now) != "EXPIRED":
+            continue
+        items.append({
+            "userId": user_id,
+            "createdAt": metadata.get("createdAt"),
+            "expiresAt": metadata.get("expiresAt"),
+            "expiredAt": metadata.get("expiresAt"),
+            "archivedAt": None,
+            "status": "EXPIRED",
+            "protocols": [],
+        })
+    items.extend(registry.get("expiredUsers", {}).values())
+    return sorted(items, key=lambda item: str(item.get("expiresAt") or ""), reverse=True)
+
+
+def start_expiration_scheduler() -> None:
+    global expiration_thread
+    if expiration_thread is not None and expiration_thread.is_alive():
+        return
+    expiration_stop.clear()
+    process_user_expirations()
+
+    def run() -> None:
+        while not expiration_stop.wait(60):
+            try:
+                process_user_expirations()
+            except Exception:
+                logger.exception("could not process user expirations")
+
+    expiration_thread = threading.Thread(target=run, name="user-expiration", daemon=True)
+    expiration_thread.start()
+
+
+def stop_expiration_scheduler() -> None:
+    global expiration_thread
+    expiration_stop.set()
+    if expiration_thread is not None and expiration_thread.is_alive():
+        expiration_thread.join(timeout=2)
+    expiration_thread = None
+
+
 def _source_ip_cidr(value: str) -> str | None:
     try:
         address = ipaddress.ip_address(str(value).strip())
@@ -947,6 +1321,15 @@ def _after_managed_enforcement_rules(
     rules: list[dict[str, Any]], metadata: dict[str, Any]
 ) -> int:
     managed_rules = _managed_enforcement_rules(metadata)
+    raw_expiration_auth_users = metadata.get(EXPIRATION_AUTH_USERS_KEY)
+    if isinstance(raw_expiration_auth_users, list) and raw_expiration_auth_users:
+        managed_rules = [
+            {
+                "auth_user": sorted(str(value) for value in raw_expiration_auth_users if value),
+                "action": "reject",
+            },
+            *managed_rules,
+        ]
     managed_indexes = [
         index
         for index, rule in enumerate(rules)
@@ -962,12 +1345,27 @@ def _remove_managed_enforcement_rules(
     managed_rules = _managed_enforcement_rules(metadata)
     if not managed_rules:
         return
-    rules[:] = [
-        rule
-        for rule in rules
-        if not isinstance(rule, dict)
-        or not any(_same_rule(rule, managed) for managed in managed_rules)
-    ]
+    # An expired user and a traffic-limited user may intentionally have two
+    # identical reject rules. Preserve the first one when it is tracked as
+    # the expiration block; remove only the occurrence owned by enforcement.
+    expiration_rule = None
+    raw_auth_users = metadata.get(EXPIRATION_AUTH_USERS_KEY)
+    if metadata.get(EXPIRATION_BLOCKED_KEY) is True and isinstance(raw_auth_users, list) and raw_auth_users:
+        expiration_rule = {
+            "auth_user": sorted(str(value) for value in raw_auth_users if value),
+            "action": "reject",
+        }
+    removed_expiration = False
+    remaining: list[dict[str, Any]] = []
+    for rule in rules:
+        if isinstance(rule, dict) and any(_same_rule(rule, managed) for managed in managed_rules):
+            if expiration_rule is not None and not removed_expiration and _same_rule(rule, expiration_rule):
+                removed_expiration = True
+                remaining.append(rule)
+                continue
+            continue
+        remaining.append(rule)
+    rules[:] = remaining
 
 
 def sync_user_enforcements(enforcements: dict[str, dict[str, Any]]) -> bool:
@@ -1333,7 +1731,8 @@ def ensure_user_outbounds() -> int:
     with _config_lock():
         current = read_config()
         registry = read_registry()
-        user_ids = _discover_user_ids(current, registry)
+        archived_user_ids = set(registry.get("expiredUsers", {}))
+        user_ids = _discover_user_ids(current, registry) - archived_user_ids
         outbound_tags = {item.get("tag") for item in current.get("outbounds", [])}
         route_tags = {
             rule.get("outbound") for rule in current.get("route", {}).get("rules", [])
@@ -1356,6 +1755,7 @@ def ensure_user_outbounds() -> int:
 
 
 def list_users() -> list[dict[str, Any]]:
+    process_user_expirations()
     with _config_lock():
         data = read_config()
         registry = read_registry()
@@ -1409,6 +1809,8 @@ def list_users() -> list[dict[str, Any]]:
             else None
         )
         item["createdAt"] = metadata.get("createdAt")
+        item["expiresAt"] = metadata.get("expiresAt")
+        item["expirationStatus"] = _expiration_status(metadata)
         item["trafficLimitBytes"] = _positive_policy_value(metadata.get("trafficLimitBytes"))
         item["maxSourceIps"] = _positive_policy_value(metadata.get("maxSourceIps"))
         item["status"] = "active"
@@ -1423,6 +1825,9 @@ def get_user_connection(user_id: str) -> dict[str, Any]:
         registry = read_registry()
 
     metadata = _registry_user(registry, user_id)
+    expiration_status = _expiration_status(metadata)
+    if expiration_status == "EXPIRED":
+        raise SingboxConfigError(f"user connection expired: {user_id}")
     auth_name = _auth_name(user_id)
     socks_username = _public_socks_username(registry, user_id)
     protocols: list[str] = []
@@ -1439,6 +1844,8 @@ def get_user_connection(user_id: str) -> dict[str, Any]:
         "protocolInfo": {},
         "proxyBound": False,
         "createdAt": metadata.get("createdAt"),
+        "expiresAt": metadata.get("expiresAt"),
+        "expirationStatus": expiration_status,
     }
 
     vless_inbound: dict[str, Any] | None = None
