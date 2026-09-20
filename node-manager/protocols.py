@@ -1,11 +1,12 @@
-"""多协议代理配置生成模块（对标 IPVelo 五种协议）。
+"""多协议代理配置生成模块（对标 IPVelo 六种协议）。
 
-基于同一份住宅 SOCKS 代理数据，生成五种标准化协议链接：
+基于同一份住宅 SOCKS 代理数据，生成六种标准化协议链接：
   1. SOCKS5（原始）      socks://Base64(user:pass)@ip:port#备注
   2. 比特浏览器          ip:port:user:pass
   3. VLESS（加速）       vless://uuid@域名:端口?参数
   4. SOCKS（加速）       socks://Base64(user:pass)@域名:端口#备注
   5. VMess（加速）       vmess://base64(JSON)
+  6. Trojan（加速）      trojan://password@域名:端口?参数
 
 设计原则：后端只返回一份统一数据，前端/本模块按协议模板本地拼接，
 不额外发起 API 请求。SOCKS URI 的完整 ``username:password`` 使用标准 Base64
@@ -112,6 +113,15 @@ class ProtocolData:
     vmess_sni: str = ""
     vmess_alpn: str = ""
     vmess_fp: str = ""
+    # Trojan 专属（第 6 种协议，复用 Reality TLS）
+    trojan_port: int = 20170
+    trojan_password: str = ""
+    trojan_sni: str = "www.microsoft.com"
+    trojan_pbk: str = ""
+    trojan_sid: str = ""
+    trojan_fp: str = "chrome"
+    trojan_type: str = "tcp"
+    trojan_security: str = "reality"
 
     def remark_label(self) -> str:
         """生成标准备注：原始地址用 `US-1.2.3.4`，加速线路用 `[US] 1.2.3.4`。"""
@@ -207,19 +217,40 @@ def vmess(data: ProtocolData) -> str:
     return f"vmess://{_b64(json.dumps(config, separators=(',', ':')))}"
 
 
+def trojan(data: ProtocolData) -> str:
+    """加速线路 - Trojan：trojan://password@域名:端口?参数#备注
+
+    第 6 种协议。复用 Reality TLS（与 VLESS 共享 pbk/sid/sni），
+    认证凭据使用 trojan_password（默认回退到 uuid，保持单凭据体验）。
+    """
+    remark = f"[{normalize_country_code(data.country_code)}] {data.ip}"
+    password = data.trojan_password or data.uuid
+    return (
+        f"trojan://{password}@{_uri_host(data.acceleration_domain)}:{data.trojan_port}"
+        f"?type={data.trojan_type}"
+        f"&security={data.trojan_security}"
+        f"&sni={data.trojan_sni}"
+        f"&fp={data.trojan_fp}"
+        f"&pbk={data.trojan_pbk}"
+        f"&sid={data.trojan_sid}"
+        f"#{_url_encode(remark)}"
+    )
+
+
 def _url_encode(value: str) -> str:
     from urllib.parse import quote
     return quote(value, safe="")
 
 
 def generate_all(data: ProtocolData) -> dict[str, str]:
-    """一次性生成五种协议链接。"""
+    """一次性生成六种协议链接。"""
     return {
         "socks5": socks5_original(data),
         "bitbrowser": bitbrowser(data),
         "vless": vless(data),
         "socksAcceleration": socks_acceleration(data),
         "vmess": vmess(data),
+        "trojan": trojan(data),
     }
 
 
@@ -277,6 +308,14 @@ def protocol_info(
         "vmessSni": data.vmess_sni,
         "vmessAlpn": data.vmess_alpn,
         "vmessFp": data.vmess_fp,
+        "trojanPort": data.trojan_port,
+        "trojanPassword": data.trojan_password,
+        "trojanSni": data.trojan_sni,
+        "trojanPbk": data.trojan_pbk,
+        "trojanSid": data.trojan_sid,
+        "trojanFp": data.trojan_fp,
+        "trojanType": data.trojan_type,
+        "trojanSecurity": data.trojan_security,
     }
     if include_original:
         result["rawPort"] = data.port

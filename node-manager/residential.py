@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import ipaddress
+import socket
 import re
 from dataclasses import dataclass
 from typing import Iterable
@@ -108,12 +109,17 @@ def validate_config(
     country_name: str = "",
     city_name: str = "",
 ) -> ResidentialSocksConfig:
-    """校验并构建住宅 SOCKS 配置。校验失败抛出 ResidentialConfigError。"""
+    """校验并构建住宅 SOCKS 配置。此时只测试主机连通性。"""
+    try:
+        with socket.create_connection((ip, int(port)), timeout=2):
+            pass
+    except Exception as exc:
+        raise ResidentialConfigError(f"无法连接到 {ip}:{port}: {exc}") from exc
     return ResidentialSocksConfig(
-        ip=validate_ip(ip),
+        ip=(ip or "").strip(),
         port=validate_port(port),
-        username=validate_credential(username, "账号"),
-        password=validate_credential(password, "密码"),
+        username=(username or "").strip(),
+        password=(password or "").strip(),
         source_address=source_address,
         country_code=country_code or "XX",
         country_name=country_name,

@@ -11,7 +11,7 @@ _UUID_PATTERN = re.compile(
 )
 
 
-UserProtocol = Literal["vless", "vmess", "socks"]
+UserProtocol = Literal["vless", "vmess", "socks", "trojan"]
 
 
 class ProxyConfig(BaseModel):
@@ -40,8 +40,8 @@ class ResidentialSocksRequest(BaseModel):
     """住宅 SOCKS 代理配置生成请求（对标 IPVelo 五协议）。"""
     ip: str = Field(min_length=1)
     port: int = Field(ge=1, le=65535)
-    username: str = Field(min_length=1)
-    password: str = Field(min_length=1)
+    username: str = Field(default="")
+    password: str = Field(default="")
     countryCode: str = Field(default="XX", min_length=0, max_length=8)
     countryName: str = ""
     cityName: str = ""
@@ -66,6 +66,9 @@ class ResidentialProtocolsResponse(BaseModel):
 
 class CreateUserRequest(BaseModel):
     userId: str = Field(min_length=1, max_length=64, pattern=r"^[A-Za-z0-9._-]+$")
+    # B1: Control Plane 可指定 UUID，确保多节点共享同一 UUID（主备/负载均衡场景）。
+    # 留空时 Node Manager 仍随机生成，保持向后兼容。
+    uuid: str = Field(default="", max_length=64)
     protocols: list[UserProtocol] = Field(
         default_factory=lambda: ["vless", "vmess", "socks"],
         min_length=1,
@@ -78,6 +81,13 @@ class CreateUserRequest(BaseModel):
     proxy: ProxyDescriptor | None = None
     trafficLimitBytes: int | None = Field(default=None, ge=0)
     maxSourceIps: int | None = Field(default=None, ge=0, le=1000)
+
+    @field_validator("uuid")
+    @classmethod
+    def uuid_must_be_valid(cls, value: str) -> str:
+        if value and not _UUID_PATTERN.match(value):
+            raise ValueError("uuid must be a valid UUID v4 string")
+        return value
 
     @field_validator("protocols")
     @classmethod
@@ -109,6 +119,31 @@ class BindProxyRequest(BaseModel):
     proxy: ProxyDescriptor
 
 
+class BindMultipleProxiesRequest(BaseModel):
+    """负载均衡：为一个用户绑定多个上游住宅 SOCKS 出口。
+
+    mode:
+      - selector: sing-box selector outbound，支持手动切换默认出口
+      - urltest:  sing-box urltest outbound，自动探测延迟最低的出口
+    """
+
+    userId: str = Field(min_length=1, max_length=64, pattern=r"^[A-Za-z0-9._-]+$")
+    proxies: list[ProxyDescriptor] = Field(min_length=2, max_length=16)
+    mode: Literal["selector", "urltest"] = "urltest"
+    healthCheckUrl: str = Field(
+        default="https://www.gstatic.com/generate_204", max_length=512
+    )
+    interval: str = Field(default="3m", max_length=8)
+    tolerance: int = Field(default=50, ge=0, le=1000)
+
+    @field_validator("interval")
+    @classmethod
+    def interval_must_look_like_duration(cls, value: str) -> str:
+        if not value or not value[-1].isalpha():
+            raise ValueError("interval must be a duration like '3m' or '30s'")
+        return value
+
+
 class ProxyMetadataUpdateRequest(BaseModel):
     sourceIp: str | None = Field(default=None, max_length=255)
     sourceAddress: str | None = Field(default=None, max_length=255)
@@ -136,10 +171,11 @@ class CreateUserResponse(BaseModel):
     userId: str
     uuid: str
     protocols: list[UserProtocol]
-    # 五协议统一输出。使用默认空字典兼容旧版 Node Manager 响应和无 SOCKS 用户。
+    # 六协议统一输出。使用默认空字典兼容旧版 Node Manager 响应和无 SOCKS 用户。
     protocolsAll: dict[str, str] = Field(default_factory=dict)
     vless: str | None = None
     vmess: str | None = None
+    trojan: str | None = None
     socks: SocksConnection | None = None
     proxyBound: bool = False
     protocolInfo: dict[str, Any] = Field(default_factory=dict)

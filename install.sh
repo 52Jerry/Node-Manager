@@ -50,6 +50,127 @@ apt_get() {
   apt-get -o "DPkg::Lock::Timeout=$APT_LOCK_TIMEOUT_SECONDS" "$@"
 }
 
+# B7: 空白节点生命周期管理子命令。
+# 默认（无子命令或 $1 是 http(s):// URL）走原有安装/升级流程；
+# 以下子命令在到达安装流程之前分发并退出，便于空白节点恢复与排障。
+NM_API_BASE="${NODE_MANAGER_API_BASE:-http://127.0.0.1:8088}"
+NM_API_TOKEN="${NODE_MANAGER_API_TOKEN:-}"
+NM_CONFIG_DIR="${NODE_MANAGER_CONFIG_DIR:-/etc/node-manager}"
+NM_DATA_DIR="${NODE_MANAGER_DATA_DIR:-/var/lib/node-manager}"
+NM_REVISIONS_DIR="${NODE_MANAGER_REVISIONS_DIR:-/var/lib/node-manager/revisions}"
+NM_SINGBOX_CONFIG="${NODE_MANAGER_SINGBOX_CONFIG:-/etc/sing-box/config.json}"
+NM_BACKUP_DIR="${NODE_MANAGER_BACKUP_DIR:-/var/backups/node-manager}"
+
+api_call() {
+  # 调用本地 Node Manager API：$1=方法 $2=路径 [$3=JSON body]
+  # 只返回 HTTP 状态码到 stdout；响应体写到 /tmp/nm-api.out 供调用方读取。
+  local method="$1" path="$2" body="${3:-}"
+  local curl_args=(-sS --connect-timeout 5 --max-time 20 -o /tmp/nm-api.out -w '%{http_code}')
+  [ -z "$NM_API_TOKEN" ] || curl_args+=(-H "Authorization: Bearer $NM_API_TOKEN")
+  [ "$method" = "GET" ] || curl_args+=(-H 'Content-Type: application/json')
+  [ -z "$body" ] || curl_args+=(--data-binary "$body")
+  curl "${curl_args[@]}" -X "$method" "${NM_API_BASE}${path}" 2>/dev/null
+}
+
+do_uninstall() {
+  log "B7: uninstalling Node Manager (sing-box package preserved)"
+  systemctl stop node-manager 2>/dev/null || true
+  systemctl disable node-manager 2>/dev/null || true
+  rm -f "$SERVICE_FILE"
+
+  # 备份状态目录后再删除，便于事后排查或重装恢复
+  if [ -d "$NM_DATA_DIR" ]; then
+    install -d -m 0750 "$NM_BACKUP_DIR"
+    local backup="${NM_BACKUP_DIR}/data-$(date -u +%Y%m%dT%H%M%SZ).tar.gz"
+    tar -czf "$backup" -C "$(dirname "$NM_DATA_DIR")" "$(basename "$NM_DATA_DIR")" 2>/dev/null || true
+    chmod 0600 "$backup"
+    log "state directory backed up to $backup"
+    rm -rf -- "$NM_DATA_DIR"
+  fi
+  rm -rf -- "$NM_CONFIG_DIR" "$APP_DIR" "$NM_REVISIONS_DIR"
+  systemctl daemon-reload
+  log "Node Manager uninstalled; run 'bash install.sh' to reinstall"
+}
+
+do_rollback() {
+  log "B7: rolling back sing-box config to last known good revision"
+  # 优先通过 API 走 revision.py 的回滚逻辑（含归档、状态更新、告警）
+  if curl -fsS --connect-timeout 5 --max-time 20 \
+       -o /dev/null "http://127.0.0.1:8088/health" 2>/dev/null; then
+    local code
+    code="$(api_call POST /api/agent/revision/rollback)"
+    case "$code" in
+      200) log "rollback completed via API" ; return 0 ;;
+      *) fail "API rollback failed (http $code); falling back to file-level rollback" ;;
+    esac
+  fi
+
+  # 节点离线时直接用 last_good.json 覆盖 config.json 并重启 sing-box
+  local last_good="$NM_REVISIONS_DIR/last_good.json"
+  [ -f "$last_good" ] || fail "no last_good.json found at $last_good; nothing to roll back to"
+  command -v sing-box >/dev/null 2>&1 || fail "sing-box not installed"
+  sing-box check -c "$last_good" || fail "last_good.json failed sing-box check; refusing to apply"
+  install -o root -g sing-box -m 0640 "$last_good" "$NM_SINGBOX_CONFIG"
+  systemctl restart sing-box 2>/dev/null || true
+  log "rolled back to $last_good and restarted sing-box"
+}
+
+do_recover() {
+  log "B7: recovery — restarting services and running health checks"
+  systemctl daemon-reload
+  systemctl enable sing-box node-manager 2>/dev/null || true
+  systemctl restart sing-box 2>/dev/null || log "WARNING: sing-box restart failed"
+  systemctl restart node-manager 2>/dev/null || log "WARNING: node-manager restart failed"
+
+  local retries=0
+  while [ "$retries" -lt 30 ]; do
+    curl -fsS --connect-timeout 2 --max-time 5 \
+      "http://127.0.0.1:8088/health" >/dev/null 2>&1 && break
+    retries=$((retries + 1))
+    sleep 1
+  done
+  if ! curl -fsS "http://127.0.0.1:8088/health" >/dev/null 2>&1; then
+    log "node-manager still unhealthy after recovery; recent logs:"
+    journalctl -u node-manager -n 40 --no-pager >&2 || true
+    journalctl -u sing-box -n 20 --no-pager >&2 || true
+    fail "recovery failed: node-manager did not become healthy"
+  fi
+  log "node-manager healthy; running network check"
+  do_network_check || true
+  log "recovery completed"
+}
+
+do_network_check() {
+  log "checking Node Manager connectivity only"
+  if curl -fsS --connect-timeout 5 --max-time 20 \
+       -o /dev/null "http://127.0.0.1:8088/health" 2>/dev/null; then
+    log "ok: Node Manager health endpoint is reachable"
+    return 0
+  fi
+  fail "connectivity check failed: Node Manager health endpoint is not reachable"
+}
+
+NM_SUBCOMMAND="${1:-}"
+case "$NM_SUBCOMMAND" in
+  uninstall|rollback|recover|network-check)
+    log "lifecycle subcommand: $NM_SUBCOMMAND"
+    shift
+    ;;
+  *)
+    NM_SUBCOMMAND=""
+    ;;
+esac
+
+if [ -n "$NM_SUBCOMMAND" ]; then
+  case "$NM_SUBCOMMAND" in
+    uninstall)      do_uninstall ;;
+    rollback)       do_rollback ;;
+    recover)        do_recover ;;
+    network-check)  do_network_check ;;
+  esac
+  exit 0
+fi
+
 # 页面一键安装会传入 Control Plane 地址和短时一次性安装码。
 # 只传地址时仍可隐藏输入长期注册令牌，环境变量方式也继续兼容。
 [ "$#" -le 2 ] || fail "usage: bash install.sh [CONTROL_PLANE_URL] [ONE_TIME_INSTALL_TOKEN]"
@@ -184,8 +305,8 @@ else
   log "sing-box $INSTALLED_SINGBOX_VERSION is current; keeping the installed version"
 fi
 
-SERVER_IP="${NODE_MANAGER_HOST:-$(curl -4fsS --max-time 8 https://api.ipify.org || hostname -I | awk '{print $1}')}"
-NODE_TOKEN="$(openssl rand -hex 32)"
+SERVER_IP="$(curl -4fsS --max-time 8 https://api.ipify.org || hostname -I | awk '{print $1}')"
+NODE_TOKEN=''
 API_SECRET="$(openssl rand -hex 32)"
 SOCKS_BOOTSTRAP_USER=""
 SOCKS_BOOTSTRAP_PASSWORD=""
@@ -251,6 +372,23 @@ else
       "users": [{"name": "node-manager:$TEST_USER_ID", "uuid": "$TEST_USER_UUID"}]
     },
     {
+      "type": "trojan",
+      "tag": "trojan",
+      "listen": "0.0.0.0",
+      "listen_port": 20170,
+      "users": [{"name": "node-manager:$TEST_USER_ID", "password": "$TEST_USER_UUID"}],
+      "tls": {
+        "enabled": true,
+        "server_name": "www.cloudflare.com",
+        "reality": {
+          "enabled": true,
+          "handshake": {"server": "www.cloudflare.com", "server_port": 443},
+          "private_key": "$PRIVATE_KEY",
+          "short_id": ["$SHORT_ID"]
+        }
+      }
+    },
+    {
       "type": "socks",
       "tag": "socks",
       "listen": "0.0.0.0",
@@ -271,9 +409,10 @@ EOF
   TEST_VLESS_URL="vless://$TEST_USER_UUID@$SERVER_IP:20168?encryption=none&flow=xtls-rprx-vision&type=tcp&security=reality&pbk=$PUBLIC_KEY&sid=$SHORT_ID&sni=www.cloudflare.com&fp=chrome#$TEST_USER_ID"
   TEST_VMESS_JSON="$(jq -nc --arg ps "$TEST_USER_ID" --arg add "$SERVER_IP" --arg id "$TEST_USER_UUID" '{v:"2",ps:$ps,add:$add,port:"20169",id:$id,aid:"0",net:"tcp",type:"none",host:"",path:"",tls:""}')"
   TEST_VMESS_URL="vmess://$(printf '%s' "$TEST_VMESS_JSON" | base64 -w 0)"
+  TEST_TROJAN_URL="trojan://$TEST_USER_UUID@$SERVER_IP:20170?type=tcp&security=reality&pbk=$PUBLIC_KEY&sid=$SHORT_ID&sni=www.cloudflare.com&fp=chrome#$TEST_USER_ID"
 fi
 
-for tag in vless-reality vmess socks; do
+for tag in vless-reality vmess trojan socks; do
   jq -e --arg tag "$tag" '.inbounds[] | select(.tag == $tag)' "$SINGBOX_CONFIG" >/dev/null \
     || fail "required sing-box inbound is missing: $tag"
 done
@@ -335,9 +474,16 @@ for state_file in users.json traffic.json idempotency.json; do
     chmod 0600 "/var/lib/node-manager/$state_file"
   fi
 done
+EXISTING_TOKEN=''
 if [ -f "$CONFIG_DIR/config.yaml" ]; then
-  EXISTING_TOKEN="$(awk '/^[[:space:]]*token:/ {print $2; exit}' "$CONFIG_DIR/config.yaml" | tr -d '"' | tr -d "'")"
-  [ -z "$EXISTING_TOKEN" ] || NODE_TOKEN="$EXISTING_TOKEN"
+  EXISTING_TOKEN="$(awk '/^[[:space:]]*token:/ {print $2; exit}' "$CONFIG_DIR/config.yaml" | tr -d '"' | tr -d ''')"
+fi
+if [ -n "${NODE_MANAGER_API_TOKEN:-}" ]; then
+  NODE_TOKEN="$NODE_MANAGER_API_TOKEN"
+elif [ -n "$EXISTING_TOKEN" ]; then
+  NODE_TOKEN="$EXISTING_TOKEN"
+else
+  NODE_TOKEN="$(openssl rand -hex 32)"
 fi
 EXISTING_NODE_ID=""
 if [ -f "$CONFIG_DIR/config.yaml" ]; then
@@ -378,6 +524,7 @@ singbox:
   vless_tag: "vless-reality"
   vmess_tag: "vmess"
   socks_tag: "socks"
+  trojan_tag: "trojan"
 EOF
 chmod 0640 "$CONFIG_DIR/config.yaml"
 
@@ -406,6 +553,7 @@ log "configuring firewall"
 ufw allow 22/tcp >/dev/null
 ufw allow 20168/tcp >/dev/null
 ufw allow 20169/tcp >/dev/null
+ufw allow 20170/tcp >/dev/null
 ufw allow 5001/tcp >/dev/null
 ufw allow 5001/udp >/dev/null
 ufw allow 8088/tcp >/dev/null
@@ -432,7 +580,6 @@ register_with_control_plane() {
   local registration_token="${CONTROL_PLANE_REGISTRATION_TOKEN:-}"
   local registration_required="${CONTROL_PLANE_REGISTRATION_REQUIRED:-0}"
   local public_url="${NODE_MANAGER_PUBLIC_URL:-http://$SERVER_IP:8088}"
-  local max_users="${NODE_MANAGER_MAX_USERS:-500}"
   local response_file request_file header_file http_code delay curl_exit_code
 
   if [ -z "$control_plane_url" ] && [ -z "$install_token" ] && [ -z "$registration_token" ]; then
@@ -446,10 +593,6 @@ register_with_control_plane() {
     log "control-plane registration skipped because its configuration is incomplete"
     return 0
   fi
-  case "$max_users" in
-    ''|*[!0-9]*) fail "NODE_MANAGER_MAX_USERS must be a positive integer" ;;
-  esac
-  [ "$max_users" -ge 1 ] || fail "NODE_MANAGER_MAX_USERS must be a positive integer"
 
   control_plane_url="${control_plane_url%/}"
   public_url="${public_url%/}"
@@ -468,14 +611,11 @@ register_with_control_plane() {
     printf 'X-Registration-Token: %s\n' "$registration_token" > "$header_file"
   fi
   jq -nc \
-    --arg nodeId "$NODE_ID" \
+    --arg nodeKey "$NODE_ID" \
     --arg name "$NODE_NAME" \
-    --arg baseUrl "$public_url" \
-    --arg apiToken "$NODE_TOKEN" \
-    --arg host "$SERVER_IP" \
-    --arg managerVersion "$APP_VERSION" \
-    --argjson maxUsers "$max_users" \
-    '{nodeId:$nodeId,name:$name,baseUrl:$baseUrl,apiToken:$apiToken,host:$host,managerVersion:$managerVersion,maxUsers:$maxUsers}' \
+    --arg managerBaseUrl "$public_url" \
+    --arg managerToken "$NODE_TOKEN" \
+    '{nodeKey:$nodeKey,managerBaseUrl:$managerBaseUrl,managerToken:$managerToken}' \
     > "$request_file"
   for delay in 0 2 4 8 16; do
     [ "$delay" -eq 0 ] || sleep "$delay"
@@ -483,7 +623,7 @@ register_with_control_plane() {
     set +e
     http_code="$(curl -sS --connect-timeout 10 --max-time 30 \
       -o "$response_file" -w '%{http_code}' \
-      -X POST "$control_plane_url/api/control/agent/register" \
+    -X POST "$control_plane_url/api/admin/singbox/agent/register" \
       -H 'Content-Type: application/json' \
       --header "@$header_file" \
       --data-binary "@$request_file")"
@@ -491,9 +631,9 @@ register_with_control_plane() {
     set -e
     [ -n "$http_code" ] || http_code="000"
     if [ "$http_code" = "200" ]; then
-      CONTROL_PLANE_NODE_ID="$(jq -r '.id // empty' "$response_file" 2>/dev/null || true)"
+      CONTROL_PLANE_NODE_ID="$(jq -r '.data.id // .id // empty' "$response_file" 2>/dev/null || true)"
       CONTROL_PLANE_REGISTRATION_STATUS="registered"
-      CONTROL_PLANE_RESPONSE="$(jq -r 'if .created then "created" else "updated" end' "$response_file" 2>/dev/null || true)"
+      CONTROL_PLANE_RESPONSE="ok"
       install_token=""
       CONTROL_PLANE_INSTALL_TOKEN=""
       registration_token=""
@@ -545,6 +685,7 @@ if [ "$FRESH_SINGBOX_CONFIG" -eq 1 ]; then
 Test user: $TEST_USER_ID
 Test VLESS: $TEST_VLESS_URL
 Test VMess: $TEST_VMESS_URL
+Test Trojan: $TEST_TROJAN_URL
 Test SOCKS5: $SERVER_IP:5001
 Test SOCKS5 username: $TEST_SOCKS_USER
 Test SOCKS5 password: $TEST_SOCKS_PASSWORD

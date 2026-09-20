@@ -516,6 +516,18 @@ def _vmess_connection(user_id: str, user_uuid: str, inbound: dict[str, Any]) -> 
     return f"vmess://{encoded}"
 
 
+def _trojan_connection(user_id: str, password: str, inbound: dict[str, Any]) -> str:
+    """第 6 种协议：Trojan 连接 URI。复用 Reality TLS（pbk/sid/sni 与 VLESS 共享）。"""
+    public_key, short_id, server_name = _reality_client_options(inbound)
+    port = int(inbound["listen_port"])
+    return (
+        f"trojan://{password}@{_uri_host(_acceleration_host())}:{port}"
+        f"?type=tcp&security=reality"
+        f"&pbk={public_key}&sid={short_id}&sni={server_name}&fp=chrome"
+        f"#{user_id}"
+    )
+
+
 def _socks_connection(
     username: str, password: str, inbound: dict[str, Any]
 ) -> dict[str, Any]:
@@ -542,6 +554,7 @@ def build_all_protocols(
     socks: dict[str, Any] | None,
     vless_inbound: dict[str, Any] | None = None,
     vmess_inbound: dict[str, Any] | None = None,
+    trojan_inbound: dict[str, Any] | None = None,
     socks_inbound: dict[str, Any] | None = None,
     vless_security: str = "reality",
     include_original: bool = False,
@@ -550,7 +563,7 @@ def build_all_protocols(
 ) -> dict[str, str]:
     """Generate the public links for one Node Manager user.
 
-    The three Node Manager acceleration links are generated from the local
+    The three/four Node Manager acceleration links are generated from the local
     inbounds and are independent of any upstream residential proxy.  The two
     legacy/original links are opt-in and are only emitted when a local SOCKS
     connection exists *and* the caller explicitly requests them (residential
@@ -558,7 +571,7 @@ def build_all_protocols(
     upstream proxy's server/port/credentials so the resulting URIs match
     what the residential provider (e.g. IPVelo) issued for this allocation.
     """
-    enabled = enabled_protocols or {"vless", "vmess", "socks"}
+    enabled = enabled_protocols or {"vless", "vmess", "socks", "trojan"}
     acceleration_host = _acceleration_host()
 
     # VLESS/VMess do not need SOCKS credentials.  For SOCKS acceleration,
@@ -599,6 +612,7 @@ def build_all_protocols(
         acceleration_port_socks=_inbound_port(socks_inbound, 5001),
         vless_port=_inbound_port(vless_inbound, 20168),
         vmess_port=_inbound_port(vmess_inbound, 20169),
+        trojan_port=_inbound_port(trojan_inbound, 20170),
     )
     if vless_inbound is not None:
         try:
@@ -609,6 +623,19 @@ def build_all_protocols(
         except SingboxConfigError:
             logger.warning("could not derive Reality client params for %s", user_id)
     data.vless_security = vless_security
+    # Trojan 复用 VLESS 的 Reality 参数（同节点共享密钥），并回退到默认 pbk/sid。
+    if trojan_inbound is not None:
+        try:
+            trojan_pbk, trojan_sid, trojan_sni = _reality_client_options(trojan_inbound)
+            data.trojan_pbk = trojan_pbk
+            data.trojan_sid = trojan_sid
+            data.trojan_sni = trojan_sni
+        except SingboxConfigError:
+            logger.warning("could not derive Reality client params for trojan %s", user_id)
+            # 回退到 VLESS 的 Reality 参数（若已设置）
+            data.trojan_pbk = data.trojan_pbk or data.vless_pbk
+            data.trojan_sid = data.trojan_sid or data.vless_sid
+            data.trojan_sni = data.trojan_sni or data.vless_sni
     links: dict[str, str] = {}
     if include_original and socks is not None:
         original_data = data
@@ -641,6 +668,7 @@ def build_all_protocols(
                 acceleration_port_socks=data.acceleration_port_socks,
                 vless_port=data.vless_port,
                 vmess_port=data.vmess_port,
+                trojan_port=data.trojan_port,
                 endpoint_host=upstream_server,
             )
         links["socks5"] = socks5_original(original_data)
@@ -651,6 +679,8 @@ def build_all_protocols(
         links["socksAcceleration"] = socks_acceleration(data)
     if "vmess" in enabled and vmess_inbound is not None and user_uuid:
         links["vmess"] = vmess(data)
+    if "trojan" in enabled and trojan_inbound is not None and user_uuid:
+        links["trojan"] = trojan(data)
     return links
 
 
@@ -660,6 +690,7 @@ def build_protocol_info(
     socks: dict[str, Any] | None,
     vless_inbound: dict[str, Any] | None = None,
     vmess_inbound: dict[str, Any] | None = None,
+    trojan_inbound: dict[str, Any] | None = None,
     socks_inbound: dict[str, Any] | None = None,
     *,
     include_original: bool = False,
@@ -708,6 +739,7 @@ def build_protocol_info(
         acceleration_port_socks=_inbound_port(socks_inbound, 5001),
         vless_port=_inbound_port(vless_inbound, 20168),
         vmess_port=_inbound_port(vmess_inbound, 20169),
+        trojan_port=_inbound_port(trojan_inbound, 20170),
     )
     if vless_inbound is not None:
         try:
@@ -717,6 +749,16 @@ def build_protocol_info(
             data.vless_sni = server_name
         except SingboxConfigError:
             logger.warning("could not derive Reality client params for %s", user_id)
+    if trojan_inbound is not None:
+        try:
+            trojan_pbk, trojan_sid, trojan_sni = _reality_client_options(trojan_inbound)
+            data.trojan_pbk = trojan_pbk
+            data.trojan_sid = trojan_sid
+            data.trojan_sni = trojan_sni
+        except SingboxConfigError:
+            data.trojan_pbk = data.trojan_pbk or data.vless_pbk
+            data.trojan_sid = data.trojan_sid or data.vless_sid
+            data.trojan_sni = data.trojan_sni or data.vless_sni
     info = protocol_info(
         data,
         protocol_id=user_uuid or user_id,
@@ -768,13 +810,23 @@ def build_protocol_info(
 def create_user(
     user_id: str,
     protocols: list[str],
+    user_uuid: str | None = None,
     socks_username: str | None = None,
     socks_password: str | None = None,
     proxy: dict[str, Any] | None = None,
     traffic_limit_bytes: int | None = None,
     max_source_ips: int | None = None,
 ) -> dict[str, Any]:
-    user_uuid = str(uuid.uuid4())
+    # B1: 优先使用 Control Plane 指定的 UUID，确保多节点共享同一凭据。
+    # 传入时严格校验格式，未传时回退到随机生成（保持向后兼容）。
+    if user_uuid:
+        try:
+            uuid.UUID(str(user_uuid))
+        except (ValueError, AttributeError, TypeError) as exc:
+            raise SingboxConfigError(f"invalid uuid from control plane: {user_uuid}") from exc
+        user_uuid = str(user_uuid)
+    else:
+        user_uuid = str(uuid.uuid4())
     # The local SOCKS inbound credentials are distinct from the upstream
     # residential proxy credentials.  The latter are used only by the
     # per-user outbound and must never leak into a public node link.
@@ -797,6 +849,7 @@ def create_user(
             "protocols": protocols,
             "vless": None,
             "vmess": None,
+            "trojan": None,
             "socks": None,
             "proxyBound": proxy is not None,
         }
@@ -812,6 +865,12 @@ def create_user(
             inbound = _find_inbound(data, config.singbox.vmess_tag)
             inbound["users"].append({"name": auth_name, "uuid": user_uuid})
             response["vmess"] = _vmess_connection(user_id, user_uuid, inbound)
+
+        if "trojan" in protocols:
+            # 第 6 种协议：Trojan 用 password 认证，复用 user_uuid 作为 password
+            inbound = _find_inbound(data, config.singbox.trojan_tag)
+            inbound["users"].append({"name": auth_name, "password": user_uuid})
+            response["trojan"] = _trojan_connection(user_id, user_uuid, inbound)
 
         if "socks" in protocols:
             inbound = _find_inbound(data, config.singbox.socks_tag)
@@ -834,6 +893,10 @@ def create_user(
             (item for item in data.get("inbounds", [])
              if item.get("tag") == config.singbox.vmess_tag), None
         )
+        trojan_inbound = next(
+            (item for item in data.get("inbounds", [])
+             if item.get("tag") == config.singbox.trojan_tag), None
+        )
         socks_inbound = next(
             (item for item in data.get("inbounds", [])
              if item.get("tag") == config.singbox.socks_tag), None
@@ -844,23 +907,27 @@ def create_user(
             response["socks"],
             vless_inbound=vless_inbound,
             vmess_inbound=vmess_inbound,
+            trojan_inbound=trojan_inbound,
             socks_inbound=socks_inbound,
             include_original=proxy is not None,
             enabled_protocols=set(protocols),
             proxy=proxy,
         )
-        # 兼容链接与结构化参数统一使用同一个加速地址：legacy vless/vmess
+        # 兼容链接与结构化参数统一使用同一个加速地址：legacy vless/vmess/trojan
         # 直接复用 protocolsAll 的生成结果，避免两套逻辑产生差异。
         if response["protocolsAll"].get("vless"):
             response["vless"] = response["protocolsAll"]["vless"]
         if response["protocolsAll"].get("vmess"):
             response["vmess"] = response["protocolsAll"]["vmess"]
+        if response["protocolsAll"].get("trojan"):
+            response["trojan"] = response["protocolsAll"]["trojan"]
         response["protocolInfo"] = build_protocol_info(
             user_id,
             user_uuid,
             response["socks"],
             vless_inbound=vless_inbound,
             vmess_inbound=vmess_inbound,
+            trojan_inbound=trojan_inbound,
             socks_inbound=socks_inbound,
             include_original=proxy is not None,
             proxy=proxy,
@@ -1262,6 +1329,130 @@ def bind_proxy(user_id: str, proxy: dict[str, Any]) -> dict[str, Any]:
     return mutate_config(apply)
 
 
+def bind_multiple_proxies(
+    user_id: str,
+    proxies: list[dict[str, Any]],
+    mode: str = "urltest",
+    health_check_url: str = "https://www.gstatic.com/generate_204",
+    interval: str = "3m",
+    tolerance: int = 50,
+) -> dict[str, Any]:
+    """负载均衡：为一个用户绑定多个上游 SOCKS 出口。
+
+    sing-box 原生 selector/urltest outbound 聚合多个出口：
+      - 为每个上游代理创建独立 socks outbound（tag=node-manager-out:user-N）
+      - 用 selector/urltest 聚合 outbound（tag=node-manager-out:user）作为路由目标
+      - urltest 自动探测延迟最低、故障自动转移
+      - selector 支持通过 Clash API 手动切换默认出口
+    """
+    if not proxies or len(proxies) < 2:
+        raise SingboxConfigError("at least 2 proxies are required for load balancing")
+    if mode not in {"selector", "urltest"}:
+        raise SingboxConfigError(f"unsupported lb mode: {mode}")
+
+    def apply(data: dict[str, Any], registry: dict[str, Any]) -> dict[str, Any]:
+        if not _user_exists(data, registry, user_id):
+            raise SingboxConfigError(f"user not found: {user_id}")
+
+        # 校验并归一化每个上游代理
+        normalized: list[dict[str, Any]] = []
+        for index, proxy in enumerate(proxies):
+            server = str(
+                proxy.get("server")
+                or proxy.get("sourceAddress")
+                or proxy.get("source_address")
+                or ""
+            ).strip()
+            if not server:
+                raise SingboxConfigError(f"proxy #{index} 缺少上游服务器地址")
+            try:
+                port = int(proxy.get("port") or proxy.get("server_port") or proxy.get("sourcePort"))
+            except (TypeError, ValueError) as exc:
+                raise SingboxConfigError(f"proxy #{index} 端口无效") from exc
+            if not 1 <= port <= 65535:
+                raise SingboxConfigError(f"proxy #{index} 端口超出范围")
+            entry = {
+                "server": server,
+                "port": port,
+                "username": proxy.get("username"),
+                "password": proxy.get("password"),
+            }
+            normalized.append(entry)
+
+        # 清理旧的子 outbound 与聚合 outbound
+        prefix = f"{USER_OUTBOUND_PREFIX}{user_id}"
+        data["outbounds"] = [
+            outb for outb in data.get("outbounds", [])
+            if not (
+                outb.get("tag", "").startswith(prefix + "-")
+                or outb.get("tag") == prefix
+            )
+        ]
+
+        # 为每个上游创建独立 socks outbound
+        member_tags: list[str] = []
+        for index, entry in enumerate(normalized):
+            member_tag = f"{prefix}-{index}"
+            outbound: dict[str, Any] = {
+                "type": "socks",
+                "tag": member_tag,
+                "server": entry["server"],
+                "server_port": entry["port"],
+            }
+            if entry["username"]:
+                outbound["username"] = entry["username"]
+                outbound["password"] = entry["password"] or ""
+            data["outbounds"].append(outbound)
+            member_tags.append(member_tag)
+
+        # 创建聚合 outbound（selector/urltest）
+        aggregate: dict[str, Any] = {
+            "type": mode,
+            "tag": prefix,
+            "outbounds": member_tags,
+        }
+        if mode == "urltest":
+            aggregate["url"] = health_check_url
+            aggregate["interval"] = interval
+            aggregate["tolerance"] = tolerance
+        else:  # selector
+            aggregate["default"] = member_tags[0]
+        data["outbounds"].append(aggregate)
+
+        # 路由规则指向聚合 outbound（复用现有规则结构）
+        route = data.setdefault("route", {})
+        rules = route.setdefault("rules", [])
+        rules[:] = [rule for rule in rules if rule.get("outbound") != prefix]
+        auth_names = sorted(_route_auth_names(data, registry, user_id))
+        insert_at = _after_managed_enforcement_rules(
+            rules, _registry_user(registry, user_id)
+        )
+        rules.insert(
+            insert_at,
+            {"auth_user": auth_names, "action": "route", "outbound": prefix},
+        )
+
+        # 用第一个代理的元数据更新 registry（展示用）
+        first_proxy = proxies[0]
+        _save_proxy_metadata(registry, user_id, first_proxy)
+        _audit(
+            "proxy.bind.multiple",
+            user_id,
+            count=len(normalized),
+            mode=mode,
+        )
+        return {
+            "success": True,
+            "userId": user_id,
+            "mode": mode,
+            "outbounds": member_tags,
+            "aggregate": prefix,
+            "message": f"bound {len(normalized)} proxies in {mode} mode",
+        }
+
+    return mutate_config(apply)
+
+
 def update_proxy_metadata(user_id: str, metadata: dict[str, Any]) -> dict[str, Any]:
     """Update persisted residential metadata without changing the active route."""
     with _config_lock():
@@ -1371,6 +1562,7 @@ def list_users() -> list[dict[str, Any]]:
     inbound_protocols = {
         config.singbox.vless_tag: ("vless", "name"),
         config.singbox.vmess_tag: ("vmess", "name"),
+        config.singbox.trojan_tag: ("trojan", "name"),
         config.singbox.socks_tag: ("socks", "username"),
     }
     for inbound in data.get("inbounds", []):
@@ -1394,7 +1586,7 @@ def list_users() -> list[dict[str, Any]]:
                 # legacy configs to the bare user id.
                 item["socksUsername"] = _public_socks_username(registry, user_id)
 
-    protocol_order = {"vless": 0, "vmess": 1, "socks": 2}
+    protocol_order = {"vless": 0, "vmess": 1, "trojan": 2, "socks": 3}
     outbounds = {item.get("tag"): item for item in data.get("outbounds", [])}
     result: list[dict[str, Any]] = []
     for user_id, item in users.items():
@@ -1434,6 +1626,7 @@ def get_user_connection(user_id: str) -> dict[str, Any]:
         "protocols": protocols,
         "vless": None,
         "vmess": None,
+        "trojan": None,
         "socks": None,
         "protocolsAll": {},
         "protocolInfo": {},
@@ -1443,6 +1636,7 @@ def get_user_connection(user_id: str) -> dict[str, Any]:
 
     vless_inbound: dict[str, Any] | None = None
     vmess_inbound: dict[str, Any] | None = None
+    trojan_inbound: dict[str, Any] | None = None
     socks_inbound: dict[str, Any] | None = None
     for inbound in data.get("inbounds", []):
         tag = inbound.get("tag")
@@ -1475,6 +1669,21 @@ def get_user_connection(user_id: str) -> dict[str, Any]:
                 user_uuid = user_uuid or vmess_uuid
                 protocols.append("vmess")
                 response["vmess"] = _vmess_connection(user_id, vmess_uuid, inbound)
+        elif tag == config.singbox.trojan_tag:
+            trojan_inbound = inbound
+            user = next(
+                (
+                    item
+                    for item in inbound.get("users", [])
+                    if item.get("name") in _legacy_auth_names(user_id)
+                ),
+                None,
+            )
+            if user:
+                # Trojan 用 password 认证；回退到 user_uuid 保持单凭据体验
+                trojan_password = str(user.get("password") or user_uuid or "")
+                protocols.append("trojan")
+                response["trojan"] = _trojan_connection(user_id, trojan_password, inbound)
         elif tag == config.singbox.socks_tag and socks_username:
             socks_inbound = inbound
             user = next(
@@ -1530,8 +1739,9 @@ def get_user_connection(user_id: str) -> dict[str, Any]:
         response.get("socks"),
         vless_inbound=vless_inbound,
         vmess_inbound=vmess_inbound,
+        trojan_inbound=trojan_inbound,
         socks_inbound=socks_inbound,
-        # 普通连接接口只返回 Node Manager 的三种加速协议。原始住宅
+        # 普通连接接口只返回 Node Manager 的加速协议。原始住宅
         # SOCKS/BitBrowser 凭据只能通过显式的 /proxy 接口获取。
         include_original=False,
         enabled_protocols=set(protocols),
@@ -1544,12 +1754,15 @@ def get_user_connection(user_id: str) -> dict[str, Any]:
             response["vless"] = all_protocols["vless"]
         if all_protocols.get("vmess"):
             response["vmess"] = all_protocols["vmess"]
+        if all_protocols.get("trojan"):
+            response["trojan"] = all_protocols["trojan"]
     response["protocolInfo"] = build_protocol_info(
         user_id,
         response["uuid"],
         response.get("socks"),
         vless_inbound=vless_inbound,
         vmess_inbound=vmess_inbound,
+        trojan_inbound=trojan_inbound,
         socks_inbound=socks_inbound,
         # 不把上游住宅 SOCKS 凭据带入普通连接详情。
         include_original=False,

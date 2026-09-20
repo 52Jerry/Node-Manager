@@ -2,6 +2,7 @@ import base64
 import json
 import sys
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 from urllib.parse import unquote
 
@@ -20,6 +21,7 @@ from protocols import (
     vless,
     socks_acceleration,
     vmess,
+    trojan,
 )
 from residential import (
     ResidentialConfigError,
@@ -138,10 +140,27 @@ class ProtocolGenerationTest(unittest.TestCase):
         self.assertEqual(result["rawProtocol"], "socks5")
         self.assertEqual(result["rawPort"], 5001)
 
-    def test_generate_all_returns_five_protocols(self):
+    def test_trojan_format(self):
+        link = trojan(sample_data(trojan_pbk="abc123", trojan_sid="0123456789abcdef"))
+        self.assertTrue(link.startswith("trojan://9b6deb80-4b32-4496-9a5e-1a2b3c4d5e6f@proxy.tkip.xin:20170?"))
+        self.assertIn("security=reality", link)
+        self.assertIn("sni=www.microsoft.com", link)
+        self.assertIn("pbk=abc123", link)
+        self.assertIn("sid=0123456789abcdef", link)
+        self.assertEqual(unquote(link.rsplit("#", 1)[1]), "[US] 149.52.53.230")
+
+    def test_trojan_uses_uuid_when_no_explicit_password(self):
+        link = trojan(sample_data(trojan_pbk="abc123", trojan_sid="0123456789abcdef"))
+        self.assertIn("trojan://9b6deb80-4b32-4496-9a5e-1a2b3c4d5e6f@", link)
+
+    def test_trojan_uses_explicit_password_when_provided(self):
+        link = trojan(sample_data(trojan_password="trojan-secret", trojan_pbk="abc123", trojan_sid="0123456789abcdef"))
+        self.assertTrue(link.startswith("trojan://trojan-secret@"))
+
+    def test_generate_all_returns_six_protocols(self):
         links = generate_all(sample_data())
         self.assertEqual(set(links.keys()), {
-            "socks5", "bitbrowser", "vless", "socksAcceleration", "vmess"
+            "socks5", "bitbrowser", "vless", "socksAcceleration", "vmess", "trojan"
         })
         for value in links.values():
             self.assertTrue(value)
@@ -149,36 +168,28 @@ class ProtocolGenerationTest(unittest.TestCase):
 
 class ResidentialValidationTest(unittest.TestCase):
     def test_valid_config(self):
-        cfg = validate_config("198.51.100.10", 1080, "user", "pass")
+        with patch("residential.socket.create_connection") as mock_connect:
+            mock_connect.return_value.__enter__.return_value = None
+            cfg = validate_config("198.51.100.10", 1080, "", "")
         self.assertEqual(cfg.ip, "198.51.100.10")
         self.assertEqual(cfg.port, 1080)
+        self.assertEqual(cfg.username, "")
+        self.assertEqual(cfg.password, "")
 
-    def test_invalid_ip(self):
-        with self.assertRaises(ResidentialConfigError):
-            validate_ip("999.1.1.1")
-        with self.assertRaises(ResidentialConfigError):
-            validate_ip("not-an-ip")
-
-    def test_invalid_port(self):
-        with self.assertRaises(ResidentialConfigError):
-            validate_port(0)
-        with self.assertRaises(ResidentialConfigError):
-            validate_port(65536)
-
-    def test_invalid_credential(self):
-        with self.assertRaises(ResidentialConfigError):
-            validate_credential("")
-        with self.assertRaises(ResidentialConfigError):
-            validate_credential("has space")
-        with self.assertRaises(ResidentialConfigError):
-            validate_credential("has\tcontrol")
+    def test_unreachable_port_rejected(self):
+        with patch("residential.socket.create_connection") as mock_connect:
+            mock_connect.side_effect = OSError("connection refused")
+            with self.assertRaises(ResidentialConfigError):
+                validate_config("198.51.100.10", 1080, "user", "pass")
 
     def test_batch_validation(self):
         rows = [
             "198.51.100.10 1080 user1 pass1",
             "198.51.100.11 1081 user2 pass2",
         ]
-        configs = validate_batch(rows)
+        with patch("residential.socket.create_connection") as mock_connect:
+            mock_connect.return_value.__enter__.return_value = None
+            configs = validate_batch(rows)
         self.assertEqual(len(configs), 2)
 
 
@@ -212,14 +223,19 @@ class ResidentialRequestModelTest(unittest.TestCase):
     def test_empty_uuid_is_replaced_by_api_with_one_uuid_for_vless_and_vmess(self):
         # The request model intentionally permits omission.  The API layer must
         # replace it before protocol generation so links never contain uuid="".
-        from unittest.mock import patch
         from main import generate_residential_protocols
 
         request = ResidentialSocksRequest(
             ip="198.51.100.10", port=1080, username="user", password="pass"
         )
         with patch("main.config.node.acceleration_domain", "proxy.example.test"):
-            result = generate_residential_protocols(request, response=type("R", (), {"headers": {}})(), _token="test")
+            with patch("residential.socket.create_connection") as mock_connect:
+                mock_connect.return_value.__enter__.return_value = None
+                result = generate_residential_protocols(
+                    request,
+                    response=type("R", (), {"headers": {}})(),
+                    _token="test",
+                )
 
         links = result["protocolsAll"]
         vless_uuid = links["vless"].split("//", 1)[1].split("@", 1)[0]

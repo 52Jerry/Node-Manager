@@ -65,6 +65,10 @@ class ServerConfig:
 @dataclass
 class SecurityConfig:
     token: str = ""
+    # B1: 可选 Control Plane IP 白名单（逗号分隔 CIDR），留空则仅校验 Token。
+    allowed_cidrs: str = ""
+    # B2: revision 签名密钥，留空则复用 token。用于 desired revision 推送校验。
+    revision_secret: str = ""
 
 
 @dataclass
@@ -75,6 +79,7 @@ class SingboxConfig:
     vless_tag: str = "vless-reality"
     vmess_tag: str = "vmess"
     socks_tag: str = "socks"
+    trojan_tag: str = "trojan"
 
 
 @dataclass
@@ -84,12 +89,90 @@ class MonitoringConfig:
 
 
 @dataclass
+class NetworkConfig:
+    """B6: 节点网络前置检查参数（专线拓扑相关，按节点配置）。"""
+
+    # 专线对端内网地址（逗号分隔）。深圳可填 10.0.0.1，香港可填 10.0.0.2。
+    peer_targets: str = ""
+    # 额外探测目标（公网出口/回程验证），逗号分隔。
+    probe_targets: str = ""
+    # 链路 Interface 期望值（逗号分隔，如 ens19）；留空则不做接口归属校验。
+    link_interfaces: str = ""
+    # 期望 MTU；低于该值只告警不判定失败（>=1280 才算通过）。
+    expected_mtu: int = 1500
+    # 专线内网前缀（逗号分隔 CIDR），用于判断对端是否真的走专线接口。
+    internal_subnets: str = ""
+    # 是否要求存在 DNAT 规则（入口节点开启，出口节点关闭）。
+    require_dnat: bool = False
+    # 期望存在 DNAT/放行的端口（逗号分隔）。
+    dnat_ports: str = ""
+    # 本机期望监听的端口（逗号分隔，形如 manager:8088、20168 或 5001/udp）。
+    # 仅在 sing-box 配置不可读时作为期望值；显式留空表示纯转发节点无本机监听。
+    # 保持默认 None 时回退到内置默认端口表（向后兼容）。
+    expected_listen_ports: str | None = None
+    # 链路质量阈值：丢包告警百分比与平均 RTT 告警毫秒。
+    packet_loss_warn_pct: float = 1.0
+    max_rtt_ms: float = 200.0
+    # conntrack 使用率告警阈值（0-1）。
+    conntrack_warn_ratio: float = 0.8
+
+    def peer_list(self) -> list[str]:
+        return [item.strip() for item in self.peer_targets.split(",") if item.strip()]
+
+    def probe_list(self) -> list[str]:
+        return [item.strip() for item in self.probe_targets.split(",") if item.strip()]
+
+    def interface_list(self) -> list[str]:
+        return [item.strip() for item in self.link_interfaces.split(",") if item.strip()]
+
+    def subnet_list(self) -> list[str]:
+        return [item.strip() for item in self.internal_subnets.split(",") if item.strip()]
+
+    def dnat_port_list(self) -> list[int]:
+        result: list[int] = []
+        for item in self.dnat_ports.split(","):
+            item = item.strip()
+            if item.isdigit():
+                result.append(int(item))
+        return result
+
+    def expected_listen_port_list(self) -> list[tuple[str, int, str]]:
+        """解析 network.expected_listen_ports 为 (name, port, protocol) 列表。
+
+        支持 `manager:8088`、`20168`、`5001/udp`、`socks:5001/udp` 四种写法；
+        未配置（None）时返回空列表，由调用方决定回退策略。
+        """
+        if self.expected_listen_ports is None:
+            return []
+        parsed: list[tuple[str, int, str]] = []
+        for item in self.expected_listen_ports.split(","):
+            item = item.strip()
+            if not item:
+                continue
+            protocol = "tcp"
+            if "/" in item:
+                item, _, raw_protocol = item.partition("/")
+                item = item.strip()
+                protocol = raw_protocol.strip().lower() or "tcp"
+            name = "local"
+            port_text = item
+            if ":" in item:
+                name, _, raw_port = item.partition(":")
+                name = name.strip() or "local"
+                port_text = raw_port.strip()
+            if not port_text.isdigit():
+                continue
+            parsed.append((name, int(port_text), protocol))
+        return parsed
+
+@dataclass
 class Config:
     node: NodeConfig = field(default_factory=NodeConfig)
     server: ServerConfig = field(default_factory=ServerConfig)
     security: SecurityConfig = field(default_factory=SecurityConfig)
     singbox: SingboxConfig = field(default_factory=SingboxConfig)
     monitoring: MonitoringConfig = field(default_factory=MonitoringConfig)
+    network: NetworkConfig = field(default_factory=NetworkConfig)
 
 
 def load_config() -> Config:
@@ -120,9 +203,15 @@ def load_config() -> Config:
 
     security = data.get("security", {})
     result.security.token = str(security.get("token", result.security.token))
+    result.security.allowed_cidrs = str(
+        security.get("allowed_cidrs", result.security.allowed_cidrs)
+    )
+    result.security.revision_secret = str(
+        security.get("revision_secret", result.security.revision_secret)
+    )
 
     singbox = data.get("singbox", {})
-    for name in ("config", "api_secret", "vless_tag", "vmess_tag", "socks_tag"):
+    for name in ("config", "api_secret", "vless_tag", "vmess_tag", "socks_tag", "trojan_tag"):
         if name in singbox:
             setattr(result.singbox, name, str(singbox[name]))
     result.singbox.api_port = int(singbox.get("api_port", result.singbox.api_port))
@@ -144,6 +233,28 @@ def load_config() -> Config:
             "monitoring.device_active_window_seconds must be between 1 and 3600"
         )
     result.monitoring.device_active_window_seconds = device_window
+
+    network = data.get("network", {}) or {}
+    result.network.peer_targets = str(network.get("peer_targets", result.network.peer_targets))
+    result.network.probe_targets = str(network.get("probe_targets", result.network.probe_targets))
+    result.network.link_interfaces = str(
+        network.get("link_interfaces", result.network.link_interfaces)
+    )
+    result.network.internal_subnets = str(
+        network.get("internal_subnets", result.network.internal_subnets)
+    )
+    result.network.dnat_ports = str(network.get("dnat_ports", result.network.dnat_ports))
+    if "expected_listen_ports" in network:
+        result.network.expected_listen_ports = str(network["expected_listen_ports"])
+    result.network.require_dnat = bool(network.get("require_dnat", result.network.require_dnat))
+    result.network.expected_mtu = int(network.get("expected_mtu", result.network.expected_mtu))
+    result.network.packet_loss_warn_pct = float(
+        network.get("packet_loss_warn_pct", result.network.packet_loss_warn_pct)
+    )
+    result.network.max_rtt_ms = float(network.get("max_rtt_ms", result.network.max_rtt_ms))
+    result.network.conntrack_warn_ratio = float(
+        network.get("conntrack_warn_ratio", result.network.conntrack_warn_ratio)
+    )
     return result
 
 

@@ -12,6 +12,7 @@ from typing import Literal
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, Response
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel, Field
 
 from auth import verify_token
 from config import config
@@ -19,6 +20,7 @@ from idempotency import IdempotencyConflict, execute_idempotent
 from models.request import (
     AgentHeartbeatResponse,
     AgentInfoResponse,
+    BindMultipleProxiesRequest,
     BindProxyRequest,
     CreateUserRequest,
     CreateUserResponse,
@@ -37,6 +39,11 @@ from models.request import (
 )
 from protocols import ProtocolData, generate_all, protocol_info
 from residential import ResidentialConfigError, validate_config
+from revision import (
+    apply_desired_revision,
+    get_revision_state,
+    rollback_to_last_known_good,
+)
 from monitor.status import get_node_status
 from monitor.traffic import (
     collect_traffic,
@@ -47,9 +54,11 @@ from monitor.traffic import (
     start_traffic_collector,
     stop_traffic_collector,
 )
+from network_check import run_network_check
 from singbox.manager import (
     SingboxConfigError,
     bind_proxy,
+    bind_multiple_proxies,
     build_protocol_info,
     create_user,
     delete_user,
@@ -132,6 +141,23 @@ def get_status(_token: str = Depends(verify_token)):
     }
 
 
+@app.get("/api/node/network-check", tags=["node"])
+def network_check_endpoint(_token: str = Depends(verify_token)):
+    """B6: 节点网络前置检查。
+
+    检查项：
+      - 端口监听（VLESS/VMess/Trojan/SOCKS/Manager/Clash API）
+      - 防火墙放行（ufw/iptables）
+      - IP 转发（DNAT 依赖 net.ipv4.ip_forward=1）
+      - MTU（避免大包分片导致代理卡顿，建议 ≥1280）
+      - TCP 本地连通性（端口握手探测）
+
+    用于节点上线前自检与排障，所有命令均带超时避免卡死。
+    在非 Linux 开发环境退化为仅报告不可用，不抛异常。
+    """
+    return run_network_check().to_dict()
+
+
 @app.post("/api/user/create", response_model=CreateUserResponse, tags=["users"])
 def create_user_endpoint(
     request: CreateUserRequest,
@@ -149,6 +175,7 @@ def create_user_endpoint(
         lambda: create_user(
             request.userId,
             list(request.protocols),
+            user_uuid=request.uuid or None,
             socks_username=request.socksUsername,
             socks_password=request.socksPassword,
             proxy=request.proxy.model_dump() if request.proxy else None,
@@ -340,6 +367,34 @@ def bind_proxy_endpoint(
     return result
 
 
+@app.post("/api/user/bind-proxies", tags=["users"])
+def bind_multiple_proxies_endpoint(
+    request: BindMultipleProxiesRequest,
+    response: Response,
+    idempotency_key: str | None = Header(
+        default=None, alias="Idempotency-Key", min_length=1, max_length=128
+    ),
+    _token: str = Depends(verify_token),
+):
+    """负载均衡：为一个用户绑定多个上游 SOCKS 出口（selector/urltest 聚合）。"""
+    payload = request.model_dump(mode="json")
+    result, replayed = execute_idempotent(
+        idempotency_key,
+        "bind-proxies",
+        payload,
+        lambda: bind_multiple_proxies(
+            request.userId,
+            [proxy.model_dump() for proxy in request.proxies],
+            mode=request.mode,
+            health_check_url=request.healthCheckUrl,
+            interval=request.interval,
+            tolerance=request.tolerance,
+        ),
+    )
+    response.headers["Idempotency-Replayed"] = str(replayed).lower()
+    return result
+
+
 @app.patch(
     "/api/user/{userId}/proxy-metadata",
     response_model=OperationResponse,
@@ -407,6 +462,56 @@ def singbox_reload(_token: str = Depends(verify_token)):
     return ReloadResponse(success=reload_singbox())
 
 
+class DesiredRevisionRequest(BaseModel):
+    """B2: Control Plane 推送的期望配置载荷。"""
+
+    config: dict = Field(default_factory=dict)
+    registry: dict = Field(default_factory=dict)
+    revisionId: str = Field(min_length=1, max_length=128)
+    # B5: 显式声明允许删除用户，对照删除审计
+    allowUserDeletion: bool = False
+
+
+@app.get("/api/agent/revision/state", tags=["revision"])
+def get_revision_state_endpoint(_token: str = Depends(verify_token)):
+    """B2: 返回当前节点 revision 状态，供 Control Plane 拉取。"""
+    return get_revision_state()
+
+
+@app.post("/api/agent/revision/apply", tags=["revision"])
+def apply_revision_endpoint(
+    request: DesiredRevisionRequest,
+    response: Response,
+    x_revision_signature: str = Header(default="", alias="X-Revision-Signature"),
+    idempotency_key: str | None = Header(
+        default=None, alias="Idempotency-Key", min_length=1, max_length=128
+    ),
+    _token: str = Depends(verify_token),
+):
+    """B2+B3+B4+B5: 应用带签名的期望配置，含用户集合缩减保护，失败自动回滚。"""
+    payload = request.model_dump(mode="json")
+    result, replayed = execute_idempotent(
+        idempotency_key,
+        "apply-revision",
+        payload,
+        lambda: apply_desired_revision(
+            request.config,
+            request.registry,
+            x_revision_signature,
+            request.revisionId,
+            allow_user_deletion=request.allowUserDeletion,
+        ),
+    )
+    response.headers["Idempotency-Replayed"] = str(replayed).lower()
+    return result
+
+
+@app.post("/api/agent/revision/rollback", tags=["revision"])
+def rollback_revision_endpoint(_token: str = Depends(verify_token)):
+    """B4: 显式回滚到上一个已知良好配置。"""
+    return rollback_to_last_known_good()
+
+
 @app.get("/api/singbox/api/status", tags=["sing-box"])
 def api_status(_token: str = Depends(verify_token)):
     return {"available": is_api_available(), "usage": "metrics-only"}
@@ -420,10 +525,12 @@ def get_agent_info(_token: str = Depends(verify_token)):
         "nodeId": config.node.id,
         "capabilities": [
             "user.create",
+            "user.create.uuid",
             "user.delete",
             "user.list",
             "user.connections",
             "proxy.bind",
+            "proxy.bind.multiple",
             "proxy.metadata.update",
             "traffic.sampled",
             "traffic.quota",
@@ -431,6 +538,10 @@ def get_agent_info(_token: str = Depends(verify_token)):
             "user.policy.update",
             "node.heartbeat",
             "request.idempotency",
+            "revision.desired",
+            "revision.apply",
+            "revision.rollback",
+            "network.check",
         ],
         "controlPlaneResponsibilities": [
             "node-registry",

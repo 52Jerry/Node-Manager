@@ -16,9 +16,35 @@ singbox:
   config: ./singbox/config.json
   api_port: 9090
   api_secret: ""
+  trojan_tag: "trojan"
 
 monitoring:
   # 大批量节点可调高到 5-10 秒以降低采样开销。
   traffic_sample_interval_seconds: 2
   # 来源 IP 在最近 60 秒有代理活动时计为在线设备，减少短连接导致的抖动。
   device_active_window_seconds: 60
+
+# B6: 网络前置检查参数（专线拓扑相关）。
+# 入口节点（如深圳）需要 DNAT，出口节点（如香港）通常不需要。
+network:
+  # 专线对端内网地址，逗号分隔。深圳填 10.0.0.1，香港填 10.0.0.2。
+  peer_targets: ""
+  # 额外回程探测目标（公网），逗号分隔。
+  probe_targets: ""
+  # 期望承载专线的接口，逗号分隔；留空则跳过接口归属校验。
+  link_interfaces: ""
+  # 专线内网前缀，逗号分隔 CIDR；用于判断对端是否真的走专线接口。
+  internal_subnets: ""
+  # 是否要求存在 DNAT 规则。
+  require_dnat: false
+  # 期望存在 DNAT/防火墙放行的端口，逗号分隔。
+  dnat_ports: ""
+  # 本机期望监听的端口，逗号分隔（如 "manager:8088"、"5001/udp"）。
+  # 仅在 sing-box 配置不可读时生效；显式留空表示纯转发节点不监听端口。
+  # 不写该键（默认）则回退到内置默认端口表，保持向后兼容。
+  # expected_listen_ports: ""
+  # 链路质量阈值。
+  expected_mtu: 1500
+  packet_loss_warn_pct: 1.0
+  max_rtt_ms: 200.0
+  conntrack_warn_ratio: 0.8
