@@ -86,6 +86,14 @@ class SingboxConfig:
 class MonitoringConfig:
     traffic_sample_interval_seconds: float = 2.0
     device_active_window_seconds: float = 60.0
+    # 健康检查：0=禁用，默认 1200 秒（20 分钟）
+    health_check_interval_seconds: int = 1200
+    # 连续失败多少次后标记为死亡
+    health_check_fail_threshold: int = 3
+    # TCP 连接测试超时（秒）
+    health_check_tcp_timeout_seconds: float = 5.0
+    # 每批并发检查数量
+    health_check_batch_size: int = 100
 
 
 @dataclass
@@ -233,7 +241,6 @@ def load_config() -> Config:
             "monitoring.device_active_window_seconds must be between 1 and 3600"
         )
     result.monitoring.device_active_window_seconds = device_window
-
     network = data.get("network", {}) or {}
     result.network.peer_targets = str(network.get("peer_targets", result.network.peer_targets))
     result.network.probe_targets = str(network.get("probe_targets", result.network.probe_targets))
@@ -254,6 +261,18 @@ def load_config() -> Config:
     result.network.max_rtt_ms = float(network.get("max_rtt_ms", result.network.max_rtt_ms))
     result.network.conntrack_warn_ratio = float(
         network.get("conntrack_warn_ratio", result.network.conntrack_warn_ratio)
+    )
+    result.monitoring.health_check_interval_seconds = int(
+        monitoring.get("health_check_interval_seconds", 1200)
+    )
+    result.monitoring.health_check_fail_threshold = int(
+        monitoring.get("health_check_fail_threshold", 3)
+    )
+    result.monitoring.health_check_tcp_timeout_seconds = float(
+        monitoring.get("health_check_tcp_timeout_seconds", 5.0)
+    )
+    result.monitoring.health_check_batch_size = int(
+        monitoring.get("health_check_batch_size", 100)
     )
     return result
 

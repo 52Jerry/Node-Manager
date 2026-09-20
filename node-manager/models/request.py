@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Literal
 
 from pydantic import BaseModel, Field, field_validator, model_validator
@@ -81,6 +81,7 @@ class CreateUserRequest(BaseModel):
     proxy: ProxyDescriptor | None = None
     trafficLimitBytes: int | None = Field(default=None, ge=0)
     maxSourceIps: int | None = Field(default=None, ge=0, le=1000)
+    expiresAt: datetime | None = None
 
     @field_validator("uuid")
     @classmethod
@@ -101,6 +102,15 @@ class CreateUserRequest(BaseModel):
         if (self.socksUsername is not None or self.socksPassword is not None) and "socks" not in self.protocols:
             raise ValueError("socksUsername and socksPassword require the socks protocol")
         return self
+
+    @field_validator("expiresAt")
+    @classmethod
+    def expiration_must_be_in_the_future(cls, value: datetime | None) -> datetime | None:
+        if value is not None:
+            normalized = value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+            if normalized <= datetime.now(timezone.utc):
+                raise ValueError("expiresAt must be in the future")
+        return value
 
 
 class UpdateUserPolicyRequest(BaseModel):
@@ -183,6 +193,8 @@ class CreateUserResponse(BaseModel):
 
 class UserConnectionResponse(CreateUserResponse):
     createdAt: datetime | None = None
+    expiresAt: datetime | None = None
+    expirationStatus: Literal["ACTIVE", "EXPIRED"] = "ACTIVE"
 
 
 class ProxyDetailsResponse(BaseModel):
@@ -251,12 +263,45 @@ class UserSummary(BaseModel):
     activeSourceIps: list[str] = Field(default_factory=list)
     status: Literal["active", "traffic_limited", "device_limited"] = "active"
     createdAt: datetime | None = None
+    expiresAt: datetime | None = None
+    expirationStatus: Literal["ACTIVE", "EXPIRED"] = "ACTIVE"
 
 
 class UserListResponse(BaseModel):
     items: list[UserSummary]
     page: int
     pageSize: int
+    total: int
+
+
+class UpdateUserExpirationRequest(BaseModel):
+    expiresAt: datetime
+
+    @field_validator("expiresAt")
+    @classmethod
+    def expiration_must_be_in_the_future(cls, value: datetime) -> datetime:
+        normalized = value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+        if normalized <= datetime.now(timezone.utc):
+            raise ValueError("expiresAt must be in the future")
+        return value
+
+
+class RestoreUserRequest(UpdateUserExpirationRequest):
+    pass
+
+
+class ExpiredUserSummary(BaseModel):
+    userId: str
+    createdAt: datetime | None = None
+    expiresAt: datetime | None = None
+    expiredAt: datetime | None = None
+    archivedAt: datetime | None = None
+    status: Literal["EXPIRED", "ARCHIVED"]
+    protocols: list[UserProtocol] = Field(default_factory=list)
+
+
+class ExpiredUserListResponse(BaseModel):
+    items: list[ExpiredUserSummary]
     total: int
 
 
@@ -305,6 +350,15 @@ class TrafficTotals(BaseModel):
     collectedAt: datetime | None = None
 
 
+class DeadOutboundInfo(BaseModel):
+    """死掉的上游代理信息，用于心跳上报到控制中心。"""
+    userId: str
+    server: str
+    port: int
+    tag: str
+    failCount: int
+
+
 class AgentHeartbeatResponse(BaseModel):
     nodeId: str
     name: str
@@ -321,4 +375,5 @@ class AgentHeartbeatResponse(BaseModel):
     userCount: int
     socksPort: int | None = Field(default=None, ge=1, le=65535)
     traffic: TrafficTotals
+    deadOutbounds: list[DeadOutboundInfo] = Field(default_factory=list)
     reportedAt: datetime

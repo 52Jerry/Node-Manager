@@ -33,7 +33,10 @@ from models.request import (
     ResidentialProtocolsResponse,
     ResidentialSocksRequest,
     TrafficResponse,
+    UpdateUserExpirationRequest,
     UpdateUserPolicyRequest,
+    RestoreUserRequest,
+    ExpiredUserListResponse,
     UserConnectionResponse,
     UserListResponse,
 )
@@ -55,6 +58,11 @@ from monitor.traffic import (
     stop_traffic_collector,
 )
 from network_check import run_network_check
+from monitor.health_check import (
+    start_health_checker,
+    stop_health_checker,
+    get_dead_outbounds,
+)
 from singbox.manager import (
     SingboxConfigError,
     bind_proxy,
@@ -72,6 +80,13 @@ from singbox.manager import (
     get_socks_inbound_port,
     is_api_available,
     list_users,
+    list_expired_users,
+    migrate_user_expirations,
+    process_user_expirations,
+    restore_user,
+    start_expiration_scheduler,
+    stop_expiration_scheduler,
+    update_user_expiration,
     reload_singbox,
 )
 
@@ -104,6 +119,9 @@ async def idempotency_error_handler(_request: Request, exc: IdempotencyConflict)
 @app.on_event("startup")
 def startup_tasks():
     try:
+        migrated_expirations = migrate_user_expirations()
+        if migrated_expirations:
+            logging.getLogger(__name__).info("backfilled expiration for %s existing users", migrated_expirations)
         migrated_socks = migrate_legacy_socks_usernames()
         if migrated_socks:
             logging.getLogger(__name__).info("migrated %s legacy SOCKS usernames", migrated_socks)
@@ -113,10 +131,14 @@ def startup_tasks():
     except Exception:
         logging.getLogger(__name__).exception("could not migrate existing user traffic outbounds")
     start_traffic_collector()
+    start_health_checker()
+    start_expiration_scheduler()
 
 
 @app.on_event("shutdown")
 def shutdown_tasks():
+    stop_expiration_scheduler()
+    stop_health_checker()
     stop_traffic_collector()
 
 
@@ -181,6 +203,7 @@ def create_user_endpoint(
             proxy=request.proxy.model_dump() if request.proxy else None,
             traffic_limit_bytes=request.trafficLimitBytes,
             max_source_ips=request.maxSourceIps,
+            expires_at=request.expiresAt,
         ),
     )
     response.headers["Idempotency-Replayed"] = str(replayed).lower()
@@ -457,6 +480,35 @@ def update_user_policy_endpoint(
     return update_user_policy(userId, request.model_dump(exclude_unset=True))
 
 
+@app.get("/api/users/expired", response_model=ExpiredUserListResponse, tags=["users"])
+def get_expired_users(_token: str = Depends(verify_token)):
+    process_user_expirations()
+    items = list_expired_users()
+    return {"items": items, "total": len(items)}
+
+
+@app.patch("/api/user/{userId}/expiration", tags=["users"])
+def update_user_expiration_endpoint(
+    userId: str,
+    request: UpdateUserExpirationRequest,
+    _token: str = Depends(verify_token),
+):
+    if not userId or len(userId) > 64:
+        raise HTTPException(status_code=422, detail="invalid userId")
+    return update_user_expiration(userId, request.expiresAt)
+
+
+@app.post("/api/user/{userId}/restore", tags=["users"])
+def restore_user_endpoint(
+    userId: str,
+    request: RestoreUserRequest,
+    _token: str = Depends(verify_token),
+):
+    if not userId or len(userId) > 64:
+        raise HTTPException(status_code=422, detail="invalid userId")
+    return restore_user(userId, request.expiresAt)
+
+
 @app.post("/api/singbox/reload", response_model=ReloadResponse, tags=["sing-box"])
 def singbox_reload(_token: str = Depends(verify_token)):
     return ReloadResponse(success=reload_singbox())
@@ -536,6 +588,9 @@ def get_agent_info(_token: str = Depends(verify_token)):
             "traffic.quota",
             "user.source-ip-limit",
             "user.policy.update",
+            "user.expiration.update",
+            "user.expiration.restore",
+            "user.expiration.archive",
             "node.heartbeat",
             "request.idempotency",
             "revision.desired",
@@ -580,6 +635,7 @@ def get_agent_heartbeat(_token: str = Depends(verify_token)):
         # The collector samples traffic in the background. Avoid an extra
         # synchronous sing-box request on every control-plane heartbeat.
         "traffic": get_traffic_totals(refresh=False),
+        "deadOutbounds": get_dead_outbounds(),
         "reportedAt": datetime.now(timezone.utc),
     }
 

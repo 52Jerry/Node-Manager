@@ -4,6 +4,7 @@ import os
 import sys
 import tempfile
 import unittest
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import unquote
 from unittest.mock import patch
@@ -423,6 +424,47 @@ class ManagerTestCase(unittest.TestCase):
         self.assertEqual(migrated["route"]["rules"][-1]["auth_user"], ["migrate-user"])
         self.assertEqual(manager.list_users()[0]["socksUsername"], "migrate-user")
 
+    def test_expiration_migration_discovers_users_missing_from_registry(self):
+        data = base_singbox_config()
+        legacy_name = "node-manager:config-only-user"
+        data["inbounds"][0]["users"].append({
+            "name": legacy_name,
+            "uuid": "33333333-3333-4333-8333-333333333333",
+            "flow": "xtls-rprx-vision",
+        })
+        data["inbounds"][1]["users"].append({
+            "name": legacy_name,
+            "uuid": "33333333-3333-4333-8333-333333333333",
+        })
+        data["inbounds"][2]["users"].append({
+            "username": "config-only-user",
+            "password": "config-only-password",
+        })
+        data["inbounds"][2]["users"].append({
+            "username": "manual-socks-user",
+            "password": "manual-socks-password",
+        })
+        self._write_config(data)
+
+        self.assertEqual(manager.migrate_user_expirations(), 1)
+        registry = json.loads(self.registry_path.read_text(encoding="utf-8"))
+        metadata = registry["users"]["config-only-user"]
+        self.assertNotIn("manual-socks-user", registry["users"])
+        created_at = datetime.fromisoformat(metadata["createdAt"])
+        expires_at = datetime.fromisoformat(metadata["expiresAt"])
+        self.assertEqual(expires_at - created_at, timedelta(days=30))
+        self.assertEqual(
+            manager.list_users()[0]["expirationStatus"],
+            "ACTIVE",
+        )
+        self.assertEqual(
+            manager.get_user_connection("config-only-user")["socks"]["username"],
+            "config-only-user",
+        )
+        migrated = json.loads(self.config_path.read_text(encoding="utf-8"))
+        socks_users = next(item for item in migrated["inbounds"] if item["tag"] == "socks")["users"]
+        self.assertIn({"username": "manual-socks-user", "password": "manual-socks-password"}, socks_users)
+
     def test_create_can_atomically_bind_proxy_without_reusing_upstream_credentials(self):
         created = manager.create_user(
             "customer-proxy",
@@ -620,6 +662,99 @@ class ManagerTestCase(unittest.TestCase):
         )
         self.assertIsNone(updated["trafficLimitBytes"])
         self.assertEqual(updated["maxSourceIps"], 1)
+
+    def test_user_expiration_blocks_then_can_be_restored_within_72_hours(self):
+        manager.create_user("expiring-user", ["socks"])
+        now = datetime.now(timezone.utc).replace(microsecond=0)
+        registry = json.loads(self.registry_path.read_text(encoding="utf-8"))
+        registry["users"]["expiring-user"]["expiresAt"] = (now - timedelta(hours=1)).isoformat()
+        self.registry_path.write_text(json.dumps(registry, indent=2) + "\n", encoding="utf-8")
+
+        snapshot = {
+            "connections": [
+                {
+                    "id": "expired-connection",
+                    "chains": ["node-manager-out:expiring-user"],
+                }
+            ]
+        }
+        with (
+            patch.object(manager.singbox_api, "get_connections", return_value=snapshot),
+            patch.object(manager.singbox_api, "close_connection", return_value=True) as close,
+        ):
+            self.assertEqual(manager.process_user_expirations(now), 1)
+        close.assert_called_once_with("expired-connection")
+        blocked = json.loads(self.config_path.read_text(encoding="utf-8"))
+        self.assertEqual(blocked["route"]["rules"][0]["action"], "reject")
+        with self.assertRaisesRegex(manager.SingboxConfigError, "connection expired"):
+            manager.get_user_connection("expiring-user")
+
+        restored = manager.restore_user(
+            "expiring-user", now + timedelta(days=30)
+        )
+        self.assertEqual(restored["expirationStatus"], "ACTIVE")
+        self.assertEqual(manager.get_user_connection("expiring-user")["success"], True)
+        current = json.loads(self.config_path.read_text(encoding="utf-8"))
+        self.assertFalse(any(rule.get("action") == "reject" for rule in current["route"]["rules"]))
+
+    def test_user_expiration_is_archived_after_restore_window(self):
+        manager.create_user("archive-user", ["socks"])
+        now = datetime.now(timezone.utc).replace(microsecond=0)
+        registry = json.loads(self.registry_path.read_text(encoding="utf-8"))
+        registry["users"]["archive-user"]["expiresAt"] = (now - timedelta(hours=73)).isoformat()
+        self.registry_path.write_text(json.dumps(registry, indent=2) + "\n", encoding="utf-8")
+
+        self.assertEqual(manager.process_user_expirations(now), 1)
+        current = json.loads(self.config_path.read_text(encoding="utf-8"))
+        self.assertFalse(any(
+            user.get("username") == "archive-user"
+            for inbound in current["inbounds"]
+            for user in inbound["users"]
+        ))
+        self.assertFalse(any(item.get("tag") == "node-manager-out:archive-user" for item in current["outbounds"]))
+        self.assertFalse(any(rule.get("outbound") == "node-manager-out:archive-user" for rule in current["route"]["rules"]))
+        archived = json.loads(self.registry_path.read_text(encoding="utf-8"))
+        self.assertNotIn("archive-user", archived["users"])
+        self.assertEqual(archived["expiredUsers"]["archive-user"]["status"], "ARCHIVED")
+
+        self.assertEqual(manager.ensure_user_outbounds(), 0)
+        after_compensation = json.loads(self.config_path.read_text(encoding="utf-8"))
+        self.assertFalse(any(
+            item.get("tag") == "node-manager-out:archive-user"
+            for item in after_compensation["outbounds"]
+        ))
+        self.assertFalse(any(
+            rule.get("outbound") == "node-manager-out:archive-user"
+            for rule in after_compensation["route"]["rules"]
+        ))
+
+    def test_expiration_and_enforcement_reject_rules_keep_their_owners(self):
+        manager.create_user("overlap-user", ["socks"])
+        now = datetime.now(timezone.utc).replace(microsecond=0)
+        registry = json.loads(self.registry_path.read_text(encoding="utf-8"))
+        registry["users"]["overlap-user"]["expiresAt"] = (now - timedelta(hours=1)).isoformat()
+        self.registry_path.write_text(json.dumps(registry, indent=2) + "\n", encoding="utf-8")
+
+        manager.process_user_expirations(now)
+        manager.sync_user_enforcements(
+            {"overlap-user": {"trafficBlocked": True, "blockedSourceIps": []}}
+        )
+        rules = json.loads(self.config_path.read_text(encoding="utf-8"))["route"]["rules"]
+        self.assertEqual([rule.get("action") for rule in rules[:2]], ["reject", "reject"])
+
+        manager.bind_proxy("overlap-user", {"server": "203.0.113.40", "port": 1080})
+        rules = json.loads(self.config_path.read_text(encoding="utf-8"))["route"]["rules"]
+        self.assertEqual([rule.get("action") for rule in rules[:3]], ["reject", "reject", "route"])
+
+        manager.sync_user_enforcements(
+            {"overlap-user": {"trafficBlocked": False, "blockedSourceIps": []}}
+        )
+        rules = json.loads(self.config_path.read_text(encoding="utf-8"))["route"]["rules"]
+        self.assertEqual(sum(rule.get("action") == "reject" for rule in rules), 1)
+
+        manager.update_user_expiration("overlap-user", now + timedelta(days=30))
+        rules = json.loads(self.config_path.read_text(encoding="utf-8"))["route"]["rules"]
+        self.assertFalse(any(rule.get("action") == "reject" for rule in rules))
 
     def test_user_enforcement_rules_are_persistent_idempotent_and_removable(self):
         manager.create_user(
