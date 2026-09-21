@@ -631,17 +631,28 @@ register_with_control_plane() {
     set -e
     [ -n "$http_code" ] || http_code="000"
     if [ "$http_code" = "200" ]; then
-      CONTROL_PLANE_NODE_ID="$(jq -r '.data.id // .id // empty' "$response_file" 2>/dev/null || true)"
-      CONTROL_PLANE_REGISTRATION_STATUS="registered"
-      CONTROL_PLANE_RESPONSE="ok"
-      install_token=""
-      CONTROL_PLANE_INSTALL_TOKEN=""
-      registration_token=""
-      CONTROL_PLANE_REGISTRATION_TOKEN=""
-      rm -rf -- "$REGISTRATION_TEMP_DIR"
-      REGISTRATION_TEMP_DIR=""
-      log "control-plane registration completed"
-      return 0
+      # 平台业务失败同样返回 HTTP 200，必须校验 body 里的 code 和节点 ID。
+      local response_code response_node_id
+      response_code="$(jq -r 'if type == "object" then (.code // empty) else empty end' "$response_file" 2>/dev/null || true)"
+      response_node_id="$(jq -r 'if type == "object" then (.data.id // .id // empty) else empty end' "$response_file" 2>/dev/null || true)"
+      if [ "$response_code" = "200" ] && [ -n "$response_node_id" ]; then
+        CONTROL_PLANE_NODE_ID="$response_node_id"
+        CONTROL_PLANE_REGISTRATION_STATUS="registered"
+        CONTROL_PLANE_RESPONSE="ok"
+        install_token=""
+        CONTROL_PLANE_INSTALL_TOKEN=""
+        registration_token=""
+        CONTROL_PLANE_REGISTRATION_TOKEN=""
+        rm -rf -- "$REGISTRATION_TEMP_DIR"
+        REGISTRATION_TEMP_DIR=""
+        log "control-plane registration completed"
+        return 0
+      fi
+      CONTROL_PLANE_RESPONSE="$(jq -r 'if type == "object" then (.message // empty) else empty end' "$response_file" 2>/dev/null || true)"
+      [ -n "$CONTROL_PLANE_RESPONSE" ] || CONTROL_PLANE_RESPONSE="$(head -c 300 "$response_file" 2>/dev/null | tr -d '\r\n' || true)"
+      CONTROL_PLANE_REGISTRATION_STATUS="rejected-${response_code:-invalid-response}"
+      log "control-plane rejected the registration (code=${response_code:-none}): ${CONTROL_PLANE_RESPONSE:-no message}"
+      continue
     fi
     if [ "$curl_exit_code" -ne 0 ] && [ -n "$install_token" ]; then
       CONTROL_PLANE_REGISTRATION_STATUS="transport-error-$curl_exit_code"
@@ -655,7 +666,7 @@ register_with_control_plane() {
   rm -rf -- "$REGISTRATION_TEMP_DIR"
   REGISTRATION_TEMP_DIR=""
   if [ "$registration_required" = "1" ]; then
-    fail "control-plane registration failed after retries ($CONTROL_PLANE_REGISTRATION_STATUS)"
+    fail "control-plane registration failed after retries ($CONTROL_PLANE_REGISTRATION_STATUS): ${CONTROL_PLANE_RESPONSE:-no message}"
   fi
   log "control-plane registration failed after retries; Node Manager remains installed"
 }

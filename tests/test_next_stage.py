@@ -1788,6 +1788,29 @@ class InstallerContractTest(unittest.TestCase):
         self.assertIn('provider cloud firewall/security group for TCP 8088', self.installer)
         self.assertIn('generate a new one-time install command', self.installer)
 
+    def test_business_error_response_is_not_reported_as_registered(self):
+        # 平台业务失败（例如 NODE_NOT_REGISTERED）同样返回 HTTP 200，
+        # 安装脚本必须校验响应体的 code 和节点 ID 才能判定成功。
+        self.assertIn("(.code // empty)", self.installer)
+        self.assertIn("(.data.id // .id // empty)", self.installer)
+        self.assertIn('response_code="$(jq -r', self.installer)
+        self.assertIn('response_node_id="$(jq -r', self.installer)
+        self.assertIn(
+            'if [ "$response_code" = "200" ] && [ -n "$response_node_id" ]; then',
+            self.installer,
+        )
+        self.assertIn('CONTROL_PLANE_REGISTRATION_STATUS="rejected-${response_code:-invalid-response}"',
+                      self.installer)
+        self.assertIn(
+            'fail "control-plane registration failed after retries ($CONTROL_PLANE_REGISTRATION_STATUS): ${CONTROL_PLANE_RESPONSE:-no message}"',
+            self.installer,
+        )
+
+    def test_page_install_command_carries_one_time_code_in_install_token(self):
+        # 节点侧只拿到短时一次性安装码，长期注册凭证不下发到节点。
+        page_section = self.installer.split("register_with_control_plane()", 1)[0]
+        self.assertIn("CONTROL_PLANE_INSTALL_TOKEN=\"${CONTROL_PLANE_INSTALL_TOKEN:-}\"", page_section)
+
     def test_fresh_install_does_not_exit_when_sing_box_is_missing(self):
         self.assertIn(
             'if command -v sing-box >/dev/null 2>&1; then',
