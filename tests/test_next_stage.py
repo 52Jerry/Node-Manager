@@ -1,6 +1,8 @@
 import importlib
 import json
 import os
+import shutil
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -1756,6 +1758,18 @@ class InstallerContractTest(unittest.TestCase):
             "printf 'X-Registration-Token: %s\\n' \"$registration_token\" > \"$header_file\"",
             self.installer,
         )
+
+    def test_installer_is_valid_bash_syntax(self):
+        bash = shutil.which("bash")
+        if not bash:
+            self.skipTest("bash is not available")
+        result = subprocess.run(
+            [bash, "-n", str(PROJECT_ROOT / "install.sh")],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_registration_credentials_are_not_written_to_info_file(self):
         info_file_section = self.installer.split('INFO_FILE="/root/node-manager-info.txt"', 1)[1]

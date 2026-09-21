@@ -476,7 +476,7 @@ for state_file in users.json traffic.json idempotency.json; do
 done
 EXISTING_TOKEN=''
 if [ -f "$CONFIG_DIR/config.yaml" ]; then
-  EXISTING_TOKEN="$(awk '/^[[:space:]]*token:/ {print $2; exit}' "$CONFIG_DIR/config.yaml" | tr -d '"' | tr -d ''')"
+  EXISTING_TOKEN="$(awk '/^[[:space:]]*token:/ {print $2; exit}' "$CONFIG_DIR/config.yaml" | tr -d '"' | tr -d "'")"
 fi
 if [ -n "${NODE_MANAGER_API_TOKEN:-}" ]; then
   NODE_TOKEN="$NODE_MANAGER_API_TOKEN"
