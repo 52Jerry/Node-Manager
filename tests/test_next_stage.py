@@ -622,6 +622,115 @@ class ManagerTestCase(unittest.TestCase):
         with self.assertRaisesRegex(manager.SingboxConfigError, "SOCKS username already exists"):
             manager.create_user("customer-4", ["socks"], socks_username="shared-user")
 
+    def test_duplicate_upstream_socks_identity_is_rejected(self):
+        proxy = {
+            "type": "socks5",
+            "server": "2001:0db8:0:0:0:0:0:1",
+            "port": 1080,
+            "username": "residential-user",
+            "password": "residential-password",
+        }
+        manager.create_user("duplicate-source-1", ["socks"], proxy=proxy)
+
+        with self.assertRaisesRegex(manager.SingboxConfigError, "当前IP已经存在"):
+            manager.create_user(
+                "duplicate-source-2",
+                ["socks"],
+                proxy={**proxy, "server": "2001:db8::1"},
+            )
+
+        self.assertEqual(
+            [item["userId"] for item in manager.list_users()],
+            ["duplicate-source-1"],
+        )
+
+    def test_upstream_socks_identity_can_be_rebound_for_same_user(self):
+        proxy = {
+            "type": "socks5",
+            "server": "203.0.113.50",
+            "port": 1080,
+            "username": "residential-user",
+            "password": "residential-password",
+        }
+        manager.create_user("rebind-source-user", ["socks"], proxy=proxy)
+
+        rebound = manager.bind_proxy("rebind-source-user", proxy)
+
+        self.assertTrue(rebound["success"])
+        self.assertEqual(manager.list_users()[0]["proxyServer"], "203.0.113.50:1080")
+
+    def test_upstream_socks_identity_changes_with_port_or_credentials(self):
+        manager.create_user(
+            "identity-change-user",
+            ["socks"],
+            proxy={
+                "type": "socks5",
+                "server": "203.0.113.60",
+                "port": 1080,
+                "username": "residential-user",
+                "password": "residential-password",
+            },
+        )
+
+        manager.bind_proxy(
+            "identity-change-user",
+            {
+                "type": "socks5",
+                "server": "203.0.113.60",
+                "port": 1081,
+                "username": "residential-user",
+                "password": "residential-password",
+            },
+        )
+        manager.bind_proxy(
+            "identity-change-user",
+            {
+                "type": "socks5",
+                "server": "203.0.113.60",
+                "port": 1081,
+                "username": "residential-user",
+                "password": "next-password",
+            },
+        )
+
+        self.assertEqual(manager.list_users()[0]["proxyServer"], "203.0.113.60:1081")
+
+    def test_multiple_upstream_socks_validation_is_atomic(self):
+        manager.create_user(
+            "batch-conflict-owner",
+            ["socks"],
+            proxy={
+                "type": "socks5",
+                "server": "203.0.113.70",
+                "port": 1080,
+                "username": "owner",
+                "password": "owner-password",
+            },
+        )
+        manager.create_user("batch-conflict-user", ["socks"])
+        original = self.config_path.read_text(encoding="utf-8")
+
+        with self.assertRaisesRegex(manager.SingboxConfigError, "当前IP已经存在"):
+            manager.bind_multiple_proxies(
+                "batch-conflict-user",
+                [
+                    {
+                        "server": "203.0.113.71",
+                        "port": 1080,
+                        "username": "new-user",
+                        "password": "new-password",
+                    },
+                    {
+                        "server": "203.0.113.70",
+                        "port": 1080,
+                        "username": "owner",
+                        "password": "owner-password",
+                    },
+                ],
+            )
+
+        self.assertEqual(self.config_path.read_text(encoding="utf-8"), original)
+
     def test_socks_username_cannot_match_another_protocol_auth_name(self):
         manager.create_user("customer-7", ["vless"])
         with self.assertRaisesRegex(manager.SingboxConfigError, "SOCKS username already exists"):

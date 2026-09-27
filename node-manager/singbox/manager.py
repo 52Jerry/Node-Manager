@@ -1585,6 +1585,7 @@ def _set_proxy_binding(
     normalized_proxy = dict(proxy)
     normalized_proxy["server"] = server
     normalized_proxy["port"] = port
+    _assert_proxy_available(data, user_id, normalized_proxy)
     _validate_proxy_does_not_loop_to_local_socks(data, normalized_proxy)
     outbound_tag = f"{USER_OUTBOUND_PREFIX}{user_id}"
     outbound = {
@@ -1637,6 +1638,77 @@ def _canonical_ip(value: str) -> str | None:
         return ipaddress.ip_address(normalized).compressed.lower()
     except ValueError:
         return None
+
+
+def _canonical_proxy_server(value: str) -> str:
+    normalized = value.strip().strip("[]")
+    return _canonical_ip(normalized) or normalized.lower()
+
+
+def _proxy_identity(
+    server: str, port: int, username: Any = None, password: Any = None
+) -> tuple[str, int, str, str]:
+    return (
+        _canonical_proxy_server(server),
+        int(port),
+        str(username or ""),
+        str(password or ""),
+    )
+
+
+def _is_user_proxy_outbound_tag(tag: str, user_id: str) -> bool:
+    prefix = f"{USER_OUTBOUND_PREFIX}{user_id}"
+    if tag == prefix:
+        return True
+    suffix = tag[len(prefix) :] if tag.startswith(prefix) else ""
+    return suffix.startswith("-") and suffix[1:].isdigit()
+
+
+def _configured_proxy_identities(
+    data: dict[str, Any], exclude_user_id: str | None = None
+) -> set[tuple[str, int, str, str]]:
+    identities: set[tuple[str, int, str, str]] = set()
+    for outbound in data.get("outbounds", []):
+        if outbound.get("type") != "socks":
+            continue
+        tag = str(outbound.get("tag") or "")
+        if exclude_user_id and _is_user_proxy_outbound_tag(tag, exclude_user_id):
+            continue
+        server = str(outbound.get("server") or "").strip()
+        try:
+            port = int(outbound.get("server_port"))
+        except (TypeError, ValueError):
+            continue
+        if server:
+            identities.add(
+                _proxy_identity(
+                    server,
+                    port,
+                    outbound.get("username"),
+                    outbound.get("password"),
+                )
+            )
+    return identities
+
+
+def _assert_proxy_available(
+    data: dict[str, Any],
+    user_id: str,
+    proxy: dict[str, Any],
+    batch_identities: set[tuple[str, int, str, str]] | None = None,
+) -> None:
+    identity = _proxy_identity(
+        str(proxy["server"]),
+        int(proxy["port"]),
+        proxy.get("username"),
+        proxy.get("password"),
+    )
+    if identity in _configured_proxy_identities(data, exclude_user_id=user_id):
+        raise SingboxConfigError("当前IP已经存在")
+    if batch_identities is not None:
+        if identity in batch_identities:
+            raise SingboxConfigError("当前IP已经存在")
+        batch_identities.add(identity)
 
 
 def _resolve_host_addresses(host: str | None) -> set[str]:
@@ -1754,6 +1826,7 @@ def bind_multiple_proxies(
 
         # 校验并归一化每个上游代理
         normalized: list[dict[str, Any]] = []
+        batch_identities: set[tuple[str, int, str, str]] = set()
         for index, proxy in enumerate(proxies):
             server = str(
                 proxy.get("server")
@@ -1775,6 +1848,7 @@ def bind_multiple_proxies(
                 "username": proxy.get("username"),
                 "password": proxy.get("password"),
             }
+            _assert_proxy_available(data, user_id, entry, batch_identities)
             normalized.append(entry)
 
         # 清理旧的子 outbound 与聚合 outbound
