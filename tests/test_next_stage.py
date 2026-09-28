@@ -1065,6 +1065,69 @@ class ApiTestCase(unittest.TestCase):
             ["sort-z", "sort-a"],
         )
 
+    def test_user_list_exposes_proxy_metadata_and_batch_deletes(self):
+        headers = {"Authorization": "Bearer test-token"}
+        for user_id, source_ip, port, country_name, city_name in (
+            ("ip-search-a", "207.152.99.183", 1080, "美国", "洛杉矶"),
+            ("ip-search-b", "198.51.100.20", 1081, "美国", "纽约"),
+        ):
+            response = self.client.post(
+                "/api/user/create",
+                headers=headers,
+                json={
+                    "userId": user_id,
+                    "protocols": ["vless", "vmess", "socks"],
+                    "proxy": {
+                        "server": "proxy.example.test",
+                        "port": port,
+                        "sourceIp": source_ip,
+                        "countryCode": "US",
+                        "countryName": country_name,
+                        "cityName": city_name,
+                    },
+                },
+            )
+            self.assertEqual(response.status_code, 200, response.text)
+
+        response = self.client.get(
+            "/api/users?page=1&pageSize=1&keyword=207.152.99.183",
+            headers=headers,
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["total"], 1)
+        item = response.json()["items"][0]
+        self.assertEqual(item["userId"], "ip-search-a")
+        self.assertEqual(item["sourceIp"], "207.152.99.183")
+        self.assertEqual(item["countryCode"], "US")
+        self.assertEqual(item["countryName"], "美国")
+        self.assertEqual(item["cityName"], "洛杉矶")
+        self.assertTrue(item["expiresAt"])
+
+        response = self.client.get(
+            "/api/users?page=1&pageSize=20&keyword=洛杉矶",
+            headers=headers,
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(
+            [user["userId"] for user in response.json()["items"]],
+            ["ip-search-a"],
+        )
+
+        deleted = self.client.post(
+            "/api/users/batch-delete",
+            headers=headers,
+            json={"userIds": ["ip-search-a", "ip-search-b", "missing-user"]},
+        )
+        self.assertEqual(deleted.status_code, 200, deleted.text)
+        body = deleted.json()
+        self.assertFalse(body["success"])
+        self.assertEqual(set(body["deleted"]), {"ip-search-a", "ip-search-b"})
+        self.assertEqual(body["failed"][0]["userId"], "missing-user")
+
+        remaining = self.client.get("/api/users", headers=headers)
+        self.assertEqual(remaining.status_code, 200, remaining.text)
+        self.assertEqual(remaining.json()["total"], 0)
+
     def test_create_and_update_user_policy_endpoints(self):
         headers = {"Authorization": "Bearer test-token"}
         response = self.client.post(

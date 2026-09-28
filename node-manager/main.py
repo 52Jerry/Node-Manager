@@ -20,6 +20,8 @@ from idempotency import IdempotencyConflict, execute_idempotent
 from models.request import (
     AgentHeartbeatResponse,
     AgentInfoResponse,
+    BatchDeleteUsersRequest,
+    BatchDeleteUsersResponse,
     BindMultipleProxiesRequest,
     BindProxyRequest,
     CreateUserRequest,
@@ -274,24 +276,12 @@ def get_users(
     _token: str = Depends(verify_token),
 ):
     items = list_users()
-    if keyword:
-        normalized = keyword.casefold()
-        items = [
-            item
-            for item in items
-            if normalized in item["userId"].casefold()
-            or normalized in (item.get("socksUsername") or "").casefold()
-        ]
-    items = _sort_users(items, sort)
-    total = len(items)
-    start = (page - 1) * pageSize
-    page_items = items[start:start + pageSize]
     # Traffic is sampled by the background collector. Do not block every user
     # list request on a live sing-box /connections call.
     traffic_available = None
     policies = get_user_policies()
     traffic_store = get_traffic_store_snapshot()
-    for item in page_items:
+    for item in items:
         traffic = get_user_traffic(
             item["userId"],
             refresh=False,
@@ -308,7 +298,32 @@ def get_users(
             activeSourceIps=traffic["activeSourceIps"],
             status=traffic["status"],
         )
+    if keyword:
+        normalized = keyword.casefold()
+        items = [
+            item
+            for item in items
+            if normalized in _user_search_text(item)
+        ]
+    items = _sort_users(items, sort)
+    total = len(items)
+    start = (page - 1) * pageSize
+    page_items = items[start:start + pageSize]
     return {"items": page_items, "page": page, "pageSize": pageSize, "total": total}
+
+
+def _user_search_text(item: dict) -> str:
+    values = [
+        item.get("userId"),
+        item.get("socksUsername"),
+        item.get("proxyServer"),
+        item.get("sourceIp"),
+        item.get("countryCode"),
+        item.get("countryName"),
+        item.get("cityName"),
+        *(item.get("activeSourceIps") or []),
+    ]
+    return " ".join(str(value) for value in values if value).casefold()
 
 
 def _sort_users(items: list[dict], sort: str) -> list[dict]:
@@ -462,6 +477,39 @@ def delete_user_endpoint(
     )
     response.headers["Idempotency-Replayed"] = str(replayed).lower()
     return result
+
+
+@app.post(
+    "/api/users/batch-delete",
+    response_model=BatchDeleteUsersResponse,
+    tags=["users"],
+)
+def batch_delete_users_endpoint(
+    request: BatchDeleteUsersRequest,
+    _token: str = Depends(verify_token),
+):
+    deleted: list[str] = []
+    failed: list[dict[str, str]] = []
+    logger = logging.getLogger(__name__)
+    for userId in request.userIds:
+        try:
+            delete_user(userId)
+            try:
+                delete_user_traffic(userId)
+            except Exception:
+                logger.exception(
+                    "could not delete traffic history for batch-deleted user %s",
+                    userId,
+                )
+            deleted.append(userId)
+        except Exception as exc:
+            logger.warning("could not batch-delete node user %s: %s", userId, exc)
+            failed.append({"userId": userId, "error": str(exc)})
+    return {
+        "success": not failed,
+        "deleted": deleted,
+        "failed": failed,
+    }
 
 
 @app.get("/api/user/{userId}/traffic", response_model=TrafficResponse, tags=["users"])

@@ -2077,6 +2077,10 @@ def list_users() -> list[dict[str, Any]]:
         item["createdAt"] = metadata.get("createdAt")
         item["expiresAt"] = metadata.get("expiresAt")
         item["expirationStatus"] = _expiration_status(metadata)
+        item["sourceIp"] = metadata.get("sourceIp")
+        item["countryCode"] = metadata.get("countryCode")
+        item["countryName"] = metadata.get("countryName")
+        item["cityName"] = metadata.get("cityName")
         item["trafficLimitBytes"] = _positive_policy_value(metadata.get("trafficLimitBytes"))
         item["maxSourceIps"] = _positive_policy_value(metadata.get("maxSourceIps"))
         item["status"] = "active"

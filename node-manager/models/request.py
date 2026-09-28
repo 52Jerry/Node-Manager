@@ -255,6 +255,10 @@ class UserSummary(BaseModel):
     socksUsername: str | None = None
     proxyBound: bool
     proxyServer: str | None = None
+    sourceIp: str | None = None
+    countryCode: str | None = None
+    countryName: str | None = None
+    cityName: str | None = None
     upload: int = 0
     download: int = 0
     total: int = 0
@@ -272,6 +276,29 @@ class UserListResponse(BaseModel):
     page: int
     pageSize: int
     total: int
+
+
+class BatchDeleteUsersRequest(BaseModel):
+    userIds: list[str] = Field(min_length=1, max_length=100)
+
+    @field_validator("userIds")
+    @classmethod
+    def user_ids_must_be_valid_and_unique(cls, value: list[str]) -> list[str]:
+        normalized = [item.strip() for item in value]
+        if any(not item or len(item) > 64 or not re.fullmatch(r"[A-Za-z0-9._-]+", item) for item in normalized):
+            raise ValueError("userIds contains an invalid user id")
+        return list(dict.fromkeys(normalized))
+
+
+class BatchDeleteUserFailure(BaseModel):
+    userId: str
+    error: str
+
+
+class BatchDeleteUsersResponse(BaseModel):
+    success: bool
+    deleted: list[str] = Field(default_factory=list)
+    failed: list[BatchDeleteUserFailure] = Field(default_factory=list)
 
 
 class UpdateUserExpirationRequest(BaseModel):
