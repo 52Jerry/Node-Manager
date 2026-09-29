@@ -10,6 +10,7 @@ from .request import (
     OperationResponse,
     ProxyMetadataUpdateRequest,
     ReloadResponse,
+    RenewUserRequest,
     TrafficResponse,
     TrafficTotals,
     UpdateUserPolicyRequest,

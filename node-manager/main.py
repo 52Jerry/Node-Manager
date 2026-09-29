@@ -32,6 +32,7 @@ from models.request import (
     ProxyDetailsResponse,
     ProxyMetadataUpdateRequest,
     ReloadResponse,
+    RenewUserRequest,
     ResidentialProtocolsResponse,
     ResidentialSocksRequest,
     TrafficResponse,
@@ -58,6 +59,7 @@ from monitor.traffic import (
     get_traffic_store_snapshot,
     start_traffic_collector,
     stop_traffic_collector,
+    reset_user_traffic,
 )
 from network_check import run_network_check
 from monitor.health_check import (
@@ -85,6 +87,7 @@ from singbox.manager import (
     list_expired_users,
     migrate_user_expirations,
     process_user_expirations,
+    renew_user,
     restore_user,
     start_expiration_scheduler,
     stop_expiration_scheduler,
@@ -235,6 +238,7 @@ def generate_residential_protocols(
             request.password,
             country_code=request.countryCode,
             country_name=request.countryName,
+            province_name=request.provinceName,
             city_name=request.cityName,
         )
     except ResidentialConfigError as exc:
@@ -320,6 +324,7 @@ def _user_search_text(item: dict) -> str:
         item.get("sourceIp"),
         item.get("countryCode"),
         item.get("countryName"),
+        item.get("provinceName"),
         item.get("cityName"),
         *(item.get("activeSourceIps") or []),
     ]
@@ -528,6 +533,28 @@ def update_user_policy_endpoint(
     return update_user_policy(userId, request.model_dump(exclude_unset=True))
 
 
+@app.post("/api/user/{userId}/renew", tags=["users"])
+def renew_user_endpoint(
+    userId: str,
+    request: RenewUserRequest,
+    _token: str = Depends(verify_token),
+):
+    if not userId or len(userId) > 64:
+        raise HTTPException(status_code=422, detail="invalid userId")
+    result = renew_user(
+        userId,
+        expires_at=request.expiresAt,
+        traffic_limit_bytes=request.trafficLimitBytes,
+        max_source_ips=request.maxSourceIps,
+    )
+    if request.resetTraffic:
+        traffic = reset_user_traffic(userId)
+        result.update(traffic)
+    else:
+        result["trafficReset"] = False
+    return result
+
+
 @app.get("/api/users/expired", response_model=ExpiredUserListResponse, tags=["users"])
 def get_expired_users(_token: str = Depends(verify_token)):
     process_user_expirations()
@@ -634,8 +661,10 @@ def get_agent_info(_token: str = Depends(verify_token)):
             "proxy.metadata.update",
             "traffic.sampled",
             "traffic.quota",
+            "traffic.reset",
             "user.source-ip-limit",
             "user.policy.update",
+            "user.renew",
             "user.expiration.update",
             "user.expiration.restore",
             "user.expiration.archive",

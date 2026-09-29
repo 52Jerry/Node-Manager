@@ -721,6 +721,11 @@ def build_all_protocols(
             or (proxy or {}).get("country_name")
             or ""
         ),
+        province_name=str(
+            (proxy or {}).get("provinceName")
+            or (proxy or {}).get("province_name")
+            or ""
+        ),
         city_name=str(
             (proxy or {}).get("cityName")
             or (proxy or {}).get("city_name")
@@ -781,6 +786,7 @@ def build_all_protocols(
                 password=str(proxy.get("password") or data.password),
                 country_code=str(proxy.get("countryCode") or proxy.get("country_code") or data.country_code or "XX"),
                 country_name=str(proxy.get("countryName") or proxy.get("country_name") or data.country_name or ""),
+                province_name=str(proxy.get("provinceName") or proxy.get("province_name") or data.province_name or ""),
                 city_name=str(proxy.get("cityName") or proxy.get("city_name") or data.city_name or ""),
                 uuid=data.uuid,
                 acceleration_domain=data.acceleration_domain,
@@ -846,6 +852,11 @@ def build_protocol_info(
         country_name=str(
             (proxy or {}).get("countryName")
             or (proxy or {}).get("country_name")
+            or ""
+        ),
+        province_name=str(
+            (proxy or {}).get("provinceName")
+            or (proxy or {}).get("province_name")
             or ""
         ),
         city_name=str(
@@ -921,6 +932,8 @@ def build_protocol_info(
         )
         if proxy.get("countryName") or proxy.get("country_name"):
             info["countryName"] = str(proxy.get("countryName") or proxy.get("country_name"))
+        if proxy.get("provinceName") or proxy.get("province_name"):
+            info["provinceName"] = str(proxy.get("provinceName") or proxy.get("province_name"))
         if proxy.get("cityName") or proxy.get("city_name"):
             info["cityName"] = str(proxy.get("cityName") or proxy.get("city_name"))
     return info
@@ -1100,6 +1113,58 @@ def update_user_policy(user_id: str, updates: dict[str, Any]) -> dict[str, Any]:
         }
         _audit("user.policy.update", user_id, **policy)
         return {"success": True, "userId": user_id, **policy}
+
+    return mutate_config(apply)
+
+
+def renew_user(
+    user_id: str,
+    expires_at: datetime,
+    traffic_limit_bytes: int | None = None,
+    max_source_ips: int | None = None,
+) -> dict[str, Any]:
+    """Atomically update a user's expiration and quota policy."""
+    new_expiry = _as_utc(expires_at)
+    now = datetime.now(timezone.utc)
+    if new_expiry is None or new_expiry <= now:
+        raise SingboxConfigError("expiresAt must be in the future")
+
+    def apply(data: dict[str, Any], registry: dict[str, Any]) -> dict[str, Any]:
+        if not _user_exists(data, registry, user_id):
+            raise SingboxConfigError(f"user not found: {user_id}")
+        metadata = _registry_user(registry, user_id)
+        old_expiry = _as_utc(metadata.get("expiresAt"))
+        if old_expiry is not None and now >= old_expiry + RESTORE_WINDOW:
+            raise SingboxConfigError("user restore window has expired")
+
+        if traffic_limit_bytes is not None:
+            metadata["trafficLimitBytes"] = _positive_policy_value(
+                traffic_limit_bytes
+            )
+        if max_source_ips is not None:
+            metadata["maxSourceIps"] = _positive_policy_value(max_source_ips)
+
+        metadata["expiresAt"] = _iso(new_expiry)
+        _remove_expiration_rule(data, metadata)
+        policy = {
+            "trafficLimitBytes": _positive_policy_value(
+                metadata.get("trafficLimitBytes")
+            ),
+            "maxSourceIps": _positive_policy_value(metadata.get("maxSourceIps")),
+        }
+        _audit(
+            "user.renew",
+            user_id,
+            expiresAt=metadata["expiresAt"],
+            **policy,
+        )
+        return {
+            "success": True,
+            "userId": user_id,
+            "expiresAt": metadata["expiresAt"],
+            "expirationStatus": "ACTIVE",
+            **policy,
+        }
 
     return mutate_config(apply)
 
@@ -1624,6 +1689,7 @@ def _save_proxy_metadata(registry: dict[str, Any], user_id: str, proxy: dict[str
         "sourcePort": ("sourcePort", "source_port", "port", "server_port"),
         "countryCode": ("countryCode", "country_code"),
         "countryName": ("countryName", "country_name"),
+        "provinceName": ("provinceName", "province_name"),
         "cityName": ("cityName", "city_name"),
     }
     for target, keys in fields.items():
@@ -2080,6 +2146,7 @@ def list_users() -> list[dict[str, Any]]:
         item["sourceIp"] = metadata.get("sourceIp")
         item["countryCode"] = metadata.get("countryCode")
         item["countryName"] = metadata.get("countryName")
+        item["provinceName"] = metadata.get("provinceName")
         item["cityName"] = metadata.get("cityName")
         item["trafficLimitBytes"] = _positive_policy_value(metadata.get("trafficLimitBytes"))
         item["maxSourceIps"] = _positive_policy_value(metadata.get("maxSourceIps"))
@@ -2287,6 +2354,7 @@ def get_user_proxy(user_id: str) -> dict[str, Any]:
             "sourcePort": metadata.get("sourcePort"),
             "countryCode": metadata.get("countryCode"),
             "countryName": metadata.get("countryName"),
+            "provinceName": metadata.get("provinceName"),
             "cityName": metadata.get("cityName"),
             "protocolInfo": {},
         }
@@ -2327,6 +2395,7 @@ def get_user_proxy(user_id: str) -> dict[str, Any]:
         "sourcePort": metadata.get("sourcePort") or outbound.get("server_port"),
         "countryCode": metadata.get("countryCode"),
         "countryName": metadata.get("countryName"),
+        "provinceName": metadata.get("provinceName"),
         "cityName": metadata.get("cityName"),
         "protocolInfo": protocol_info_data,
     }

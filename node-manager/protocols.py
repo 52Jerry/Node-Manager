@@ -75,6 +75,7 @@ class ProtocolData:
     password: str
     country_code: str = "XX"
     country_name: str = ""
+    province_name: str = ""
     city_name: str = ""
     remark: str = ""
     # 加速线路共用
@@ -278,6 +279,7 @@ def protocol_info(
         "password": data.password,
         "countryCode": normalize_country_code(data.country_code),
         "countryName": data.country_name,
+        "provinceName": data.province_name,
         "cityName": data.city_name,
         "status": status,
         "expireTime": expire_time,

@@ -357,6 +357,36 @@ def delete_user_traffic(user_id: str) -> None:
             _write_store(store)
 
 
+def reset_user_traffic(user_id: str) -> dict[str, Any]:
+    """Reset a user's usage while preserving the connection sampling baseline.
+
+    The active connection counters must remain in the store. Otherwise the
+    next sample treats the full counter as new traffic and adds the pre-renewal
+    usage back to the user.
+    """
+    with collection_lock:
+        with traffic_lock:
+            store = _read_store()
+            user = store["users"].setdefault(user_id, {})
+            user.update(
+                {
+                    "upload": 0,
+                    "download": 0,
+                    "activeSourceIps": [],
+                    "blockedSourceIps": [],
+                    "sourceIpLastSeen": {},
+                    "status": "active",
+                    "updatedAt": _now(),
+                }
+            )
+            _write_store(store)
+
+    sync_user_enforcements(
+        {user_id: {"trafficBlocked": False, "blockedSourceIps": []}}
+    )
+    return {"success": True, "userId": user_id, "trafficReset": True}
+
+
 def _collector_loop() -> None:
     while not stop_event.is_set():
         try:

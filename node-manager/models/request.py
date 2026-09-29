@@ -33,6 +33,7 @@ class ProxyDescriptor(ProxyConfig):
     sourceAddress: str | None = Field(default=None, max_length=255)
     countryCode: str = Field(default="XX", max_length=8)
     countryName: str = ""
+    provinceName: str = ""
     cityName: str = ""
 
 
@@ -44,6 +45,7 @@ class ResidentialSocksRequest(BaseModel):
     password: str = Field(default="")
     countryCode: str = Field(default="XX", min_length=0, max_length=8)
     countryName: str = ""
+    provinceName: str = ""
     cityName: str = ""
     uuid: str = Field(default="", max_length=64)
     accelerationDomain: str | None = Field(default=None, max_length=255)
@@ -124,6 +126,21 @@ class UpdateUserPolicyRequest(BaseModel):
         return self
 
 
+class RenewUserRequest(BaseModel):
+    expiresAt: datetime
+    trafficLimitBytes: int | None = Field(default=None, ge=0)
+    maxSourceIps: int | None = Field(default=None, ge=0, le=1000)
+    resetTraffic: bool = True
+
+    @field_validator("expiresAt")
+    @classmethod
+    def expiration_must_be_in_the_future(cls, value: datetime) -> datetime:
+        normalized = value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+        if normalized <= datetime.now(timezone.utc):
+            raise ValueError("expiresAt must be in the future")
+        return value
+
+
 class BindProxyRequest(BaseModel):
     userId: str = Field(min_length=1, max_length=64, pattern=r"^[A-Za-z0-9._-]+$")
     proxy: ProxyDescriptor
@@ -160,6 +177,7 @@ class ProxyMetadataUpdateRequest(BaseModel):
     sourcePort: int | None = Field(default=None, ge=1, le=65535)
     countryCode: str | None = Field(default=None, max_length=8)
     countryName: str | None = Field(default=None, max_length=255)
+    provinceName: str | None = Field(default=None, max_length=255)
     cityName: str | None = Field(default=None, max_length=255)
 
     @model_validator(mode="after")
@@ -209,6 +227,7 @@ class ProxyDetailsResponse(BaseModel):
     sourcePort: int | None = None
     countryCode: str | None = None
     countryName: str | None = None
+    provinceName: str | None = None
     cityName: str | None = None
     protocolInfo: dict[str, Any] = Field(default_factory=dict)
 
@@ -258,6 +277,7 @@ class UserSummary(BaseModel):
     sourceIp: str | None = None
     countryCode: str | None = None
     countryName: str | None = None
+    provinceName: str | None = None
     cityName: str | None = None
     upload: int = 0
     download: int = 0

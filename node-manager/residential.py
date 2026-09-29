@@ -40,6 +40,7 @@ class ResidentialSocksConfig:
     source_address: str | None = None  # 实际 SOCKS 接入地址（可为域名）
     country_code: str = "XX"
     country_name: str = ""
+    province_name: str = ""
     city_name: str = ""
 
     def to_protocol_data(self, **overrides) -> ProtocolData:
@@ -51,6 +52,7 @@ class ResidentialSocksConfig:
             "password": self.password,
             "country_code": self.country_code,
             "country_name": self.country_name,
+            "province_name": self.province_name,
             "city_name": self.city_name,
         }
         base.update(overrides)
@@ -107,6 +109,7 @@ def validate_config(
     source_address: str | None = None,
     country_code: str = "XX",
     country_name: str = "",
+    province_name: str = "",
     city_name: str = "",
 ) -> ResidentialSocksConfig:
     """校验并构建住宅 SOCKS 配置。此时只测试主机连通性。"""
@@ -123,6 +126,7 @@ def validate_config(
         source_address=source_address,
         country_code=country_code or "XX",
         country_name=country_name,
+        province_name=province_name,
         city_name=city_name,
     )
 
