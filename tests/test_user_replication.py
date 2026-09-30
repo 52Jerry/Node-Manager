@@ -7,6 +7,8 @@ from unittest.mock import patch
 import test_next_stage as fixture
 from test_next_stage import base_singbox_config, manager, traffic, main, TestClient
 from user_replication import ReplicationRequest, export_users, apply_users
+import ha_readiness
+from pydantic import ValidationError
 
 
 class UserReplicationTest(unittest.TestCase):
@@ -34,6 +36,160 @@ class UserReplicationTest(unittest.TestCase):
 
     def request(self, snapshot, **extra):
         return ReplicationRequest(groupKey="test-group", users=snapshot["users"], **extra)
+
+    def ha_request(self, snapshot, generation=100, **extra):
+        return self.request(snapshot, sharedConfig=snapshot["sharedConfig"], generation=generation, **extra)
+
+    def test_ha_copies_reality_ports_and_transport_but_not_local_settings(self):
+        self.create()
+        source = manager.read_config()
+        source["inbounds"][1]["transport"] = {"type": "ws", "path": "/proxy"}
+        self._write_config(source)
+        registry = manager.read_registry()
+        registry["users"]["primary-7"].update(remark="customer remark", tags=["premium"])
+        manager._write_registry(registry)
+        snapshot = export_users(shared_config=True)
+        self.assertNotIn("users", snapshot["sharedConfig"]["vless"])
+        self.assertNotIn("tag", snapshot["sharedConfig"]["vless"])
+        self.reset_target()
+        data = manager.read_config()
+        data["inbounds"][0]["listen"] = "10.0.0.2"
+        data["experimental"] = {"clash_api": {"secret": "target-api-secret"}}
+        self._write_config(data)
+        apply_users(self.ha_request(snapshot))
+        self.assertEqual(export_users(shared_config=True), snapshot)
+        actual = manager.read_config()
+        self.assertEqual(actual["inbounds"][0]["listen"], "10.0.0.2")
+        self.assertEqual(actual["experimental"], data["experimental"])
+        self.assertEqual(actual["inbounds"][-1], data["inbounds"][-1])
+
+    def test_ha_noop_does_not_reload_and_old_generations_cannot_overwrite(self):
+        self.create()
+        snapshot = export_users(shared_config=True)
+        self.reset_target()
+        apply_users(self.ha_request(snapshot))
+        with patch.object(manager, "_write_and_reload", wraps=self._write_config) as reload:
+            apply_users(self.ha_request(snapshot))
+            apply_users(self.ha_request(snapshot, generation=101))
+            reload.assert_not_called()
+        with self.assertRaises(manager.SingboxConfigError):
+            apply_users(self.ha_request(snapshot, generation=99))
+        changed = copy.deepcopy(snapshot)
+        changed["users"][0]["auth"][0]["credential"] = "new-credential"
+        with self.assertRaises(manager.SingboxConfigError):
+            apply_users(self.ha_request(changed, generation=101))
+        with self.assertRaises(manager.SingboxConfigError):
+            apply_users(self.request(snapshot))
+        self.assertEqual(export_users(shared_config=True), snapshot)
+
+    def test_ha_does_not_change_independent_customer_listener(self):
+        self.create()
+        snapshot = export_users(shared_config=True)
+        self.reset_target()
+        manager.create_user("independent", ["socks"], socks_username="other", socks_password="different")
+        before = self.config_path.read_bytes(), self.registry_path.read_bytes()
+        with self.assertRaises(manager.SingboxConfigError):
+            apply_users(self.ha_request(snapshot))
+        self.assertEqual(before, (self.config_path.read_bytes(), self.registry_path.read_bytes()))
+
+    def test_ha_rejects_port_conflict_and_preserves_versions_on_reload_failure(self):
+        self.create()
+        snapshot = export_users(shared_config=True)
+        self.reset_target()
+        bad = copy.deepcopy(snapshot)
+        bad["sharedConfig"]["vless"]["listen_port"] = 8888
+        with self.assertRaises(manager.SingboxConfigError):
+            apply_users(self.ha_request(bad))
+        before = self.config_path.read_bytes()
+        with patch.object(manager, "_write_and_reload", side_effect=manager.SingboxConfigError("reload failed")):
+            with self.assertRaises(manager.SingboxConfigError):
+                apply_users(self.ha_request(snapshot))
+        self.assertEqual(before, self.config_path.read_bytes())
+        self.assertFalse(self.registry_path.exists())
+        self.assertFalse(self.traffic_path.exists())
+
+    def test_ha_rejects_tls_local_files_and_api_port_collision(self):
+        self.create()
+        snapshot = export_users(shared_config=True)
+        for options in [{"tls": {"key_path": "/source/private.pem"}}, {"listen_port": 8088},
+                        {"tls": "invalid"}, {"listen_port": True}, {"type": "hysteria2"},
+                        {"tls": {"reality": {"private_key": "bad", "short_id": ["00"]}}}]:
+            bad = copy.deepcopy(snapshot)
+            bad["sharedConfig"]["vless"].update(options)
+            with self.assertRaises(manager.SingboxConfigError):
+                apply_users(self.ha_request(bad))
+
+    def test_ha_can_install_missing_managed_inbounds(self):
+        self.create()
+        snapshot = export_users(shared_config=True)
+        self.reset_target()
+        data = manager.read_config()
+        data["inbounds"] = [data["inbounds"][-1]]
+        self._write_config(data)
+        apply_users(self.ha_request(snapshot))
+        self.assertEqual(export_users(shared_config=True), snapshot)
+
+    def test_ha_readiness_requires_runtime_ports_and_exact_generation(self):
+        self.create()
+        snapshot = export_users(shared_config=True)
+        self.reset_target()
+        apply_users(self.ha_request(snapshot))
+        request = ha_readiness.ReadinessRequest(groupKey="test-group", generation=100)
+        with patch.object(manager, "is_singbox_running", return_value=True), \
+                patch.object(ha_readiness, "tcp_reachable", return_value=True):
+            self.assertTrue(ha_readiness.readiness(request)["ready"])
+            self.assertFalse(ha_readiness.readiness(request.model_copy(update={"generation": 99}))["ready"])
+        with patch.object(manager, "is_singbox_running", return_value=True), \
+                patch.object(ha_readiness, "tcp_reachable", return_value=False):
+            self.assertFalse(ha_readiness.readiness(request)["ready"])
+
+    def test_ha_export_authentication_and_validation_never_echo_keys(self):
+        self.create()
+        client = TestClient(main.app)
+        response = client.get("/api/users/replication?sharedConfig=true")
+        self.assertEqual(response.status_code, 401)
+        headers = {"Authorization": "Bearer test-token"}
+        response = client.get("/api/users/replication?sharedConfig=true", headers=headers)
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.headers["cache-control"], "no-store")
+        self.assertIn("sharedConfig", response.json())
+        response = client.post("/api/users/replication/readiness", headers=headers,
+                               json={"groupKey": "group", "generation": "private-key-secret"})
+        self.assertEqual(response.status_code, 422)
+        self.assertNotIn("private-key-secret", response.text)
+        with patch.object(main, "export_users", side_effect=manager.SingboxConfigError("private-key-secret")):
+            response = client.get("/api/users/replication?sharedConfig=true", headers=headers)
+        self.assertEqual(response.status_code, 409)
+        self.assertNotIn("private-key-secret", response.text)
+
+    def test_ha_requires_generation(self):
+        with self.assertRaises(ValidationError):
+            ReplicationRequest(groupKey="test-group", users=[], sharedConfig={})
+
+    def test_ha_removes_omitted_managed_protocol_without_leaving_credentials(self):
+        self.create()
+        snapshot = export_users(shared_config=True)
+        self.reset_target()
+        apply_users(self.ha_request(snapshot))
+        snapshot["sharedConfig"].pop("vmess")
+        snapshot["users"][0]["auth"] = [entry for entry in snapshot["users"][0]["auth"]
+                                         if entry["protocol"] != "vmess"]
+        apply_users(self.ha_request(snapshot, generation=101))
+        self.assertEqual(export_users(shared_config=True), snapshot)
+        self.assertFalse(any(item["type"] == "vmess" for item in manager.read_config()["inbounds"]))
+
+    def test_ha_omitted_protocol_with_independent_accounts_blocks_adoption(self):
+        self.create()
+        snapshot = export_users(shared_config=True)
+        snapshot["sharedConfig"].pop("vmess")
+        snapshot["users"][0]["auth"] = [entry for entry in snapshot["users"][0]["auth"]
+                                         if entry["protocol"] != "vmess"]
+        self.reset_target()
+        manager.create_user("independent", ["vmess"])
+        before = self.config_path.read_bytes(), self.registry_path.read_bytes()
+        with self.assertRaises(manager.SingboxConfigError):
+            apply_users(self.ha_request(snapshot))
+        self.assertEqual(before, (self.config_path.read_bytes(), self.registry_path.read_bytes()))
 
     def test_portable_snapshot_preserves_credentials_proxy_region_and_target_listeners(self):
         self.create()
@@ -218,6 +374,16 @@ class UserReplicationTest(unittest.TestCase):
         manager._write_registry(registry)
         with self.assertRaises(manager.SingboxConfigError):
             export_users()
+
+    def test_custom_outbound_options_are_not_silently_discarded(self):
+        self.create()
+        data = manager.read_config()
+        outbound = next(item for item in data["outbounds"]
+                        if item.get("tag") == manager.USER_OUTBOUND_PREFIX + "primary-7")
+        outbound["bind_interface"] = "eth-private"
+        self._write_config(data)
+        with self.assertRaises(manager.SingboxConfigError):
+            export_users(shared_config=True)
 
 
 if __name__ == "__main__":

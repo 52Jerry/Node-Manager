@@ -1,9 +1,11 @@
-"""Portable user replication; never import listeners, Reality keys or host settings."""
+"""Portable users and opt-in shared protocol configuration, applied atomically."""
 from __future__ import annotations
 
 from datetime import datetime, timezone
 import copy
 import re
+import hashlib
+import json
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -11,6 +13,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 from config import config
 from monitor import traffic
 from singbox import manager
+from ha_template import export_template, apply_template
 
 
 class StrictModel(BaseModel):
@@ -46,6 +49,8 @@ class PortableUser(StrictModel):
     maxSourceIps: int | None = Field(default=None, gt=0)
     upload: int = Field(default=0, ge=0)
     download: int = Field(default=0, ge=0)
+    remark: str | None = Field(default=None, max_length=1024)
+    tags: list[str] = Field(default_factory=list, max_length=32)
 
     @model_validator(mode="after")
     def unique_protocols(self):
@@ -62,6 +67,8 @@ class ReplicationRequest(StrictModel):
     users: list[PortableUser] = Field(max_length=10000)
     retired: list[PortableUser] = Field(default_factory=list, max_length=10000)
     aliases: dict[str, str] = Field(default_factory=dict)
+    sharedConfig: dict | None = None
+    generation: int | None = Field(default=None, gt=0)
 
     @model_validator(mode="after")
     def unique_users(self):
@@ -72,6 +79,10 @@ class ReplicationRequest(StrictModel):
         if len(self.aliases) > 10000 or any(not re.fullmatch(r"[A-Za-z0-9._-]{1,64}", value)
                                           for pair in self.aliases.items() for value in pair):
             raise ValueError("invalid aliases")
+        if self.sharedConfig is not None and self.generation is None:
+            raise ValueError("shared configuration requires a generation")
+        if any(len(tag) > 128 for user in [*self.users, *self.retired] for tag in user.tags):
+            raise ValueError("tag too long")
         return self
 
 
@@ -104,7 +115,7 @@ def _auth(data, registry, user_id):
     return entries
 
 
-def export_users():
+def export_users(shared_config=False):
     # Collection always takes this lock before accessing config or traffic.
     with traffic.collection_lock:
         with manager._config_lock():
@@ -122,6 +133,10 @@ def export_users():
                    for item in data.get("outbounds", [])):
                 raise manager.SingboxConfigError("multi-proxy users require a separate migration; replication refused")
             proxy = None
+            portable_outbound_fields = {"type", "tag", "server", "server_port", "username", "password"}
+            if outbound and (set(outbound) - portable_outbound_fields
+                             or (outbound.get("type") == "direct" and set(outbound) - {"type", "tag"})):
+                raise manager.SingboxConfigError("custom outbound options require a separate migration; replication refused")
             if outbound and outbound.get("type") in {"socks", "socks5"}:
                 proxy = {"server": outbound["server"], "port": outbound["server_port"],
                          "username": outbound.get("username"), "password": outbound.get("password")}
@@ -135,10 +150,14 @@ def export_users():
                 createdAt=metadata.get("createdAt"), expiresAt=metadata["expiresAt"],
                 trafficLimitBytes=metadata.get("trafficLimitBytes"), maxSourceIps=metadata.get("maxSourceIps"),
                 upload=int(usage.get("upload") or 0), download=int(usage.get("download") or 0),
+                remark=metadata.get("remark"), tags=metadata.get("tags") or [],
             ).model_dump(mode="json"))
         if len(users) > 10000:
             raise manager.SingboxConfigError("replication supports at most 10000 users per group")
-        return {"version": 1, "users": users}
+        snapshot = {"version": 1, "users": users}
+        if shared_config:
+            snapshot["sharedConfig"] = export_template(data)
+        return snapshot
 
 
 def _remove(data, registry, user_id):
@@ -162,6 +181,8 @@ def apply_users(request: ReplicationRequest):
     # Expired accounts are never recreated, even from an old disaster-recovery snapshot.
     desired = {user.userId: user for user in request.users if manager._as_utc(user.expiresAt) > now}
     retired = {user.userId: user for user in [*request.users, *request.retired] if user.userId not in desired}
+    digest = hashlib.sha256(json.dumps(request.model_dump(mode="json"), sort_keys=True,
+                                      separators=(",", ":")).encode()).hexdigest()
     with traffic.collection_lock:
         store = traffic.get_traffic_store_snapshot()
         original_store = copy.deepcopy(store)
@@ -169,6 +190,14 @@ def apply_users(request: ReplicationRequest):
         removed = set()
 
         def apply(data, registry):
+            previous = registry.get("replicationVersions", {}).get(request.groupKey, {})
+            if request.generation is None and previous:
+                raise manager.SingboxConfigError("versioned group cannot accept unversioned replication")
+            if request.generation is not None:
+                if request.generation < previous.get("generation", 0):
+                    raise manager.SingboxConfigError("stale replication generation refused")
+                if request.generation == previous.get("generation") and digest != previous.get("digest"):
+                    raise manager.SingboxConfigError("replication generation content conflict")
             enforcement_rules = []
             existing_ids = manager._discover_user_ids(data, registry)
             previous_metadata = {user_id: dict(manager._registry_user(registry, user_id)) for user_id in existing_ids}
@@ -219,10 +248,13 @@ def apply_users(request: ReplicationRequest):
                 _remove(data, registry, user_id)
                 if user_id not in desired:
                     removed.add(user_id)
+            if request.sharedConfig is not None:
+                apply_template(data, registry, request.sharedConfig, request.groupKey, desired, retired)
             for user_id, user in desired.items():
                 metadata = {"replicationOwner": request.groupKey, "createdAt": manager._iso(manager._as_utc(user.createdAt)),
                             "expiresAt": manager._iso(manager._as_utc(user.expiresAt)),
-                            "trafficLimitBytes": user.trafficLimitBytes, "maxSourceIps": user.maxSourceIps}
+                            "trafficLimitBytes": user.trafficLimitBytes, "maxSourceIps": user.maxSourceIps,
+                            "remark": user.remark, "tags": user.tags}
                 registry.setdefault("users", {})[user_id] = metadata
                 registry.setdefault("expiredUsers", {}).pop(user_id, None)
                 for auth in user.auth:
@@ -269,6 +301,9 @@ def apply_users(request: ReplicationRequest):
             data.setdefault("route", {}).setdefault("rules", [])[0:0] = enforcement_rules
             for user_id in removed:
                 store["users"].pop(user_id, None)
+            if request.generation is not None:
+                registry.setdefault("replicationVersions", {})[request.groupKey] = {
+                    "generation": request.generation, "digest": digest}
             # Persist counters before enabling credentials. Failed config reloads
             # restore the prior counters while collection remains locked.
             if store != original_store:

@@ -65,6 +65,7 @@ from monitor.traffic import (
 )
 from network_check import run_network_check
 from user_replication import ReplicationRequest, export_users, apply_users
+from ha_readiness import ReadinessRequest, readiness
 from monitor.health_check import (
     start_health_checker,
     stop_health_checker,
@@ -116,6 +117,8 @@ app.mount("/static", StaticFiles(directory=static_dir), name="static")
 
 @app.exception_handler(SingboxConfigError)
 async def singbox_error_handler(_request: Request, exc: SingboxConfigError):
+    if _request.url.path.startswith("/api/users/replication"):
+        return JSONResponse(status_code=409, content={"detail": "replication configuration conflict or runtime validation failed"})
     return JSONResponse(status_code=409, content={"detail": str(exc)})
 
 
@@ -126,7 +129,7 @@ async def idempotency_error_handler(_request: Request, exc: IdempotencyConflict)
 
 @app.exception_handler(RequestValidationError)
 async def validation_error_handler(request: Request, exc: RequestValidationError):
-    if request.url.path == "/api/users/replication":
+    if request.url.path.startswith("/api/users/replication"):
         # Pydantic errors otherwise echo submitted credentials in the input field.
         return JSONResponse(status_code=422, content={"detail": "invalid replication payload"})
     return await request_validation_exception_handler(request, exc)
@@ -281,14 +284,20 @@ def generate_residential_protocols(
 
 
 @app.get("/api/users/replication", tags=["users"])
-def export_replication(response: Response, _token: str = Depends(verify_token)):
+def export_replication(response: Response, sharedConfig: bool = False, _token: str = Depends(verify_token)):
     response.headers["Cache-Control"] = "no-store"
-    return export_users()
+    return export_users(shared_config=sharedConfig)
 
 
 @app.post("/api/users/replication", tags=["users"])
 def apply_replication(request: ReplicationRequest, _token: str = Depends(verify_token)):
     return apply_users(request)
+
+
+@app.post("/api/users/replication/readiness", tags=["users"])
+def replication_readiness(request: ReadinessRequest, response: Response, _token: str = Depends(verify_token)):
+    response.headers["Cache-Control"] = "no-store"
+    return readiness(request)
 
 
 @app.get("/api/users", response_model=UserListResponse, tags=["users"])
@@ -680,6 +689,7 @@ def get_agent_info(_token: str = Depends(verify_token)):
             "user.delete",
             "user.list",
             "user.replication.v1",
+            "user.replication.ha.v1",
             "user.connections",
             "proxy.bind",
             "proxy.bind.multiple",
