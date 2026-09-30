@@ -357,7 +357,7 @@ def delete_user_traffic(user_id: str) -> None:
             _write_store(store)
 
 
-def reset_user_traffic(user_id: str) -> dict[str, Any]:
+def reset_user_traffic(user_id: str, renewal_key: str | None = None) -> dict[str, Any]:
     """Reset a user's usage while preserving the connection sampling baseline.
 
     The active connection counters must remain in the store. Otherwise the
@@ -368,6 +368,8 @@ def reset_user_traffic(user_id: str) -> dict[str, Any]:
         with traffic_lock:
             store = _read_store()
             user = store["users"].setdefault(user_id, {})
+            if renewal_key is not None and user.get("lastRenewalResetKey") == renewal_key:
+                return {"success": True, "userId": user_id, "trafficReset": False}
             user.update(
                 {
                     "upload": 0,
@@ -379,6 +381,8 @@ def reset_user_traffic(user_id: str) -> dict[str, Any]:
                     "updatedAt": _now(),
                 }
             )
+            if renewal_key is not None:
+                user["lastRenewalResetKey"] = renewal_key
             _write_store(store)
 
     sync_user_enforcements(

@@ -11,6 +11,8 @@ from typing import Literal
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, Response
 from fastapi.responses import FileResponse, JSONResponse
+from fastapi.exceptions import RequestValidationError
+from fastapi.exception_handlers import request_validation_exception_handler
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
@@ -62,6 +64,7 @@ from monitor.traffic import (
     reset_user_traffic,
 )
 from network_check import run_network_check
+from user_replication import ReplicationRequest, export_users, apply_users
 from monitor.health_check import (
     start_health_checker,
     stop_health_checker,
@@ -119,6 +122,14 @@ async def singbox_error_handler(_request: Request, exc: SingboxConfigError):
 @app.exception_handler(IdempotencyConflict)
 async def idempotency_error_handler(_request: Request, exc: IdempotencyConflict):
     return JSONResponse(status_code=409, content={"detail": str(exc)})
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_error_handler(request: Request, exc: RequestValidationError):
+    if request.url.path == "/api/users/replication":
+        # Pydantic errors otherwise echo submitted credentials in the input field.
+        return JSONResponse(status_code=422, content={"detail": "invalid replication payload"})
+    return await request_validation_exception_handler(request, exc)
 
 
 @app.on_event("startup")
@@ -269,6 +280,17 @@ def generate_residential_protocols(
     }
 
 
+@app.get("/api/users/replication", tags=["users"])
+def export_replication(response: Response, _token: str = Depends(verify_token)):
+    response.headers["Cache-Control"] = "no-store"
+    return export_users()
+
+
+@app.post("/api/users/replication", tags=["users"])
+def apply_replication(request: ReplicationRequest, _token: str = Depends(verify_token)):
+    return apply_users(request)
+
+
 @app.get("/api/users", response_model=UserListResponse, tags=["users"])
 def get_users(
     page: int = Query(default=1, ge=1),
@@ -404,7 +426,9 @@ def bind_proxy_endpoint(
         idempotency_key,
         "bind-proxy",
         request.model_dump(mode="json"),
-        lambda: bind_proxy(request.userId, request.proxy.model_dump()),
+        lambda: bind_proxy(
+            request.userId, request.proxy.model_dump(), request.syncSocksCredentials
+        ),
     )
     response.headers["Idempotency-Replayed"] = str(replayed).lower()
     return result
@@ -548,7 +572,7 @@ def renew_user_endpoint(
         max_source_ips=request.maxSourceIps,
     )
     if request.resetTraffic:
-        traffic = reset_user_traffic(userId)
+        traffic = reset_user_traffic(userId, renewal_key=result["expiresAt"])
         result.update(traffic)
     else:
         result["trafficReset"] = False
@@ -655,6 +679,7 @@ def get_agent_info(_token: str = Depends(verify_token)):
             "user.create.uuid",
             "user.delete",
             "user.list",
+            "user.replication.v1",
             "user.connections",
             "proxy.bind",
             "proxy.bind.multiple",

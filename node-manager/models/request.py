@@ -144,6 +144,7 @@ class RenewUserRequest(BaseModel):
 class BindProxyRequest(BaseModel):
     userId: str = Field(min_length=1, max_length=64, pattern=r"^[A-Za-z0-9._-]+$")
     proxy: ProxyDescriptor
+    syncSocksCredentials: bool = False
 
 
 class BindMultipleProxiesRequest(BaseModel):

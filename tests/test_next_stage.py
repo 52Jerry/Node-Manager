@@ -113,6 +113,82 @@ class ManagerTestCase(unittest.TestCase):
     def _write_config(self, data):
         self.config_path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
 
+    def test_explicit_credential_edit_updates_inbound_outbound_links_and_enforcement(self):
+        created = manager.create_user(
+            "edit-user", ["vless", "vmess", "socks"],
+            socks_username="old-account", socks_password="old-password",
+        )
+        manager.sync_user_enforcements({"edit-user": {"trafficBlocked": True, "blockedSourceIps": []}})
+        manager.bind_proxy("edit-user", {
+            "server": "203.0.113.20", "port": 1080,
+            "username": "new-account", "password": "new-password",
+        }, sync_socks_credentials=True)
+        data = manager.read_config()
+        socks = next(item for item in data["inbounds"] if item["tag"] == "socks")
+        self.assertEqual(socks["users"], [{"username": "new-account", "password": "new-password"}])
+        outbound = next(item for item in data["outbounds"] if item["type"] == "socks")
+        self.assertEqual(outbound["username"], "new-account")
+        self.assertEqual(outbound["password"], "new-password")
+        for rule in data["route"]["rules"]:
+            if "auth_user" in rule:
+                self.assertNotIn("old-account", rule["auth_user"])
+                self.assertIn("new-account", rule["auth_user"])
+        connections = manager.get_user_connection("edit-user")
+        self.assertEqual(connections["uuid"], created["uuid"])
+        self.assertEqual(connections["socks"]["password"], "new-password")
+        self.assertEqual(manager.get_user_proxy("edit-user")["username"], "new-account")
+        self.assertEqual(connections["protocolInfo"]["password"], "new-password")
+        self.assertEqual(manager.read_registry()["users"]["edit-user"]["expiresAt"], created["expiresAt"])
+        manager.sync_user_enforcements({"edit-user": {"trafficBlocked": False, "blockedSourceIps": []}})
+        self.assertFalse(any(rule.get("action") == "reject" for rule in manager.read_config()["route"]["rules"]))
+
+    def test_credential_edit_preserves_source_ip_and_expiration_blocks(self):
+        manager.create_user("edit-user", ["socks"], socks_username="old-account", socks_password="old")
+        manager.sync_user_enforcements({"edit-user": {"blockedSourceIps": ["198.51.100.3"]}})
+        now = datetime.now(timezone.utc)
+        registry = manager.read_registry()
+        registry["users"]["edit-user"]["expiresAt"] = (now - timedelta(hours=1)).isoformat()
+        self.registry_path.write_text(json.dumps(registry, indent=2) + "\n", encoding="utf-8")
+        with patch.object(manager.singbox_api, "get_connections", return_value={"connections": []}):
+            manager.process_user_expirations(now)
+        manager.bind_proxy("edit-user", {
+            "server": "203.0.113.20", "port": 1080, "username": "new-account", "password": "new",
+        }, sync_socks_credentials=True)
+        rules = manager.read_config()["route"]["rules"]
+        self.assertEqual([rule["action"] for rule in rules[:3]], ["reject", "reject", "route"])
+        self.assertTrue(all("new-account" in rule["auth_user"] for rule in rules))
+        manager.sync_user_enforcements({"edit-user": {"blockedSourceIps": []}})
+        self.assertEqual(sum(rule["action"] == "reject" for rule in manager.read_config()["route"]["rules"]), 1)
+        manager.update_user_expiration("edit-user", datetime.now(timezone.utc) + timedelta(days=1))
+        self.assertFalse(any(rule["action"] == "reject" for rule in manager.read_config()["route"]["rules"]))
+
+    def test_credential_edit_rejects_duplicate_username_without_mutation(self):
+        manager.create_user("edit-user", ["socks"], socks_username="first", socks_password="old")
+        manager.create_user("other-user", ["socks"], socks_username="taken", socks_password="other")
+        before = self.config_path.read_bytes(), self.registry_path.read_bytes()
+        with self.assertRaises(manager.SingboxConfigError):
+            manager.bind_proxy("edit-user", {
+                "server": "203.0.113.20", "port": 1080, "username": "taken", "password": "new",
+            }, sync_socks_credentials=True)
+        self.assertEqual(before, (self.config_path.read_bytes(), self.registry_path.read_bytes()))
+
+    def test_credential_edit_reload_failure_restores_registry(self):
+        manager.create_user("edit-user", ["socks"], socks_username="old-account", socks_password="old")
+        before = self.config_path.read_bytes(), self.registry_path.read_bytes()
+        with patch.object(manager, "_write_and_reload", side_effect=RuntimeError("reload failed")):
+            with self.assertRaises(RuntimeError):
+                manager.bind_proxy("edit-user", {
+                    "server": "203.0.113.20", "port": 1080, "username": "new-account", "password": "new",
+                }, sync_socks_credentials=True)
+        self.assertEqual(before, (self.config_path.read_bytes(), self.registry_path.read_bytes()))
+
+    def test_proxy_rebind_without_explicit_edit_preserves_socks_credentials(self):
+        manager.create_user("edit-user", ["socks"], socks_username="local-user", socks_password="local-password")
+        manager.bind_proxy("edit-user", {
+            "server": "203.0.113.20", "port": 1080, "username": "upstream-user", "password": "upstream-password",
+        })
+        self.assertEqual(manager.get_user_connection("edit-user")["socks"]["password"], "local-password")
+
     def test_custom_socks_credentials_follow_bind_list_and_delete(self):
         created = manager.create_user(
             "customer-1",
@@ -622,6 +698,36 @@ class ManagerTestCase(unittest.TestCase):
         with self.assertRaisesRegex(manager.SingboxConfigError, "SOCKS username already exists"):
             manager.create_user("customer-4", ["socks"], socks_username="shared-user")
 
+    def test_batch_residential_endpoints_with_shared_upstream_account_route_independently(self):
+        endpoints = [("200.36.30.206", 36214), ("91.149.231.14", 50101), ("169.40.131.205", 50101)]
+        for index, (server, port) in enumerate(endpoints):
+            user_id = f"res-{index:032x}"
+            proxy = {
+                "type": "socks5", "server": server, "port": port, "sourceIp": server,
+                "username": "shared-upstream", "password": "test-upstream-password",
+            }
+            created = manager.create_user(user_id, ["vless", "vmess", "socks"], proxy=proxy)
+            self.assertTrue(created["success"])
+            self.assertEqual(created["socks"]["username"], user_id)
+            self.assertEqual(created["protocolInfo"]["rawUsername"], proxy["username"])
+            self.assertEqual(created["protocolInfo"]["rawPassword"], proxy["password"])
+            self.assertEqual(created["protocolInfo"]["sourceIp"], server)
+            self.assertEqual(manager.get_user_proxy(user_id)["server"], server)
+
+        data = manager.read_config()
+        self.assertEqual(len(manager.list_users()), 3)
+        socks = next(item for item in data["inbounds"] if item["tag"] == "socks")
+        self.assertEqual(len({user["username"] for user in socks["users"]}), 3)
+        for index, (server, port) in enumerate(endpoints):
+            user_id = f"res-{index:032x}"
+            outbound_tag = f"node-manager-out:{user_id}"
+            outbound = next(item for item in data["outbounds"] if item["tag"] == outbound_tag)
+            self.assertEqual((outbound["server"], outbound["server_port"]), (server, port))
+            self.assertEqual(outbound["username"], "shared-upstream")
+            self.assertEqual(outbound["password"], "test-upstream-password")
+            rule = next(item for item in data["route"]["rules"] if item.get("outbound") == outbound_tag)
+            self.assertEqual(set(rule["auth_user"]), {user_id, f"node-manager:{user_id}"})
+
     def test_duplicate_upstream_socks_identity_is_rejected(self):
         proxy = {
             "type": "socks5",
@@ -632,7 +738,10 @@ class ManagerTestCase(unittest.TestCase):
         }
         manager.create_user("duplicate-source-1", ["socks"], proxy=proxy)
 
-        with self.assertRaisesRegex(manager.SingboxConfigError, "当前IP已经存在"):
+        with self.assertRaisesRegex(manager.SingboxConfigError, "当前已有这条住宅IP的连接了"):
+            manager.create_user("duplicate-source-1", ["socks"], proxy=proxy)
+
+        with self.assertRaisesRegex(manager.SingboxConfigError, "当前已有这条住宅IP的连接了"):
             manager.create_user(
                 "duplicate-source-2",
                 ["socks"],
@@ -710,7 +819,7 @@ class ManagerTestCase(unittest.TestCase):
         manager.create_user("batch-conflict-user", ["socks"])
         original = self.config_path.read_text(encoding="utf-8")
 
-        with self.assertRaisesRegex(manager.SingboxConfigError, "当前IP已经存在"):
+        with self.assertRaisesRegex(manager.SingboxConfigError, "当前已有这条住宅IP的连接了"):
             manager.bind_multiple_proxies(
                 "batch-conflict-user",
                 [
@@ -774,7 +883,7 @@ class ManagerTestCase(unittest.TestCase):
         self.assertIsNone(updated["trafficLimitBytes"])
         self.assertEqual(updated["maxSourceIps"], 1)
 
-    def test_user_expiration_blocks_then_can_be_restored_within_72_hours(self):
+    def test_user_expiration_blocks_then_can_be_restored_within_24_hours(self):
         manager.create_user("expiring-user", ["socks"])
         now = datetime.now(timezone.utc).replace(microsecond=0)
         registry = json.loads(self.registry_path.read_text(encoding="utf-8"))
@@ -812,7 +921,7 @@ class ManagerTestCase(unittest.TestCase):
         manager.create_user("archive-user", ["socks"])
         now = datetime.now(timezone.utc).replace(microsecond=0)
         registry = json.loads(self.registry_path.read_text(encoding="utf-8"))
-        registry["users"]["archive-user"]["expiresAt"] = (now - timedelta(hours=73)).isoformat()
+        registry["users"]["archive-user"]["expiresAt"] = (now - timedelta(hours=24)).isoformat()
         self.registry_path.write_text(json.dumps(registry, indent=2) + "\n", encoding="utf-8")
 
         self.assertEqual(manager.process_user_expirations(now), 1)
@@ -995,6 +1104,25 @@ class ApiTestCase(unittest.TestCase):
     def _write_config(self, data):
         self.config_path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
 
+    def test_bind_proxy_endpoint_syncs_credentials_and_accepts_later_edits(self):
+        headers = {"Authorization": "Bearer test-token"}
+        manager.create_user("credential-api", ["vless", "socks"],
+                            socks_username="old-account", socks_password="old-password")
+        original_uuid = manager.get_user_connection("credential-api")["uuid"]
+        for username, password in [("new-account", "new-password"), ("next-account", "next-password")]:
+            response = self.client.post("/api/user/bind-proxy", headers=headers, json={
+                "userId": "credential-api",
+                "syncSocksCredentials": True,
+                "proxy": {"server": "203.0.113.20", "port": 1080,
+                          "username": username, "password": password},
+            })
+            self.assertEqual(response.status_code, 200, response.text)
+            connection = self.client.get("/api/user/credential-api/connections", headers=headers).json()
+            self.assertEqual(connection["socks"]["username"], username)
+            self.assertEqual(connection["socks"]["password"], password)
+            self.assertEqual(connection["uuid"], original_uuid)
+            self.assertEqual(manager.get_user_proxy("credential-api")["password"], password)
+
     def test_create_user_and_list_endpoints(self):
         headers = {"Authorization": "Bearer test-token"}
         response = self.client.post(
@@ -1064,6 +1192,37 @@ class ApiTestCase(unittest.TestCase):
             [item["userId"] for item in response.json()["items"]],
             ["sort-z", "sort-a"],
         )
+
+    def test_renewal_retries_do_not_reset_new_traffic_or_shorten_expiration(self):
+        headers = {"Authorization": "Bearer test-token"}
+        manager.create_user("renew-api-user", ["socks"])
+        expiry = datetime.now(timezone.utc) + timedelta(days=60)
+        payload = {"expiresAt": expiry.isoformat(), "resetTraffic": True}
+
+        first = self.client.post("/api/user/renew-api-user/renew", headers=headers, json=payload)
+        self.assertEqual(first.status_code, 200, first.text)
+        self.assertTrue(first.json()["trafficReset"])
+
+        store = json.loads(self.traffic_path.read_text(encoding="utf-8"))
+        store["users"]["renew-api-user"]["download"] = 1234
+        self.traffic_path.write_text(json.dumps(store), encoding="utf-8")
+
+        retry = self.client.post("/api/user/renew-api-user/renew", headers=headers, json=payload)
+        self.assertEqual(retry.status_code, 200, retry.text)
+        self.assertFalse(retry.json()["trafficReset"])
+        store = json.loads(self.traffic_path.read_text(encoding="utf-8"))
+        self.assertEqual(store["users"]["renew-api-user"]["download"], 1234)
+
+        stale_payload = {"expiresAt": (expiry - timedelta(days=1)).isoformat()}
+        stale = self.client.post("/api/user/renew-api-user/renew", headers=headers, json=stale_payload)
+        self.assertEqual(stale.status_code, 409, stale.text)
+
+        payload["expiresAt"] = (expiry + timedelta(days=30)).isoformat()
+        next_renewal = self.client.post("/api/user/renew-api-user/renew", headers=headers, json=payload)
+        self.assertEqual(next_renewal.status_code, 200, next_renewal.text)
+        self.assertTrue(next_renewal.json()["trafficReset"])
+        store = json.loads(self.traffic_path.read_text(encoding="utf-8"))
+        self.assertEqual(store["users"]["renew-api-user"]["download"], 0)
 
     def test_user_list_exposes_proxy_metadata_and_batch_deletes(self):
         headers = {"Authorization": "Bearer test-token"}

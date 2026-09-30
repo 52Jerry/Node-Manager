@@ -30,6 +30,7 @@ from protocols import (
     socks_acceleration,
     vmess,
     vless,
+    trojan,
 )
 from .api import SingboxAPI
 
@@ -51,7 +52,7 @@ ENFORCEMENT_AUTH_USERS_KEY = "enforcementAuthUsers"
 EXPIRATION_AUTH_USERS_KEY = "expirationAuthUsers"
 EXPIRATION_BLOCKED_KEY = "expirationBlocked"
 DEFAULT_USER_LIFETIME = timedelta(days=30)
-RESTORE_WINDOW = timedelta(hours=72)
+RESTORE_WINDOW = timedelta(hours=24)
 expiration_stop = threading.Event()
 expiration_thread: threading.Thread | None = None
 singbox_api = SingboxAPI()
@@ -973,6 +974,8 @@ def create_user(
         raise SingboxConfigError("expiresAt must be in the future")
 
     def apply(data: dict[str, Any], registry: dict[str, Any]) -> dict[str, Any]:
+        if proxy is not None:
+            _assert_proxy_available(data, "", proxy)
         if _user_exists(data, registry, user_id):
             raise SingboxConfigError(f"user already exists: {user_id}")
         if "socks" in protocols and _auth_identifier_exists(data, effective_socks_username):
@@ -1136,6 +1139,8 @@ def renew_user(
         old_expiry = _as_utc(metadata.get("expiresAt"))
         if old_expiry is not None and now >= old_expiry + RESTORE_WINDOW:
             raise SingboxConfigError("user restore window has expired")
+        if old_expiry is not None and new_expiry < old_expiry:
+            raise SingboxConfigError("renewal cannot shorten the existing expiration")
 
         if traffic_limit_bytes is not None:
             metadata["trafficLimitBytes"] = _positive_policy_value(
@@ -1398,7 +1403,7 @@ def start_expiration_scheduler() -> None:
     process_user_expirations()
 
     def run() -> None:
-        while not expiration_stop.wait(60):
+        while not expiration_stop.wait(5):
             try:
                 process_user_expirations()
             except Exception:
@@ -1770,10 +1775,10 @@ def _assert_proxy_available(
         proxy.get("password"),
     )
     if identity in _configured_proxy_identities(data, exclude_user_id=user_id):
-        raise SingboxConfigError("当前IP已经存在")
+        raise SingboxConfigError("当前已有这条住宅IP的连接了")
     if batch_identities is not None:
         if identity in batch_identities:
-            raise SingboxConfigError("当前IP已经存在")
+            raise SingboxConfigError("当前已有这条住宅IP的连接了")
         batch_identities.add(identity)
 
 
@@ -1852,11 +1857,64 @@ def _set_direct_binding(data: dict[str, Any], registry: dict[str, Any], user_id:
         )
 
 
-def bind_proxy(user_id: str, proxy: dict[str, Any]) -> dict[str, Any]:
+def _update_socks_credentials(
+    data: dict[str, Any], registry: dict[str, Any], user_id: str, username: str, password: str
+) -> None:
+    if not username or not password or len(username.encode("utf-8")) > 255 or len(password.encode("utf-8")) > 255:
+        raise SingboxConfigError("SOCKS credentials must contain 1 to 255 bytes")
+    if username.startswith(USER_PREFIX):
+        raise SingboxConfigError("SOCKS username uses a reserved prefix")
+    old_names = _user_auth_names(registry, user_id)
+    targets = [
+        user for inbound in data.get("inbounds", [])
+        if inbound.get("tag") == config.singbox.socks_tag
+        for user in inbound.get("users", []) if user.get("username") in old_names
+    ]
+    if not targets:
+        return
+    if any(
+        (user.get("username") == username or user.get("name") == username)
+        and not any(user is target for target in targets)
+        for inbound in data.get("inbounds", []) for user in inbound.get("users", [])
+    ):
+        raise SingboxConfigError("SOCKS username already exists")
+
+    replaced_names = {str(user["username"]) for user in targets}
+    retained_names = {
+        str(user["name"]) for inbound in data.get("inbounds", [])
+        for user in inbound.get("users", []) if user.get("name") in replaced_names
+    }
+
+    def replace_names(names):
+        return sorted({
+            username if str(name) in replaced_names else str(name) for name in names
+        } | (retained_names & set(names)))
+
+    # Keep routing, expiration and traffic/source-IP enforcement on the new identity.
+    for rule in data.get("route", {}).get("rules", []):
+        if isinstance(rule.get("auth_user"), list):
+            rule["auth_user"] = replace_names(rule["auth_user"])
+    metadata = registry.setdefault("users", {}).setdefault(user_id, {})
+    for key in (ENFORCEMENT_AUTH_USERS_KEY, EXPIRATION_AUTH_USERS_KEY):
+        if isinstance(metadata.get(key), list):
+            metadata[key] = replace_names(metadata[key])
+    for user in targets:
+        user.update(username=username, password=password)
+    metadata["socksUsername"] = username
+
+
+def bind_proxy(
+    user_id: str, proxy: dict[str, Any], sync_socks_credentials: bool = False
+) -> dict[str, Any]:
     def apply(data: dict[str, Any], registry: dict[str, Any]) -> dict[str, Any]:
         if not _user_exists(data, registry, user_id):
             raise SingboxConfigError(f"user not found: {user_id}")
 
+        if sync_socks_credentials:
+            _update_socks_credentials(
+                data, registry, user_id, str(proxy.get("username") or ""),
+                str(proxy.get("password") or ""),
+            )
         _save_proxy_metadata(registry, user_id, proxy)
         _set_proxy_binding(data, registry, user_id, proxy)
         _audit("proxy.bind", user_id, server=str(proxy.get("server")), port=int(proxy.get("port")))
