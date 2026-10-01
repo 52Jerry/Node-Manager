@@ -1903,13 +1903,61 @@ def _update_socks_credentials(
     metadata["socksUsername"] = username
 
 
+def _rotate_protocol_credentials(
+    data: dict[str, Any], registry: dict[str, Any], user_id: str, new_uuid: str
+) -> int:
+    try:
+        parsed = uuid.UUID(str(new_uuid))
+    except (ValueError, AttributeError, TypeError) as exc:
+        raise SingboxConfigError("invalid uuid for credential rotation") from exc
+    if parsed.version != 4:
+        raise SingboxConfigError("credential rotation requires a UUID v4")
+
+    normalized_uuid = str(parsed)
+    auth_names = _user_auth_names(registry, user_id)
+    credential_fields = {
+        config.singbox.vless_tag: "uuid",
+        config.singbox.vmess_tag: "uuid",
+        config.singbox.trojan_tag: "password",
+    }
+
+    # Do not silently create a duplicate inbound credential for another user.
+    for inbound in data.get("inbounds", []):
+        field = credential_fields.get(str(inbound.get("tag")))
+        if field is None:
+            continue
+        for user in inbound.get("users", []):
+            identity = user.get("name") or user.get("username")
+            if identity not in auth_names and user.get(field) == normalized_uuid:
+                raise SingboxConfigError("uuid already exists")
+
+    changed = 0
+    for inbound in data.get("inbounds", []):
+        field = credential_fields.get(str(inbound.get("tag")))
+        if field is None:
+            continue
+        for user in inbound.get("users", []):
+            if user.get("name") in auth_names or user.get("username") in auth_names:
+                user[field] = normalized_uuid
+                changed += 1
+    return changed
+
+
 def bind_proxy(
-    user_id: str, proxy: dict[str, Any], sync_socks_credentials: bool = False
+    user_id: str,
+    proxy: dict[str, Any],
+    sync_socks_credentials: bool = False,
+    new_uuid: str | None = None,
 ) -> dict[str, Any]:
     def apply(data: dict[str, Any], registry: dict[str, Any]) -> dict[str, Any]:
         if not _user_exists(data, registry, user_id):
             raise SingboxConfigError(f"user not found: {user_id}")
 
+        rotated_protocols = 0
+        if new_uuid:
+            rotated_protocols = _rotate_protocol_credentials(
+                data, registry, user_id, new_uuid
+            )
         if sync_socks_credentials:
             _update_socks_credentials(
                 data, registry, user_id, str(proxy.get("username") or ""),
@@ -1918,6 +1966,8 @@ def bind_proxy(
         _save_proxy_metadata(registry, user_id, proxy)
         _set_proxy_binding(data, registry, user_id, proxy)
         _audit("proxy.bind", user_id, server=str(proxy.get("server")), port=int(proxy.get("port")))
+        if rotated_protocols:
+            _audit("credentials.rotate", user_id, protocols=rotated_protocols)
         return {"success": True, "userId": user_id, "message": "proxy bound"}
 
     return mutate_config(apply)

@@ -182,6 +182,63 @@ class ManagerTestCase(unittest.TestCase):
                 }, sync_socks_credentials=True)
         self.assertEqual(before, (self.config_path.read_bytes(), self.registry_path.read_bytes()))
 
+    def test_credential_rotation_updates_all_protocol_credentials_atomically(self):
+        config_data = manager.read_config()
+        config_data["inbounds"].append({
+            "type": "trojan",
+            "tag": "trojan",
+            "listen_port": 20170,
+            "tls": json.loads(json.dumps(config_data["inbounds"][0]["tls"])),
+            "users": [],
+        })
+        self._write_config(config_data)
+        created = manager.create_user(
+            "rotate-user",
+            ["vless", "vmess", "trojan", "socks"],
+            socks_username="old-account",
+            socks_password="old-password",
+        )
+        rotated_uuid = "22222222-2222-4222-8222-222222222222"
+
+        manager.bind_proxy(
+            "rotate-user",
+            {
+                "server": "203.0.113.20",
+                "port": 1080,
+                "username": "new-account",
+                "password": "new-password",
+            },
+            sync_socks_credentials=True,
+            new_uuid=rotated_uuid,
+        )
+
+        data = manager.read_config()
+        inbounds = {item["tag"]: item for item in data["inbounds"]}
+        self.assertEqual(
+            next(user for user in inbounds["vless-reality"]["users"]
+                 if user["name"] == "node-manager:rotate-user")["uuid"],
+            rotated_uuid,
+        )
+        self.assertEqual(
+            next(user for user in inbounds["vmess"]["users"]
+                 if user["name"] == "node-manager:rotate-user")["uuid"],
+            rotated_uuid,
+        )
+        self.assertEqual(
+            next(user for user in inbounds["trojan"]["users"]
+                 if user["name"] == "node-manager:rotate-user")["password"],
+            rotated_uuid,
+        )
+        self.assertEqual(
+            next(user for user in inbounds["socks"]["users"]
+                 if user["username"] == "new-account")["password"],
+            "new-password",
+        )
+        connection = manager.get_user_connection("rotate-user")
+        self.assertEqual(connection["uuid"], rotated_uuid)
+        self.assertNotEqual(connection["vless"], created["vless"])
+        self.assertNotEqual(connection["vmess"], created["vmess"])
+
     def test_proxy_rebind_without_explicit_edit_preserves_socks_credentials(self):
         manager.create_user("edit-user", ["socks"], socks_username="local-user", socks_password="local-password")
         manager.bind_proxy("edit-user", {
@@ -1122,6 +1179,30 @@ class ApiTestCase(unittest.TestCase):
             self.assertEqual(connection["socks"]["password"], password)
             self.assertEqual(connection["uuid"], original_uuid)
             self.assertEqual(manager.get_user_proxy("credential-api")["password"], password)
+
+    def test_bind_proxy_endpoint_rotates_protocol_uuid(self):
+        headers = {"Authorization": "Bearer test-token"}
+        manager.create_user("credential-rotate-api", ["vless", "vmess", "socks"],
+                            socks_username="old-account", socks_password="old-password")
+        rotated_uuid = "33333333-3333-4333-8333-333333333333"
+        response = self.client.post("/api/user/bind-proxy", headers=headers, json={
+            "userId": "credential-rotate-api",
+            "syncSocksCredentials": True,
+            "uuid": rotated_uuid,
+            "proxy": {
+                "server": "203.0.113.20",
+                "port": 1080,
+                "username": "new-account",
+                "password": "new-password",
+            },
+        })
+        self.assertEqual(response.status_code, 200, response.text)
+        connection = self.client.get(
+            "/api/user/credential-rotate-api/connections", headers=headers
+        ).json()
+        self.assertEqual(connection["uuid"], rotated_uuid)
+        self.assertEqual(connection["socks"]["username"], "new-account")
+        self.assertEqual(connection["socks"]["password"], "new-password")
 
     def test_create_user_and_list_endpoints(self):
         headers = {"Authorization": "Bearer test-token"}

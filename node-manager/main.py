@@ -436,7 +436,10 @@ def bind_proxy_endpoint(
         "bind-proxy",
         request.model_dump(mode="json"),
         lambda: bind_proxy(
-            request.userId, request.proxy.model_dump(), request.syncSocksCredentials
+            request.userId,
+            request.proxy.model_dump(),
+            request.syncSocksCredentials,
+            request.uuid or None,
         ),
     )
     response.headers["Idempotency-Replayed"] = str(replayed).lower()

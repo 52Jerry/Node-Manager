@@ -145,6 +145,14 @@ class BindProxyRequest(BaseModel):
     userId: str = Field(min_length=1, max_length=64, pattern=r"^[A-Za-z0-9._-]+$")
     proxy: ProxyDescriptor
     syncSocksCredentials: bool = False
+    uuid: str = Field(default="", max_length=64)
+
+    @field_validator("uuid")
+    @classmethod
+    def uuid_must_be_valid(cls, value: str) -> str:
+        if value and not _UUID_PATTERN.match(value):
+            raise ValueError("uuid must be a valid UUID v4 string")
+        return value
 
 
 class BindMultipleProxiesRequest(BaseModel):
