@@ -581,13 +581,16 @@ class ManagerTestCase(unittest.TestCase):
         })
         self._write_config(data)
 
+        old_time = datetime(2020, 1, 1, tzinfo=timezone.utc).timestamp()
+        os.utime(self.config_path, (old_time, old_time))
         self.assertEqual(manager.migrate_user_expirations(), 1)
+        self.assertEqual(manager.migrate_user_expirations(), 0)
         registry = json.loads(self.registry_path.read_text(encoding="utf-8"))
         metadata = registry["users"]["config-only-user"]
         self.assertNotIn("manual-socks-user", registry["users"])
-        created_at = datetime.fromisoformat(metadata["createdAt"])
-        expires_at = datetime.fromisoformat(metadata["expiresAt"])
-        self.assertEqual(expires_at - created_at, timedelta(days=30))
+        self.assertEqual(datetime.fromisoformat(metadata["createdAt"]).year, 2020)
+        self.assertNotIn("expiresAt", metadata)
+        self.assertEqual(manager.process_user_expirations(), 0)
         self.assertEqual(
             manager.list_users()[0]["expirationStatus"],
             "ACTIVE",
@@ -599,6 +602,40 @@ class ManagerTestCase(unittest.TestCase):
         migrated = json.loads(self.config_path.read_text(encoding="utf-8"))
         socks_users = next(item for item in migrated["inbounds"] if item["tag"] == "socks")["users"]
         self.assertIn({"username": "manual-socks-user", "password": "manual-socks-password"}, socks_users)
+
+    def test_unknown_historical_expiration_does_not_change_credentials_or_policy(self):
+        for expiry in (None, "", "not-a-date"):
+            with self.subTest(expiry=expiry):
+                user_id = "unknown-expiration"
+                created = manager.create_user(user_id, ["vless", "vmess", "socks"],
+                                              traffic_limit_bytes=123456, max_source_ips=5)
+                registry = json.loads(self.registry_path.read_text(encoding="utf-8"))
+                metadata = registry["users"][user_id]
+                metadata["createdAt"] = "2020-01-01T00:00:00+00:00"
+                metadata["expiresAt"] = expiry
+                self.registry_path.write_text(json.dumps(registry), encoding="utf-8")
+                config_before = self.config_path.read_text(encoding="utf-8")
+                with patch.object(manager.singbox_api, "close_connection") as close:
+                    self.assertEqual(manager.migrate_user_expirations(), 0)
+                    self.assertEqual(manager.process_user_expirations(), 0)
+                    user = next(item for item in manager.list_users() if item["userId"] == user_id)
+                    self.assertEqual(user["expiresAt"], expiry)
+                    self.assertEqual(user["expirationStatus"], "ACTIVE")
+                    close.assert_not_called()
+                self.assertEqual(self.config_path.read_text(encoding="utf-8"), config_before)
+                self.assertEqual(json.loads(self.registry_path.read_text(encoding="utf-8")), registry)
+                connection = manager.get_user_connection(user_id)
+                self.assertEqual(connection["uuid"], created["uuid"])
+                self.assertEqual(connection["protocols"], ["vless", "vmess", "socks"])
+                self.assertEqual(manager.get_user_policy(user_id)["trafficLimitBytes"], 123456)
+                manager.delete_user(user_id)
+
+    def test_new_users_still_receive_default_expiration(self):
+        manager.create_user("new-default", ["socks"])
+        metadata = json.loads(self.registry_path.read_text(encoding="utf-8"))["users"]["new-default"]
+        self.assertEqual(datetime.fromisoformat(metadata["expiresAt"])
+                         - datetime.fromisoformat(metadata["createdAt"]), timedelta(days=30))
+        self.assertEqual(manager.migrate_user_expirations(), 0)
 
     def test_create_can_atomically_bind_proxy_without_reusing_upstream_credentials(self):
         created = manager.create_user(

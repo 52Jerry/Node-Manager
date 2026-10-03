@@ -201,7 +201,7 @@ def _config_user_ids(data: dict[str, Any], registry: dict[str, Any]) -> set[str]
 
 
 def migrate_user_expirations() -> int:
-    """为旧版本用户补齐创建时间后 30 天的默认有效期。"""
+    """Register historical users without inventing expiration dates."""
     if not EXPIRATION_ENABLED:
         return 0
     fallback_created_at = _config_mtime()
@@ -213,11 +213,11 @@ def migrate_user_expirations() -> int:
         users = registry.setdefault("users", {})
         for user_id in _config_user_ids(data, registry):
             metadata = users.setdefault(user_id, {})
-            if not isinstance(metadata, dict) or _as_utc(metadata.get("expiresAt")) is not None:
+            if (not isinstance(metadata, dict)
+                    or _as_utc(metadata.get("expiresAt")) is not None
+                    or _as_utc(metadata.get("createdAt")) is not None):
                 continue
-            created_at = _as_utc(metadata.get("createdAt")) or fallback_created_at
-            metadata["createdAt"] = _iso(created_at)
-            metadata["expiresAt"] = _iso(created_at + DEFAULT_USER_LIFETIME)
+            metadata["createdAt"] = _iso(fallback_created_at)
             changed += 1
         return changed
 
@@ -1309,11 +1309,8 @@ def process_user_expirations(now: datetime | None = None) -> int:
                 continue
             expires_at = _as_utc(metadata.get("expiresAt"))
             if expires_at is None:
-                created_at = _as_utc(metadata.get("createdAt")) or current_time
-                metadata["createdAt"] = _iso(created_at)
-                metadata["expiresAt"] = _iso(created_at + DEFAULT_USER_LIFETIME)
-                expires_at = created_at + DEFAULT_USER_LIFETIME
-                changed += 1
+                # Historical users need an authoritative date before enforcement.
+                continue
             if expires_at > current_time:
                 continue
             if current_time >= expires_at + RESTORE_WINDOW:

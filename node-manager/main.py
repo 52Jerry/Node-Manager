@@ -140,7 +140,7 @@ def startup_tasks():
     try:
         migrated_expirations = migrate_user_expirations()
         if migrated_expirations:
-            logging.getLogger(__name__).info("backfilled expiration for %s existing users", migrated_expirations)
+            logging.getLogger(__name__).info("registered metadata for %s existing users without inferring expiration", migrated_expirations)
         migrated_socks = migrate_legacy_socks_usernames()
         if migrated_socks:
             logging.getLogger(__name__).info("migrated %s legacy SOCKS usernames", migrated_socks)
