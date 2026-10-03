@@ -53,6 +53,9 @@ EXPIRATION_AUTH_USERS_KEY = "expirationAuthUsers"
 EXPIRATION_BLOCKED_KEY = "expirationBlocked"
 DEFAULT_USER_LIFETIME = timedelta(days=30)
 RESTORE_WINDOW = timedelta(hours=24)
+EXPIRATION_ENABLED = os.environ.get("NODE_MANAGER_EXPIRATION_ENABLED", "true").lower() not in {
+    "false", "0", "no", "off"
+}
 expiration_stop = threading.Event()
 expiration_thread: threading.Thread | None = None
 singbox_api = SingboxAPI()
@@ -125,6 +128,8 @@ def _iso(value: datetime) -> str:
 
 
 def _expiration_status(metadata: dict[str, Any], now: datetime | None = None) -> str:
+    if not EXPIRATION_ENABLED:
+        return "ACTIVE"
     expires_at = _as_utc(metadata.get("expiresAt"))
     return "EXPIRED" if expires_at is not None and expires_at <= (now or datetime.now(timezone.utc)) else "ACTIVE"
 
@@ -197,6 +202,8 @@ def _config_user_ids(data: dict[str, Any], registry: dict[str, Any]) -> set[str]
 
 def migrate_user_expirations() -> int:
     """为旧版本用户补齐创建时间后 30 天的默认有效期。"""
+    if not EXPIRATION_ENABLED:
+        return 0
     fallback_created_at = _config_mtime()
 
     def apply(data: dict[str, Any], registry: dict[str, Any]) -> int:
@@ -1276,6 +1283,8 @@ def _archive_user(data: dict[str, Any], registry: dict[str, Any], user_id: str, 
 
 
 def process_user_expirations(now: datetime | None = None) -> int:
+    if not EXPIRATION_ENABLED:
+        return 0
     current_time = _as_utc(now) or datetime.now(timezone.utc)
     with _config_lock():
         current_registry = read_registry()
@@ -1385,6 +1394,9 @@ def list_expired_users() -> list[dict[str, Any]]:
 
 def start_expiration_scheduler() -> None:
     global expiration_thread
+    if not EXPIRATION_ENABLED:
+        logger.warning("node user expiration processing is disabled by operator")
+        return
     if expiration_thread is not None and expiration_thread.is_alive():
         return
     expiration_stop.clear()

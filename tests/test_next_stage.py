@@ -1006,6 +1006,21 @@ class ManagerTestCase(unittest.TestCase):
             self.assertEqual(manager._connections_to_close_for_expired_users({}, set()), set())
         connections.assert_not_called()
 
+    def test_operator_can_pause_expiration_without_changing_dates_or_config(self):
+        metadata = {"expiresAt": "2026-01-01T00:00:00+00:00"}
+        with (patch.object(manager, "EXPIRATION_ENABLED", False),
+              patch.object(manager, "mutate_config") as mutate,
+              patch.object(manager, "read_registry") as read,
+              patch.object(manager.threading, "Thread") as thread):
+            self.assertEqual(manager._expiration_status(metadata), "ACTIVE")
+            self.assertEqual(manager.migrate_user_expirations(), 0)
+            self.assertEqual(manager.process_user_expirations(), 0)
+            manager.start_expiration_scheduler()
+            mutate.assert_not_called()
+            read.assert_not_called()
+            thread.assert_not_called()
+        self.assertEqual(metadata["expiresAt"], "2026-01-01T00:00:00+00:00")
+
     def test_user_expiration_is_archived_after_restore_window(self):
         manager.create_user("archive-user", ["socks"])
         now = datetime.now(timezone.utc).replace(microsecond=0)

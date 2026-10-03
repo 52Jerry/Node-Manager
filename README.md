@@ -52,6 +52,18 @@ Python Node Manager 是部署在每台 sing-box 节点服务器上的管理 Agen
 - [Node Manager 开发文档](doc/Python-Node-Manager-开发文档.md)
 - [sing-box 架构方案](doc/singbox架构方案.md)
 
+## 到期处理维护开关
+
+`NODE_MANAGER_EXPIRATION_ENABLED` 默认开启。恢复历史用户或迁移旧节点时，可通过
+systemd drop-in 设置为 `false`，然后执行 `systemctl daemon-reload` 和重启
+`node-manager`。该开关会暂停默认到期日期迁移、到期拒绝规则和自动归档，并让
+连接查询暂不拒绝已过期用户；不会修改保存的到期日期，也不会自动恢复已归档
+的用户或移除已有拒绝规则。流量与设备限制仍正常执行。
+
+重新开启前必须核对用户到期日期并备份 `/etc/sing-box/config.json`、
+`/var/lib/node-manager/users.json`、`/var/lib/node-manager/traffic.json` 和应用配置。
+到期超过恢复窗口的用户会在重新开启后自动归档。代码备份不能替代运行数据备份。
+
 ## 项目结构
 
 ```
