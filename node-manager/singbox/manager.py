@@ -1204,29 +1204,6 @@ def _add_expiration_rule(data: dict[str, Any], registry: dict[str, Any], user_id
     return True
 
 
-def _connection_matches_user(
-    connection: dict[str, Any], registry: dict[str, Any], user_id: str
-) -> bool:
-    """判断 sing-box 活跃连接是否属于指定用户。"""
-    outbound_tag = f"{USER_OUTBOUND_PREFIX}{user_id}"
-    if outbound_tag in (connection.get("chains") or []):
-        return True
-
-    auth_names = _user_auth_names(registry, user_id)
-    candidates: list[Any] = []
-    metadata = connection.get("metadata")
-    if isinstance(metadata, dict):
-        candidates.extend(
-            metadata.get(field)
-            for field in ("inboundUser", "inbound_user", "authUser", "auth_user", "user")
-        )
-    candidates.extend(
-        connection.get(field)
-        for field in ("inboundUser", "inbound_user", "authUser", "auth_user", "user")
-    )
-    return any(value is not None and str(value) in auth_names for value in candidates)
-
-
 def _connections_to_close_for_expired_users(
     registry: dict[str, Any], user_ids: set[str]
 ) -> set[str]:
@@ -1238,11 +1215,22 @@ def _connections_to_close_for_expired_users(
         logger.warning("could not inspect sing-box connections for expired users")
         return set()
 
+    # Index expired identities once instead of scanning all users per connection.
+    outbound_tags = {f"{USER_OUTBOUND_PREFIX}{user_id}" for user_id in user_ids}
+    auth_names = set().union(*(_user_auth_names(registry, user_id) for user_id in user_ids))
+    auth_fields = ("inboundUser", "inbound_user", "authUser", "auth_user", "user")
     connection_ids: set[str] = set()
     for connection in snapshot["connections"]:
         if not isinstance(connection, dict) or not connection.get("id"):
             continue
-        if any(_connection_matches_user(connection, registry, user_id) for user_id in user_ids):
+        if any(tag in outbound_tags for tag in (connection.get("chains") or [])):
+            connection_ids.add(str(connection["id"]))
+            continue
+        metadata = connection.get("metadata")
+        candidates = [connection.get(field) for field in auth_fields]
+        if isinstance(metadata, dict):
+            candidates.extend(metadata.get(field) for field in auth_fields)
+        if any(value is not None and str(value) in auth_names for value in candidates):
             connection_ids.add(str(connection["id"]))
     return connection_ids
 

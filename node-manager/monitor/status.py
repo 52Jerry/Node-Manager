@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import sys
+from pathlib import Path
+
 import psutil
 
 from singbox.manager import is_singbox_running, singbox_api
@@ -17,6 +20,21 @@ def get_memory_usage() -> float:
 
 def get_system_connections() -> int:
     try:
+        if sys.platform.startswith("linux"):
+            try:
+                # Count kernel entries without resolving every address and process.
+                total = 0
+                for name in ("tcp", "tcp6", "udp", "udp6", "unix"):
+                    try:
+                        with (Path("/proc/net") / name).open(encoding="ascii") as table:
+                            next(table, None)
+                            total += sum(1 for line in table if line.strip())
+                    except FileNotFoundError:
+                        if name not in ("tcp6", "udp6"):
+                            raise
+                return total
+            except OSError:
+                pass
         connections = psutil.net_connections()
         return len(connections)
     except Exception:

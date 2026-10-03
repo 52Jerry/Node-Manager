@@ -974,6 +974,38 @@ class ManagerTestCase(unittest.TestCase):
         current = json.loads(self.config_path.read_text(encoding="utf-8"))
         self.assertFalse(any(rule.get("action") == "reject" for rule in current["route"]["rules"]))
 
+    def test_expired_connection_matching_indexes_identities_once(self):
+        registry = {"users": {
+            "expired-one": {"socksUsername": "custom-one"},
+            "expired-two": {"socksUsername": "custom-two"},
+            "active-user": {"socksUsername": "active-account"},
+        }}
+        snapshot = {"connections": [
+            {"id": "by-chain", "chains": ["node-manager-out:expired-one"]},
+            {"id": "by-custom", "metadata": {"inboundUser": "custom-two"}},
+            {"id": "by-alias", "auth_user": "node-manager:expired-one"},
+            {"id": "by-id", "user": "expired-two"},
+            {"id": "active", "chains": ["node-manager-out:active-user"],
+             "metadata": {"user": "active-account"}},
+            {"id": "unrelated", "metadata": None},
+            {"metadata": {"user": "custom-one"}},
+            None,
+        ]}
+        with (
+            patch.object(manager.singbox_api, "get_connections", return_value=snapshot),
+            patch.object(manager, "_user_auth_names", wraps=manager._user_auth_names) as identities,
+        ):
+            result = manager._connections_to_close_for_expired_users(
+                registry, {"expired-one", "expired-two"}
+            )
+        self.assertEqual(result, {"by-chain", "by-custom", "by-alias", "by-id"})
+        self.assertEqual(identities.call_count, 2)
+
+    def test_no_expired_users_does_not_read_live_connections(self):
+        with patch.object(manager.singbox_api, "get_connections") as connections:
+            self.assertEqual(manager._connections_to_close_for_expired_users({}, set()), set())
+        connections.assert_not_called()
+
     def test_user_expiration_is_archived_after_restore_window(self):
         manager.create_user("archive-user", ["socks"])
         now = datetime.now(timezone.utc).replace(microsecond=0)
@@ -1647,6 +1679,35 @@ class ApiTestCase(unittest.TestCase):
 
 
 class StatusTestCase(unittest.TestCase):
+    def test_linux_connection_count_uses_kernel_tables(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            for name, rows in (("tcp", 2), ("tcp6", 1), ("udp", 3), ("unix", 4)):
+                (root / name).write_text("header\n" + "socket\n" * rows + "\n", encoding="ascii")
+            with (patch.object(status_monitor.sys, "platform", "linux"),
+                  patch.object(status_monitor, "Path", return_value=root),
+                  patch.object(status_monitor.psutil, "net_connections") as connections):
+                self.assertEqual(status_monitor.get_system_connections(), 10)
+                connections.assert_not_called()
+
+    def test_linux_connection_count_falls_back_if_tables_unavailable(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with (patch.object(status_monitor.sys, "platform", "linux"),
+                  patch.object(status_monitor, "Path", return_value=Path(temp_dir)),
+                  patch.object(status_monitor.psutil, "net_connections", return_value=[1, 2]) as connections):
+                self.assertEqual(status_monitor.get_system_connections(), 2)
+                connections.assert_called_once_with()
+
+    def test_non_linux_connection_count_keeps_psutil(self):
+        with (patch.object(status_monitor.sys, "platform", "win32"),
+              patch.object(status_monitor.psutil, "net_connections", return_value=[1])):
+            self.assertEqual(status_monitor.get_system_connections(), 1)
+
+    def test_connection_count_returns_zero_when_fallback_fails(self):
+        with (patch.object(status_monitor.sys, "platform", "win32"),
+              patch.object(status_monitor.psutil, "net_connections", side_effect=OSError)):
+            self.assertEqual(status_monitor.get_system_connections(), 0)
+
     def test_proxy_connections_are_counted_from_clash_api(self):
         with patch.object(
             status_monitor.singbox_api,
