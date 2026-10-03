@@ -323,6 +323,7 @@ def get_users(
             available=traffic_available,
             policy=policies.get(item["userId"], {}),
             store=traffic_store,
+            include_online=False,
         )
         item.update(
             upload=traffic["upload"],

@@ -259,6 +259,17 @@ class NodeStatusResponse(BaseModel):
     api_available: bool
 
 
+class OnlineConnection(BaseModel):
+    id: str
+    sourceIp: str | None = None
+    sourcePort: int | None = None
+    network: str | None = None
+    protocol: str | None = None
+    startedAt: datetime | None = None
+    upload: int = 0
+    download: int = 0
+
+
 class TrafficResponse(BaseModel):
     userId: str
     upload: int = 0
@@ -267,6 +278,8 @@ class TrafficResponse(BaseModel):
     available: bool = False
     source: str = "clash-api-sampled"
     collectedAt: datetime | None = None
+    onlineConnections: list[OnlineConnection] | None = None
+    sourceIpActiveWindowSeconds: float | None = None
     trafficLimitBytes: int | None = None
     maxSourceIps: int | None = None
     activeSourceIps: list[str] = Field(default_factory=list)

@@ -234,6 +234,9 @@ def _collect_traffic() -> bool:
             previous_upload = int(previous.get("upload") or 0)
             previous_download = int(previous.get("download") or 0)
             source_ip = _connection_source_ip(connection)
+            metadata = connection.get("metadata")
+            if not isinstance(metadata, dict):
+                metadata = {}
             user = store["users"].setdefault(
                 user_id, {"upload": 0, "download": 0, "updatedAt": collected_at}
             )
@@ -247,6 +250,10 @@ def _collect_traffic() -> bool:
                 "upload": upload,
                 "download": download,
                 "sourceIp": source_ip,
+                "sourcePort": metadata.get("sourcePort"),
+                "network": metadata.get("network"),
+                "protocol": metadata.get("type"),
+                "startedAt": connection.get("start"),
             }
             connections_by_user.setdefault(user_id, []).append(
                 {"id": connection_id, "sourceIp": source_ip}
@@ -254,6 +261,9 @@ def _collect_traffic() -> bool:
         enforcements, connections_to_close = _enforce_policies(
             store, connections_by_user, policies, sampled_at
         )
+        # Keep closed-session counters as baselines, but never report them as online.
+        for connection_id, connection in active_connections.items():
+            connection["online"] = connection_id not in connections_to_close
         store["connections"] = active_connections
         store["collectedAt"] = collected_at
         _write_store(store)
@@ -290,6 +300,7 @@ def get_user_traffic(
     available: bool | None = None,
     policy: dict[str, int | None] | None = None,
     store: dict[str, Any] | None = None,
+    include_online: bool = True,
 ) -> dict[str, Any]:
     if refresh:
         available = collect_traffic()
@@ -302,15 +313,23 @@ def get_user_traffic(
     policy = get_user_policies().get(user_id, {}) if policy is None else policy
     upload = int(user.get("upload") or 0)
     download = int(user.get("download") or 0)
-    traffic_limit = user.get("trafficLimitBytes")
-    if traffic_limit is None:
-        traffic_limit = policy.get("trafficLimitBytes")
-    max_source_ips = user.get("maxSourceIps")
-    if max_source_ips is None:
-        max_source_ips = policy.get("maxSourceIps")
+    # The registry is authoritative even if telemetry fails or a limit was removed.
+    traffic_limit = policy.get("trafficLimitBytes", user.get("trafficLimitBytes"))
+    max_source_ips = policy.get("maxSourceIps", user.get("maxSourceIps"))
     status = user.get("status", "active")
     if traffic_limit and upload + download >= int(traffic_limit):
         status = "traffic_limited"
+    elif status == "traffic_limited":
+        status = "active"
+    online_connections = [
+        {"id": connection_id, **{
+            field: item.get(field) for field in (
+                "sourceIp", "sourcePort", "network", "protocol", "startedAt", "upload", "download"
+            )
+        }}
+        for connection_id, item in store.get("connections", {}).items()
+        if item.get("userId") == user_id and item.get("online", True)
+    ] if available and include_online else None
     return {
         "userId": user_id,
         "upload": upload,
@@ -322,6 +341,8 @@ def get_user_traffic(
         "trafficLimitBytes": traffic_limit,
         "maxSourceIps": max_source_ips,
         "activeSourceIps": user.get("activeSourceIps", []),
+        "onlineConnections": online_connections,
+        "sourceIpActiveWindowSeconds": DEVICE_ACTIVE_WINDOW_SECONDS,
         "status": status,
     }
 

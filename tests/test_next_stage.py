@@ -1397,6 +1397,36 @@ class ApiTestCase(unittest.TestCase):
         self.assertIsNone(updated.json()["trafficLimitBytes"])
         self.assertEqual(updated.json()["maxSourceIps"], 1)
 
+    def test_traffic_endpoint_serializes_current_policy_and_online_sessions(self):
+        headers = {"Authorization": "Bearer test-token"}
+        manager.create_user("live-api", ["socks"],
+                            traffic_limit_bytes=200 * 1024 ** 3, max_source_ips=5)
+        snapshot = {"connections": [{
+            "id": "live-session", "chains": ["node-manager-out:live-api"],
+            "upload": 10, "download": 20, "start": "2026-10-03T00:00:00Z",
+            "metadata": {"sourceIP": "198.51.100.10", "sourcePort": "12000",
+                         "network": "tcp", "type": "SOCKS"},
+        }]}
+        with patch.object(traffic.singbox_api, "get_connections", return_value=snapshot):
+            response = self.client.get("/api/user/live-api/traffic", headers=headers)
+        self.assertEqual(response.status_code, 200, response.text)
+        body = response.json()
+        self.assertTrue(body["available"])
+        self.assertEqual(body["trafficLimitBytes"], 200 * 1024 ** 3)
+        self.assertEqual(body["maxSourceIps"], 5)
+        self.assertEqual(body["sourceIpActiveWindowSeconds"], traffic.DEVICE_ACTIVE_WINDOW_SECONDS)
+        self.assertEqual(body["onlineConnections"], [{
+            "id": "live-session", "sourceIp": "198.51.100.10", "sourcePort": 12000,
+            "network": "tcp", "protocol": "SOCKS", "startedAt": "2026-10-03T00:00:00Z",
+            "upload": 10, "download": 20,
+        }])
+        with patch.object(traffic.singbox_api, "get_connections", return_value=None):
+            response = self.client.get("/api/user/live-api/traffic", headers=headers)
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertFalse(response.json()["available"])
+        self.assertIsNone(response.json()["onlineConnections"])
+        self.assertEqual(response.json()["trafficLimitBytes"], 200 * 1024 ** 3)
+
     def test_delete_user_clears_traffic_before_recreating_same_id(self):
         headers = {"Authorization": "Bearer test-token"}
         payload = {
@@ -1648,6 +1678,51 @@ class TrafficTestCase(unittest.TestCase):
         self.path_patch.stop()
         self.temp_dir.cleanup()
 
+    def test_online_sessions_are_current_and_separate_from_recent_source_ips(self):
+        snapshot = {"connections": [
+            {"id": "session-a", "upload": 10, "download": 20,
+             "chains": ["node-manager-out:live-user"], "start": "2026-10-03T00:00:00Z",
+             "metadata": {"sourceIP": "198.51.100.10", "sourcePort": "12000",
+                          "network": "tcp", "type": "VLESS"}},
+            {"id": "session-b", "upload": 5, "download": 6,
+             "chains": ["node-manager-out:live-user"],
+             "metadata": {"sourceIP": "198.51.100.10", "sourcePort": 12001}},
+            {"id": "other-session", "chains": ["node-manager-out:other-user"]},
+        ]}
+        with patch.object(traffic.singbox_api, "get_connections", side_effect=[snapshot, {"connections": []}]):
+            first = traffic.get_user_traffic("live-user")
+            self.assertEqual(len(first["onlineConnections"]), 2)
+            self.assertEqual(first["onlineConnections"][0]["sourcePort"], "12000")
+            self.assertEqual(first["onlineConnections"][0]["protocol"], "VLESS")
+            self.assertEqual(first["activeSourceIps"], ["198.51.100.10"])
+            second = traffic.get_user_traffic("live-user")
+            self.assertEqual(second["onlineConnections"], [])
+            self.assertEqual(second["activeSourceIps"], ["198.51.100.10"])
+            self.assertEqual(second["total"], 41)
+
+    def test_unavailable_telemetry_returns_current_policy_not_stale_limits(self):
+        self.traffic_path.write_text(json.dumps({
+            "users": {"live-user": {"trafficLimitBytes": 100, "maxSourceIps": 2,
+                                     "upload": 100, "status": "traffic_limited"}},
+            "connections": {"old": {"userId": "live-user"}},
+            "collectedAt": "2026-10-03T00:00:00Z",
+        }), encoding="utf-8")
+        with (patch.object(traffic.singbox_api, "get_connections", return_value=None),
+              patch.object(traffic, "get_user_policies", return_value={
+                  "live-user": {"trafficLimitBytes": 200 * 1024 ** 3, "maxSourceIps": 5}
+              })):
+            result = traffic.get_user_traffic("live-user")
+            self.assertFalse(result["available"])
+            self.assertIsNone(result["onlineConnections"])
+            self.assertEqual(result["trafficLimitBytes"], 200 * 1024 ** 3)
+            self.assertEqual(result["maxSourceIps"], 5)
+            self.assertEqual(result["status"], "active")
+        result = traffic.get_user_traffic("live-user", refresh=False, policy={
+            "trafficLimitBytes": None, "maxSourceIps": None
+        })
+        self.assertIsNone(result["trafficLimitBytes"])
+        self.assertIsNone(result["maxSourceIps"])
+
     def test_sampled_connection_traffic_is_accumulated(self):
         snapshots = [
             {
@@ -1768,6 +1843,7 @@ class TrafficTestCase(unittest.TestCase):
         result = traffic.get_user_traffic("quota-user", refresh=False)
         self.assertEqual(result["status"], "traffic_limited")
         self.assertEqual(result["trafficLimitBytes"], 1000)
+        self.assertEqual(result["onlineConnections"], [])
 
     def test_raising_traffic_quota_clears_the_persistent_block(self):
         snapshot = {
@@ -1866,6 +1942,7 @@ class TrafficTestCase(unittest.TestCase):
         close.assert_called_once_with("second-device")
         result = traffic.get_user_traffic("device-user", refresh=False)
         self.assertEqual(result["activeSourceIps"], ["198.51.100.10"])
+        self.assertEqual([item["id"] for item in result["onlineConnections"]], ["first-device"])
         self.assertEqual(result["status"], "device_limited")
         self.enforcement.assert_called_once_with(
             {
