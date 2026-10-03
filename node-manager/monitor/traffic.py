@@ -101,12 +101,12 @@ def _connection_user_id(
     return None
 
 
-def _connection_source_ip(connection: dict[str, Any]) -> str | None:
+def _connection_ip(connection: dict[str, Any], *fields: str) -> str | None:
     metadata = connection.get("metadata")
     candidates = []
     if isinstance(metadata, dict):
-        candidates.extend((metadata.get("sourceIP"), metadata.get("source_ip")))
-    candidates.extend((connection.get("sourceIP"), connection.get("source_ip")))
+        candidates.extend(metadata.get(field) for field in fields)
+    candidates.extend(connection.get(field) for field in fields)
     for value in candidates:
         if not value:
             continue
@@ -115,6 +115,10 @@ def _connection_source_ip(connection: dict[str, Any]) -> str | None:
         except ValueError:
             continue
     return None
+
+
+def _connection_source_ip(connection: dict[str, Any]) -> str | None:
+    return _connection_ip(connection, "sourceIP", "source_ip")
 
 
 def _enforce_policies(
@@ -251,6 +255,9 @@ def _collect_traffic() -> bool:
                 "download": download,
                 "sourceIp": source_ip,
                 "sourcePort": metadata.get("sourcePort"),
+                "destinationIp": _connection_ip(connection, "destinationIP", "destination_ip"),
+                "destinationPort": metadata.get("destinationPort"),
+                "host": metadata.get("host"),
                 "network": metadata.get("network"),
                 "protocol": metadata.get("type"),
                 "startedAt": connection.get("start"),
@@ -324,7 +331,8 @@ def get_user_traffic(
     online_connections = [
         {"id": connection_id, **{
             field: item.get(field) for field in (
-                "sourceIp", "sourcePort", "network", "protocol", "startedAt", "upload", "download"
+                "sourceIp", "sourcePort", "network", "protocol", "startedAt", "upload", "download",
+                "destinationIp", "destinationPort", "host"
             )
         }}
         for connection_id, item in store.get("connections", {}).items()

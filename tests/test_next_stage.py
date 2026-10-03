@@ -1452,7 +1452,9 @@ class ApiTestCase(unittest.TestCase):
             "id": "live-session", "chains": ["node-manager-out:live-api"],
             "upload": 10, "download": 20, "start": "2026-10-03T00:00:00Z",
             "metadata": {"sourceIP": "198.51.100.10", "sourcePort": "12000",
-                         "network": "tcp", "type": "SOCKS"},
+                         "network": "tcp", "type": "SOCKS",
+                         "destinationIP": "203.0.113.20", "destinationPort": "443",
+                         "host": "example.com"},
         }]}
         with patch.object(traffic.singbox_api, "get_connections", return_value=snapshot):
             response = self.client.get("/api/user/live-api/traffic", headers=headers)
@@ -1466,6 +1468,7 @@ class ApiTestCase(unittest.TestCase):
             "id": "live-session", "sourceIp": "198.51.100.10", "sourcePort": 12000,
             "network": "tcp", "protocol": "SOCKS", "startedAt": "2026-10-03T00:00:00Z",
             "upload": 10, "download": 20,
+            "destinationIp": "203.0.113.20", "destinationPort": 443, "host": "example.com",
         }])
         with patch.object(traffic.singbox_api, "get_connections", return_value=None):
             response = self.client.get("/api/user/live-api/traffic", headers=headers)
@@ -1775,6 +1778,26 @@ class TrafficTestCase(unittest.TestCase):
             self.assertEqual(second["onlineConnections"], [])
             self.assertEqual(second["activeSourceIps"], ["198.51.100.10"])
             self.assertEqual(second["total"], 41)
+
+    def test_destination_telemetry_is_optional_and_normalizes_ipv6(self):
+        snapshot = {"connections": [
+            {"id": "ipv6", "chains": ["node-manager-out:live-user"],
+             "metadata": {"destination_ip": "[2001:0DB8:0:0:0:0:0:1]",
+                          "destinationPort": 443, "host": "example.com"}},
+            {"id": "legacy", "chains": ["node-manager-out:live-user"]},
+            {"id": "invalid", "chains": ["node-manager-out:live-user"],
+             "metadata": {"destinationIP": "not-an-ip"}},
+        ]}
+        with patch.object(traffic.singbox_api, "get_connections", return_value=snapshot):
+            result = traffic.get_user_traffic("live-user")
+        sessions = {item["id"]: item for item in result["onlineConnections"]}
+        self.assertEqual(sessions["ipv6"]["destinationIp"], "2001:db8::1")
+        self.assertEqual(sessions["ipv6"]["destinationPort"], 443)
+        self.assertEqual(sessions["ipv6"]["host"], "example.com")
+        self.assertIsNone(sessions["legacy"]["destinationIp"])
+        self.assertIsNone(sessions["legacy"]["destinationPort"])
+        self.assertIsNone(sessions["invalid"]["destinationIp"])
+        self.assertEqual(result["activeSourceIps"], [])
 
     def test_unavailable_telemetry_returns_current_policy_not_stale_limits(self):
         self.traffic_path.write_text(json.dumps({

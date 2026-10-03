@@ -263,6 +263,9 @@ class OnlineConnection(BaseModel):
     id: str
     sourceIp: str | None = None
     sourcePort: int | None = None
+    destinationIp: str | None = None
+    destinationPort: int | None = None
+    host: str | None = None
     network: str | None = None
     protocol: str | None = None
     startedAt: datetime | None = None
