@@ -230,6 +230,7 @@ def get_user_policy(user_id: str) -> dict[str, int | None]:
     return {
         "trafficLimitBytes": _positive_policy_value(metadata.get("trafficLimitBytes")),
         "maxSourceIps": _positive_policy_value(metadata.get("maxSourceIps")),
+        "maxConnections": _positive_policy_value(metadata.get("maxConnections")),
     }
 
 
@@ -240,6 +241,7 @@ def get_user_policies() -> dict[str, dict[str, int | None]]:
         user_id: {
             "trafficLimitBytes": _positive_policy_value(item.get("trafficLimitBytes")),
             "maxSourceIps": _positive_policy_value(item.get("maxSourceIps")),
+            "maxConnections": _positive_policy_value(item.get("maxConnections")),
         }
         for user_id, item in registry.get("users", {}).items()
         if isinstance(item, dict)
@@ -1106,7 +1108,7 @@ def create_user(
 
 
 def update_user_policy(user_id: str, updates: dict[str, Any]) -> dict[str, Any]:
-    supported = {"trafficLimitBytes", "maxSourceIps"}
+    supported = {"trafficLimitBytes", "maxSourceIps", "maxConnections"}
     unknown = set(updates) - supported
     if unknown:
         raise SingboxConfigError(f"unsupported policy fields: {', '.join(sorted(unknown))}")
@@ -1120,6 +1122,7 @@ def update_user_policy(user_id: str, updates: dict[str, Any]) -> dict[str, Any]:
         policy = {
             "trafficLimitBytes": _positive_policy_value(item.get("trafficLimitBytes")),
             "maxSourceIps": _positive_policy_value(item.get("maxSourceIps")),
+            "maxConnections": _positive_policy_value(item.get("maxConnections")),
         }
         _audit("user.policy.update", user_id, **policy)
         return {"success": True, "userId": user_id, **policy}

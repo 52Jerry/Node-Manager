@@ -118,6 +118,7 @@ class CreateUserRequest(BaseModel):
 class UpdateUserPolicyRequest(BaseModel):
     trafficLimitBytes: int | None = Field(default=None, ge=0)
     maxSourceIps: int | None = Field(default=None, ge=0, le=1000)
+    maxConnections: int | None = Field(default=None, ge=0, le=100000)
 
     @model_validator(mode="after")
     def at_least_one_policy_is_required(self):
@@ -261,6 +262,8 @@ class NodeStatusResponse(BaseModel):
 
 class OnlineConnection(BaseModel):
     id: str
+    deviceId: str | None = None
+    credentialId: str | None = None
     sourceIp: str | None = None
     sourcePort: int | None = None
     destinationIp: str | None = None
@@ -285,8 +288,10 @@ class TrafficResponse(BaseModel):
     sourceIpActiveWindowSeconds: float | None = None
     trafficLimitBytes: int | None = None
     maxSourceIps: int | None = None
+    maxConnections: int | None = None
+    connectionLimitSupported: bool = True
     activeSourceIps: list[str] = Field(default_factory=list)
-    status: Literal["active", "traffic_limited", "device_limited"] = "active"
+    status: Literal["active", "traffic_limited", "device_limited", "connection_limited"] = "active"
 
 
 class ReloadResponse(BaseModel):
@@ -310,7 +315,7 @@ class UserSummary(BaseModel):
     trafficLimitBytes: int | None = None
     maxSourceIps: int | None = None
     activeSourceIps: list[str] = Field(default_factory=list)
-    status: Literal["active", "traffic_limited", "device_limited"] = "active"
+    status: Literal["active", "traffic_limited", "device_limited", "connection_limited"] = "active"
     createdAt: datetime | None = None
     expiresAt: datetime | None = None
     expirationStatus: Literal["ACTIVE", "EXPIRED"] = "ACTIVE"

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import ipaddress
 import logging
 import os
@@ -136,8 +137,10 @@ def _enforce_policies(
         policy = policies.get(user_id, {})
         traffic_limit = policy.get("trafficLimitBytes")
         max_source_ips = policy.get("maxSourceIps")
+        max_connections = policy.get("maxConnections")
         user["trafficLimitBytes"] = traffic_limit
         user["maxSourceIps"] = max_source_ips
+        user["maxConnections"] = max_connections
         user["status"] = "active"
 
         last_seen = user.get("sourceIpLastSeen")
@@ -208,6 +211,17 @@ def _enforce_policies(
             user["activeSourceIps"] = sorted(active_ips)
             user["blockedSourceIps"] = []
             enforcements[user_id] = {"trafficBlocked": False, "blockedSourceIps": []}
+        if max_connections:
+            candidates = [item for item in connections if str(item["id"]) not in connections_to_close]
+            # Retain admitted sessions before new arrivals to avoid evicting long-lived connections.
+            candidates.sort(key=lambda item: (
+                not store.get("connections", {}).get(str(item["id"]), {}).get("online", False),
+                str(item.get("startedAt") or ""), str(item["id"]),
+            ))
+            excess = candidates[int(max_connections):]
+            connections_to_close.update(str(item["id"]) for item in excess)
+            if excess and user["status"] == "active":
+                user["status"] = "connection_limited"
     return enforcements, connections_to_close
 
 
@@ -261,9 +275,12 @@ def _collect_traffic() -> bool:
                 "network": metadata.get("network"),
                 "protocol": metadata.get("type"),
                 "startedAt": connection.get("start"),
+                # Stock VLESS/Clash telemetry has no verified per-device identity.
+                "deviceId": None,
+                "credentialId": hashlib.sha256(user_id.encode("utf-8")).hexdigest()[:24],
             }
             connections_by_user.setdefault(user_id, []).append(
-                {"id": connection_id, "sourceIp": source_ip}
+                {"id": connection_id, "sourceIp": source_ip, "startedAt": connection.get("start")}
             )
         enforcements, connections_to_close = _enforce_policies(
             store, connections_by_user, policies, sampled_at
@@ -323,6 +340,7 @@ def get_user_traffic(
     # The registry is authoritative even if telemetry fails or a limit was removed.
     traffic_limit = policy.get("trafficLimitBytes", user.get("trafficLimitBytes"))
     max_source_ips = policy.get("maxSourceIps", user.get("maxSourceIps"))
+    max_connections = policy.get("maxConnections", user.get("maxConnections"))
     status = user.get("status", "active")
     if traffic_limit and upload + download >= int(traffic_limit):
         status = "traffic_limited"
@@ -332,7 +350,7 @@ def get_user_traffic(
         {"id": connection_id, **{
             field: item.get(field) for field in (
                 "sourceIp", "sourcePort", "network", "protocol", "startedAt", "upload", "download",
-                "destinationIp", "destinationPort", "host"
+                "destinationIp", "destinationPort", "host", "deviceId", "credentialId"
             )
         }}
         for connection_id, item in store.get("connections", {}).items()
@@ -348,6 +366,8 @@ def get_user_traffic(
         "collectedAt": store.get("collectedAt"),
         "trafficLimitBytes": traffic_limit,
         "maxSourceIps": max_source_ips,
+        "maxConnections": max_connections,
+        "connectionLimitSupported": True,
         "activeSourceIps": user.get("activeSourceIps", []),
         "onlineConnections": online_connections,
         "sourceIpActiveWindowSeconds": DEVICE_ACTIVE_WINDOW_SECONDS,

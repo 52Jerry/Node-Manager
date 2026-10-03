@@ -46,7 +46,7 @@ class UserReplicationTest(unittest.TestCase):
         source["inbounds"][1]["transport"] = {"type": "ws", "path": "/proxy"}
         self._write_config(source)
         registry = manager.read_registry()
-        registry["users"]["primary-7"].update(remark="customer remark", tags=["premium"])
+        registry["users"]["primary-7"].update(remark="customer remark", tags=["premium"], maxConnections=100)
         manager._write_registry(registry)
         snapshot = export_users(shared_config=True)
         self.assertNotIn("users", snapshot["sharedConfig"]["vless"])
@@ -58,6 +58,7 @@ class UserReplicationTest(unittest.TestCase):
         self._write_config(data)
         apply_users(self.ha_request(snapshot))
         self.assertEqual(export_users(shared_config=True), snapshot)
+        self.assertEqual(manager.get_user_policy("primary-7")["maxConnections"], 100)
         actual = manager.read_config()
         self.assertEqual(actual["inbounds"][0]["listen"], "10.0.0.2")
         self.assertEqual(actual["experimental"], data["experimental"])

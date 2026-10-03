@@ -931,7 +931,7 @@ class ManagerTestCase(unittest.TestCase):
         )
         self.assertEqual(
             manager.get_user_policy("limited-user"),
-            {"trafficLimitBytes": 1024, "maxSourceIps": 2},
+            {"trafficLimitBytes": 1024, "maxSourceIps": 2, "maxConnections": None},
         )
 
         updated = manager.update_user_policy(
@@ -939,6 +939,10 @@ class ManagerTestCase(unittest.TestCase):
         )
         self.assertIsNone(updated["trafficLimitBytes"])
         self.assertEqual(updated["maxSourceIps"], 1)
+        manager.update_user_policy("limited-user", {"maxConnections": 50})
+        self.assertEqual(manager.get_user_policy("limited-user")["maxConnections"], 50)
+        manager.update_user_policy("limited-user", {"maxConnections": 0})
+        self.assertIsNone(manager.get_user_policy("limited-user")["maxConnections"])
 
     def test_user_expiration_blocks_then_can_be_restored_within_24_hours(self):
         manager.create_user("expiring-user", ["socks"])
@@ -1464,6 +1468,9 @@ class ApiTestCase(unittest.TestCase):
         self.assertEqual(body["trafficLimitBytes"], 200 * 1024 ** 3)
         self.assertEqual(body["maxSourceIps"], 5)
         self.assertEqual(body["sourceIpActiveWindowSeconds"], traffic.DEVICE_ACTIVE_WINDOW_SECONDS)
+        self.assertTrue(body["connectionLimitSupported"])
+        self.assertIsNone(body["onlineConnections"][0].pop("deviceId"))
+        self.assertEqual(len(body["onlineConnections"][0].pop("credentialId")), 24)
         self.assertEqual(body["onlineConnections"], [{
             "id": "live-session", "sourceIp": "198.51.100.10", "sourcePort": 12000,
             "network": "tcp", "protocol": "SOCKS", "startedAt": "2026-10-03T00:00:00Z",
@@ -1778,6 +1785,56 @@ class TrafficTestCase(unittest.TestCase):
             self.assertEqual(second["onlineConnections"], [])
             self.assertEqual(second["activeSourceIps"], ["198.51.100.10"])
             self.assertEqual(second["total"], 41)
+
+    def test_shared_credential_is_not_fabricated_as_verified_device(self):
+        snapshot = {"connections": [
+            {"id": "a", "chains": ["node-manager-out:shared"],
+             "metadata": {"sourceIP": "192.0.2.1", "deviceId": "untrusted-client"}},
+            {"id": "b", "chains": ["node-manager-out:shared"],
+             "metadata": {"sourceIP": "192.0.2.2"}},
+        ]}
+        with patch.object(traffic.singbox_api, "get_connections", return_value=snapshot):
+            result = traffic.get_user_traffic("shared")
+        self.assertTrue(result["connectionLimitSupported"])
+        self.assertTrue(all(item["deviceId"] is None for item in result["onlineConnections"]))
+        credentials = {item["credentialId"] for item in result["onlineConnections"]}
+        self.assertEqual(len(credentials), 1)
+        self.assertNotIn("shared", credentials)
+
+    def test_connection_limit_keeps_existing_sessions_and_releases_on_removal(self):
+        def connection(identifier, start):
+            return {"id": identifier, "start": start, "chains": ["node-manager-out:limited"],
+                    "metadata": {"sourceIP": "192.0.2.1"}}
+        initial = {"connections": [connection("existing", "2026-10-03T00:01:00Z")]}
+        full = {"connections": [connection("new", "2026-10-03T00:00:00Z"), *initial["connections"]]}
+        policies = {"limited": {"maxConnections": 1}}
+        with (patch.object(traffic.singbox_api, "get_connections", side_effect=[initial, full, full]),
+              patch.object(traffic, "get_user_policies", return_value=policies),
+              patch.object(traffic.singbox_api, "close_connection", return_value=True) as close):
+            traffic.collect_traffic()
+            traffic.collect_traffic()
+            result = traffic.get_user_traffic("limited", refresh=False)
+            self.assertEqual([item["id"] for item in result["onlineConnections"]], ["existing"])
+            self.assertEqual(result["status"], "connection_limited")
+            self.assertEqual(result["maxConnections"], 1)
+            close.assert_called_once_with("new")
+            policies["limited"]["maxConnections"] = None
+            traffic.collect_traffic()
+            result = traffic.get_user_traffic("limited", refresh=False)
+            self.assertEqual(len(result["onlineConnections"]), 2)
+            self.assertEqual(result["status"], "active")
+            close.assert_called_once()
+
+    def test_failed_close_does_not_report_enforcement_as_success(self):
+        snapshot = {"connections": [
+            {"id": value, "chains": ["node-manager-out:limited"]} for value in ("a", "b")
+        ]}
+        with (patch.object(traffic.singbox_api, "get_connections", return_value=snapshot),
+              patch.object(traffic, "get_user_policies", return_value={"limited": {"maxConnections": 1}}),
+              patch.object(traffic.singbox_api, "close_connection", return_value=False)):
+            result = traffic.get_user_traffic("limited")
+        self.assertFalse(result["available"])
+        self.assertIsNone(result["onlineConnections"])
 
     def test_destination_telemetry_is_optional_and_normalizes_ipv6(self):
         snapshot = {"connections": [

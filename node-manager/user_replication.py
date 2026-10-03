@@ -47,6 +47,7 @@ class PortableUser(StrictModel):
     expiresAt: datetime
     trafficLimitBytes: int | None = Field(default=None, gt=0)
     maxSourceIps: int | None = Field(default=None, gt=0)
+    maxConnections: int | None = Field(default=None, gt=0, le=100000)
     upload: int = Field(default=0, ge=0)
     download: int = Field(default=0, ge=0)
     remark: str | None = Field(default=None, max_length=1024)
@@ -149,6 +150,7 @@ def export_users(shared_config=False):
                 userId=user_id, auth=_auth(data, registry, user_id), proxy=proxy,
                 createdAt=metadata.get("createdAt"), expiresAt=metadata["expiresAt"],
                 trafficLimitBytes=metadata.get("trafficLimitBytes"), maxSourceIps=metadata.get("maxSourceIps"),
+                maxConnections=metadata.get("maxConnections"),
                 upload=int(usage.get("upload") or 0), download=int(usage.get("download") or 0),
                 remark=metadata.get("remark"), tags=metadata.get("tags") or [],
             ).model_dump(mode="json"))
@@ -254,6 +256,7 @@ def apply_users(request: ReplicationRequest):
                 metadata = {"replicationOwner": request.groupKey, "createdAt": manager._iso(manager._as_utc(user.createdAt)),
                             "expiresAt": manager._iso(manager._as_utc(user.expiresAt)),
                             "trafficLimitBytes": user.trafficLimitBytes, "maxSourceIps": user.maxSourceIps,
+                            "maxConnections": user.maxConnections,
                             "remark": user.remark, "tags": user.tags}
                 registry.setdefault("users", {})[user_id] = metadata
                 registry.setdefault("expiredUsers", {}).pop(user_id, None)
