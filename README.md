@@ -330,7 +330,9 @@ monitoring:
 ### Clash API 指标采集
 Clash API 仅监听 `127.0.0.1`，用于连接和流量指标采集：
 
-用户达到流量额度或超过最大来源 IP 数后，Node Manager 会同步 sing-box 拒绝规则并关闭已有连接，防止客户端通过重连绕过限制。来源 IP 在最近的设备活跃窗口内计为在线设备，默认 60 秒。
+用户达到流量额度或超过最大来源 IP 数后，Node Manager 会同步 sing-box 拒绝规则并关闭已有连接，防止客户端通过重连绕过限制。来源 IP 在最近的活跃窗口内占用一个来源名额，默认 60 秒；这不是物理设备数。同一来源的多端口、多协议连接只占一个名额。
+
+中转线路必须保留用户源地址才能准确限制来源 IP。`/api/user/{userId}/traffic` 返回 `sourceIpVisibility`、`suspectedRelaySourceIps`、`missingSourceConnections` 和 `blockedSourceIps`。私网/共享地址以及配置的 `monitoring.relay_source_cidrs` 会触发中转风险诊断；这些配置仅用于识别风险，不信任客户端声明的真实 IP。完整接入及验收步骤见 [来源 IP 限制与专线接入](docs/SOURCE_IP_LIMITS.md)。
 
 ```json
 {

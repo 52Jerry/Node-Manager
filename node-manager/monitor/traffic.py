@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import hashlib
-import ipaddress
 import logging
 import os
 import tempfile
@@ -20,6 +19,7 @@ from singbox.manager import (
     sync_user_enforcements,
 )
 from config import config
+from monitor.source_identity import normalize_ip, source_ip_diagnostics
 
 
 logger = logging.getLogger(__name__)
@@ -111,10 +111,9 @@ def _connection_ip(connection: dict[str, Any], *fields: str) -> str | None:
     for value in candidates:
         if not value:
             continue
-        try:
-            return ipaddress.ip_address(str(value).strip().strip("[]")).compressed.lower()
-        except ValueError:
-            continue
+        normalized = normalize_ip(value)
+        if normalized is not None:
+            return normalized
     return None
 
 
@@ -152,8 +151,11 @@ def _enforce_policies(
                 seen_value = float(seen_at)
             except (TypeError, ValueError):
                 continue
-            if seen_value >= active_cutoff:
-                normalized_last_seen[str(source_ip)] = seen_value
+            normalized_ip = normalize_ip(source_ip)
+            if normalized_ip and seen_value >= active_cutoff:
+                normalized_last_seen[normalized_ip] = max(
+                    seen_value, normalized_last_seen.get(normalized_ip, 0)
+                )
         for connection in connections:
             source_ip = connection.get("sourceIp")
             if source_ip is not None:
@@ -170,17 +172,18 @@ def _enforce_policies(
 
         active_ips = set(normalized_last_seen)
         previous_allowed_ips = [
-            source_ip for source_ip in user.get("activeSourceIps", []) if source_ip in active_ips
+            normalize_ip(source_ip) for source_ip in user.get("activeSourceIps", [])
+            if normalize_ip(source_ip) in active_ips
         ]
         previous_blocked_ips = {
-            str(source_ip)
+            normalize_ip(source_ip)
             for source_ip in user.get("blockedSourceIps", [])
-            if source_ip
+            if normalize_ip(source_ip)
         }
         if max_source_ips:
             allowed = list(dict.fromkeys(previous_allowed_ips))[:max_source_ips]
             # Once a slot is available, release old rejected addresses so one
-            # of them can become the next active device. While all slots stay
+            # of them can become the next active source. While all slots stay
             # occupied, keep rejecting them even after their failed connection
             # falls out of the activity window.
             retained_blocked_ips = (
@@ -371,6 +374,8 @@ def get_user_traffic(
         "activeSourceIps": user.get("activeSourceIps", []),
         "onlineConnections": online_connections,
         "sourceIpActiveWindowSeconds": DEVICE_ACTIVE_WINDOW_SECONDS,
+        "blockedSourceIps": user.get("blockedSourceIps", []) if available else [],
+        **source_ip_diagnostics(online_connections),
         "status": status,
     }
 

@@ -23,6 +23,9 @@ monitoring:
   traffic_sample_interval_seconds: 2
   # 来源 IP 在最近 60 秒有代理活动时计为活跃来源，不代表真实设备数。
   device_active_window_seconds: 60
+  # 已知中转源地址/CIDR（逗号分隔），仅用于诊断，不信任客户端自报 IP。
+  # 例如 "172.16.208.118/32,203.0.113.10/32"；私网来源自动告警。
+  relay_source_cidrs: ""
 
 # B6: 网络前置检查参数（专线拓扑相关）。
 # 入口节点（如深圳）需要 DNAT，出口节点（如香港）通常不需要。

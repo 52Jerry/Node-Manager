@@ -1673,6 +1673,10 @@ class ApiTestCase(unittest.TestCase):
         self.assertTrue(body["available"])
         self.assertEqual(body["trafficLimitBytes"], 200 * 1024 ** 3)
         self.assertEqual(body["maxSourceIps"], 5)
+        self.assertEqual(body["sourceIpVisibility"], "observed")
+        self.assertEqual(body["suspectedRelaySourceIps"], [])
+        self.assertEqual(body["blockedSourceIps"], [])
+        self.assertEqual(body["missingSourceConnections"], 0)
         self.assertEqual(body["sourceIpActiveWindowSeconds"], traffic.DEVICE_ACTIVE_WINDOW_SECONDS)
         self.assertTrue(body["connectionLimitSupported"])
         self.assertIsNone(body["onlineConnections"][0].pop("deviceId"))
@@ -1687,6 +1691,8 @@ class ApiTestCase(unittest.TestCase):
             response = self.client.get("/api/user/live-api/traffic", headers=headers)
         self.assertEqual(response.status_code, 200, response.text)
         self.assertFalse(response.json()["available"])
+        self.assertEqual(response.json()["sourceIpVisibility"], "unavailable")
+        self.assertIsNone(response.json()["missingSourceConnections"])
         self.assertIsNone(response.json()["onlineConnections"])
         self.assertEqual(response.json()["trafficLimitBytes"], 200 * 1024 ** 3)
 
@@ -1969,6 +1975,83 @@ class TrafficTestCase(unittest.TestCase):
         self.policy_patch.stop()
         self.path_patch.stop()
         self.temp_dir.cleanup()
+
+    def test_five_sources_share_many_sessions_and_reject_sixth_across_protocols(self):
+        def session(identifier, source, protocol="VLESS"):
+            return {"id": identifier, "chains": ["node-manager-out:five"],
+                    "metadata": {"sourceIP": source, "sourcePort": 10000 + len(identifier), "type": protocol}}
+        initial = [session(str(index), f"192.0.2.{index}") for index in range(1, 6)]
+        initial.extend(session(f"same-{index}", "192.0.2.1", "VMess") for index in range(10))
+        initial.append(session("mapped", "::ffff:192.0.2.1", "SOCKS"))
+        sixth = session("sixth", "192.0.2.6")
+        with (patch.object(traffic, "get_user_policies", return_value={"five": {"maxSourceIps": 5}}),
+              patch.object(traffic.singbox_api, "get_connections", side_effect=[
+                  {"connections": initial}, {"connections": [sixth, *initial]}]),
+              patch.object(traffic.singbox_api, "close_connection", return_value=True) as close):
+            first = traffic.get_user_traffic("five")
+            second = traffic.get_user_traffic("five")
+        self.assertEqual(len(first["onlineConnections"]), 16)
+        self.assertEqual(len(first["activeSourceIps"]), 5)
+        self.assertEqual(first["sourceIpVisibility"], "observed")
+        self.assertEqual(second["blockedSourceIps"], ["192.0.2.6"])
+        self.assertEqual(len(second["onlineConnections"]), 16)
+        close.assert_called_once_with("sixth")
+
+    def test_mapped_ip_history_does_not_consume_two_slots(self):
+        store = {"users": {"five": {
+            "sourceIpLastSeen": {"::ffff:192.0.2.1": 990, "192.0.2.1": 999},
+            "activeSourceIps": ["::ffff:192.0.2.1", "192.0.2.1"]}}, "connections": {}}
+        _, closed = traffic._enforce_policies(store, {"five": [
+            {"id": "new", "sourceIp": "192.0.2.2"}]}, {"five": {"maxSourceIps": 2}}, 1000)
+        self.assertEqual(store["users"]["five"]["activeSourceIps"], ["192.0.2.1", "192.0.2.2"])
+        self.assertFalse(closed)
+
+    def test_relay_source_is_flagged_and_forwarded_fields_are_not_trusted(self):
+        snapshot = {"connections": [{"id": str(index), "chains": ["node-manager-out:relay"],
+            "metadata": {"sourceIP": "172.16.208.118", "sourcePort": 10000 + index,
+                         "realIP": f"192.0.2.{index}", "deviceId": str(index)}} for index in range(40)]}
+        with patch.object(traffic.singbox_api, "get_connections", return_value=snapshot):
+            result = traffic.get_user_traffic("relay")
+        self.assertEqual(result["sourceIpVisibility"], "relay_detected")
+        self.assertEqual(result["suspectedRelaySourceIps"], ["172.16.208.118"])
+        self.assertEqual(result["activeSourceIps"], ["172.16.208.118"])
+        self.assertEqual(len(result["onlineConnections"]), 40)
+        self.assertTrue(all(item["deviceId"] is None for item in result["onlineConnections"]))
+
+    def test_configured_public_relay_and_missing_sources_are_reported(self):
+        from monitor.source_identity import source_ip_diagnostics
+        with patch.object(traffic.config.monitoring, "relay_source_cidrs", "203.0.113.10/32"):
+            result = source_ip_diagnostics([{"sourceIp": "203.0.113.10"}, {"sourceIp": None}])
+        self.assertEqual(result["sourceIpVisibility"], "relay_detected")
+        self.assertEqual(result["missingSourceConnections"], 1)
+        self.assertEqual(source_ip_diagnostics([{}])["sourceIpVisibility"], "missing")
+        self.assertEqual(source_ip_diagnostics([])["sourceIpVisibility"], "idle")
+        self.assertEqual(source_ip_diagnostics(None)["sourceIpVisibility"], "unavailable")
+
+    def test_source_diagnostics_cover_ipv6_private_and_mapped_addresses(self):
+        from monitor.source_identity import source_ip_diagnostics
+        result = source_ip_diagnostics([{"sourceIp": value} for value in
+            ("::ffff:172.16.208.118", "fd00::1", "100.64.0.1", "::1", "fe80::1")])
+        self.assertEqual(result["sourceIpVisibility"], "relay_detected")
+        self.assertEqual(result["suspectedRelaySourceIps"],
+                         ["100.64.0.1", "172.16.208.118", "::1", "fd00::1", "fe80::1"])
+
+    def test_rejected_sixth_source_can_take_a_released_slot(self):
+        def sessions(indices):
+            return {"connections": [{"id": str(index), "chains": ["node-manager-out:five"],
+                "metadata": {"sourceIP": f"192.0.2.{index}"}} for index in indices]}
+        with (patch.object(traffic, "get_user_policies", return_value={"five": {"maxSourceIps": 5}}),
+              patch.object(traffic.singbox_api, "get_connections", side_effect=[
+                  sessions(range(1, 7)), sessions(range(2, 6)), sessions(range(2, 7))]),
+              patch.object(traffic.time, "time", side_effect=[1000, 1061, 1062]),
+              patch.object(traffic, "DEVICE_ACTIVE_WINDOW_SECONDS", 60),
+              patch.object(traffic.singbox_api, "close_connection", return_value=True) as close):
+            traffic.collect_traffic()
+            traffic.collect_traffic()
+            result = traffic.get_user_traffic("five")
+        self.assertEqual(result["activeSourceIps"], [f"192.0.2.{index}" for index in range(2, 7)])
+        self.assertEqual(result["blockedSourceIps"], [])
+        close.assert_called_once_with("6")
 
     def test_online_sessions_are_current_and_separate_from_recent_source_ips(self):
         snapshot = {"connections": [
@@ -2501,6 +2584,21 @@ class SingboxWriteReloadTest(unittest.TestCase):
 
 
 class MonitoringConfigTest(unittest.TestCase):
+    def test_relay_source_cidrs_are_validated_without_network_changes(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_path = Path(temp_dir) / "config.yaml"
+            for value in ("172.16.208.118/32, 2001:db8::/32", "not-a-cidr"):
+                config_path.write_text(
+                    f'node:\n  host: 192.0.2.10\nmonitoring:\n  relay_source_cidrs: "{value}"\n',
+                    encoding="utf-8",
+                )
+                with patch.dict(os.environ, {"NODE_MANAGER_CONFIG": str(config_path)}):
+                    if value == "not-a-cidr":
+                        with self.assertRaises(ValueError):
+                            config_module.load_config()
+                    else:
+                        self.assertEqual(config_module.load_config().monitoring.relay_source_cidrs, value)
+
     def test_sampling_interval_accepts_supported_boundaries(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             config_path = Path(temp_dir) / "config.yaml"

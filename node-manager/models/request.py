@@ -295,6 +295,10 @@ class TrafficResponse(BaseModel):
     maxConnections: int | None = None
     connectionLimitSupported: bool = True
     activeSourceIps: list[str] = Field(default_factory=list)
+    blockedSourceIps: list[str] = Field(default_factory=list)
+    sourceIpVisibility: Literal["observed", "relay_detected", "missing", "idle", "unavailable"] = "unavailable"
+    suspectedRelaySourceIps: list[str] = Field(default_factory=list)
+    missingSourceConnections: int | None = None
     status: Literal["active", "traffic_limited", "device_limited", "connection_limited"] = "active"
 
 
