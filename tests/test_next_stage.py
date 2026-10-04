@@ -1393,6 +1393,99 @@ class ApiTestCase(unittest.TestCase):
         store = json.loads(self.traffic_path.read_text(encoding="utf-8"))
         self.assertEqual(store["users"]["renew-api-user"]["download"], 0)
 
+    def test_authoritative_expiration_sync_preserves_policy_credentials_and_traffic(self):
+        headers = {"Authorization": "Bearer test-token"}
+        proxy = {"server": "198.51.100.30", "port": 1080,
+                 "username": "upstream-account", "password": "upstream-password"}
+        manager.create_user("date-sync", ["socks"], proxy=proxy,
+                            traffic_limit_bytes=214748364800, max_source_ips=5)
+        connection = manager.get_user_connection("date-sync")
+        original = manager.read_registry()["users"]["date-sync"]
+        self.traffic_path.write_text(json.dumps({"users": {"date-sync": {"upload": 10, "download": 20}}}),
+                                     encoding="utf-8")
+        traffic_before = self.traffic_path.read_bytes()
+        old = original["expiresAt"]
+        for target in (datetime.now(timezone.utc) + timedelta(days=3),
+                       datetime.now(timezone.utc) - timedelta(hours=1),
+                       datetime.now(timezone.utc) + timedelta(days=60)):
+            payload = {"expiresAt": target.isoformat(), "expectedExpiresAt": old, "expectedProxy": proxy}
+            response = self.client.patch("/api/user/date-sync/expiration/sync", headers=headers, json=payload)
+            self.assertEqual(response.status_code, 200, response.text)
+            self.assertEqual(datetime.fromisoformat(response.json()["expiresAt"].replace("Z", "+00:00")), target)
+            retry = self.client.patch("/api/user/date-sync/expiration/sync", headers=headers, json=payload)
+            self.assertEqual(retry.status_code, 200, retry.text)
+            current = manager.read_registry()["users"]["date-sync"]
+            self.assertEqual(current["createdAt"], original["createdAt"])
+            self.assertEqual(current["trafficLimitBytes"], 214748364800)
+            self.assertEqual(current["maxSourceIps"], 5)
+            for field in ("uuid", "socksUsername", "socksPassword"):
+                self.assertEqual(current.get(field), original.get(field))
+            if target > datetime.now(timezone.utc):
+                current_connection = manager.get_user_connection("date-sync")
+                for field in ("uuid", "socks", "vlessLink", "vmessLink", "links"):
+                    self.assertEqual(current_connection.get(field), connection.get(field))
+            self.assertEqual(self.traffic_path.read_bytes(), traffic_before)
+            old = response.json()["expiresAt"]
+
+    def test_expiration_sync_rejects_stale_date_wrong_proxy_and_missing_auth(self):
+        headers = {"Authorization": "Bearer test-token"}
+        proxy = {"server": "198.51.100.30", "port": 1080,
+                 "username": "upstream-account", "password": "upstream-password"}
+        manager.create_user("date-guard", ["socks"], proxy=proxy)
+        initial_config = self.config_path.read_bytes()
+        initial_registry = self.registry_path.read_bytes()
+        old = manager.read_registry()["users"]["date-guard"]["expiresAt"]
+        target = (datetime.now(timezone.utc) + timedelta(days=90)).isoformat()
+        path = "/api/user/date-guard/expiration/sync"
+        payload = {"expiresAt": target, "expectedExpiresAt": old, "expectedProxy": proxy}
+        self.assertIn(self.client.patch(path, json=payload).status_code, (401, 403))
+        for changes in ({"expectedExpiresAt": target},
+                        {"expectedProxy": {**proxy, "password": "wrong"}},
+                        {"expiresAt": "2026-11-01T00:00:00"}):
+            response = self.client.patch(path, headers=headers, json={**payload, **changes})
+            self.assertGreaterEqual(response.status_code, 400, response.text)
+            self.assertEqual(self.config_path.read_bytes(), initial_config)
+            self.assertEqual(self.registry_path.read_bytes(), initial_registry)
+
+    def test_batch_expiration_sync_checks_each_identity_and_writes_registry_once(self):
+        proxy = {"server": "198.51.100.30", "port": 1080,
+                 "username": "upstream-account", "password": "upstream-password"}
+        manager.create_user("batch-date-a", ["socks"], proxy=proxy)
+        # Different proxy avoids the existing duplicate-proxy creation guard.
+        second = {**proxy, "port": 1081}
+        manager.create_user("batch-date-b", ["socks"], proxy=second)
+        users = manager.read_registry()["users"]
+        target = (datetime.now(timezone.utc) + timedelta(days=60)).isoformat()
+        payload = {"items": [
+            {"userId": "batch-date-a", "expiresAt": target,
+             "expectedExpiresAt": users["batch-date-a"]["expiresAt"], "expectedProxy": proxy},
+            {"userId": "batch-date-b", "expiresAt": target,
+             "expectedExpiresAt": users["batch-date-b"]["expiresAt"], "expectedProxy": proxy}]}
+        with patch.object(manager, "_write_registry", wraps=manager._write_registry) as write:
+            response = self.client.patch("/api/users/expiration/sync",
+                                         headers={"Authorization": "Bearer test-token"}, json=payload)
+            self.assertEqual(response.status_code, 200, response.text)
+            self.assertEqual([item["success"] for item in response.json()["items"]], [True, False])
+            self.assertEqual(write.call_count, 1)
+        self.assertEqual(manager.read_registry()["users"]["batch-date-b"]["expiresAt"],
+                         users["batch-date-b"]["expiresAt"])
+
+    def test_expiration_sync_refuses_snapshot_older_than_renewal(self):
+        proxy = {"server": "198.51.100.30", "port": 1080,
+                 "username": "upstream-account", "password": "upstream-password"}
+        manager.create_user("fresh-date", ["socks"], proxy=proxy)
+        snapshot_started = datetime.now(timezone.utc) - timedelta(minutes=1)
+        renewed = datetime.now(timezone.utc) + timedelta(days=60)
+        manager.renew_user("fresh-date", renewed)
+        old = manager.read_registry()["users"]["fresh-date"]["expiresAt"]
+        response = self.client.patch("/api/user/fresh-date/expiration/sync",
+            headers={"Authorization": "Bearer test-token"}, json={
+                "expiresAt": (renewed - timedelta(days=30)).isoformat(),
+                "expectedExpiresAt": old, "expectedProxy": proxy,
+                "snapshotStartedAt": snapshot_started.isoformat()})
+        self.assertGreaterEqual(response.status_code, 400)
+        self.assertEqual(manager.read_registry()["users"]["fresh-date"]["expiresAt"], old)
+
     def test_user_list_exposes_proxy_metadata_and_batch_deletes(self):
         headers = {"Authorization": "Bearer test-token"}
         for user_id, source_ip, port, country_name, city_name in (

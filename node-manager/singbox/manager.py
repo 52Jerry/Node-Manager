@@ -1160,6 +1160,7 @@ def renew_user(
             metadata["maxSourceIps"] = _positive_policy_value(max_source_ips)
 
         metadata["expiresAt"] = _iso(new_expiry)
+        metadata["expirationUpdatedAt"] = _iso(now)
         _remove_expiration_rule(data, metadata)
         policy = {
             "trafficLimitBytes": _positive_policy_value(
@@ -1341,11 +1342,84 @@ def update_user_expiration(user_id: str, expires_at: datetime) -> dict[str, Any]
         if old_expiry is not None and now >= old_expiry + RESTORE_WINDOW:
             raise SingboxConfigError("user restore window has expired")
         metadata["expiresAt"] = _iso(new_expiry)
+        metadata["expirationUpdatedAt"] = _iso(now)
         _remove_expiration_rule(data, metadata)
         _audit("user.expiration.update", user_id, expiresAt=metadata["expiresAt"])
         return {"success": True, "userId": user_id, "expiresAt": metadata["expiresAt"], "expirationStatus": "ACTIVE"}
 
     return mutate_config(apply)
+
+
+def sync_user_expiration(user_id: str, expires_at: datetime, expected_proxy: dict[str, Any],
+                         expected_expires_at: datetime | None, snapshot_started_at: datetime | None = None) -> dict[str, Any]:
+    result = sync_user_expirations([{"userId": user_id, "expiresAt": expires_at,
+                                    "expectedProxy": expected_proxy, "expectedExpiresAt": expected_expires_at,
+                                    "snapshotStartedAt": snapshot_started_at}])
+    item = result["items"][0]
+    if not item["success"]:
+        raise SingboxConfigError(item["error"])
+    return item
+
+
+def sync_user_expirations(items: list[dict[str, Any]]) -> dict[str, Any]:
+    """One atomic write per batch; each identity and previous date is checked under the same lock."""
+    if len({item["userId"] for item in items}) != len(items):
+        raise SingboxConfigError("duplicate userId in expiration synchronization")
+    now = datetime.now(timezone.utc)
+
+    def apply_one(data: dict[str, Any], registry: dict[str, Any], item: dict[str, Any],
+                  outbounds: dict[str, Any]) -> dict[str, Any]:
+        user_id = item["userId"]
+        new_expiry = _as_utc(item["expiresAt"])
+        if new_expiry is None:
+            raise SingboxConfigError("invalid expiration")
+        expected_proxy = item["expectedProxy"]
+        if not _user_exists(data, registry, user_id):
+            raise SingboxConfigError("user not found; expiration synchronization refused")
+        metadata = _registry_user(registry, user_id)
+        outbound = outbounds.get(f"{USER_OUTBOUND_PREFIX}{user_id}")
+        if not outbound or outbound.get("type") not in {"socks", "socks5"}:
+            raise SingboxConfigError("upstream proxy mismatch; expiration synchronization refused")
+        actual = (str(metadata.get("sourceIp") or outbound.get("server") or "").strip().lower(),
+                  outbound.get("server_port"), outbound.get("username"), outbound.get("password"))
+        expected = (expected_proxy["server"].strip().lower(), expected_proxy["port"],
+                    expected_proxy["username"], expected_proxy["password"])
+        if actual != expected:
+            raise SingboxConfigError("upstream proxy mismatch; expiration synchronization refused")
+        old_expiry = _as_utc(metadata.get("expiresAt"))
+        if old_expiry != _as_utc(item["expectedExpiresAt"]) and old_expiry != new_expiry:
+            raise SingboxConfigError("expiration changed concurrently; synchronization refused")
+        snapshot_started = _as_utc(item.get("snapshotStartedAt"))
+        updated_at = _as_utc(metadata.get("expirationUpdatedAt"))
+        if old_expiry != new_expiry and snapshot_started and updated_at and updated_at > snapshot_started:
+            raise SingboxConfigError("expiration newer than upstream snapshot; synchronization refused")
+        metadata["expiresAt"] = _iso(new_expiry)
+        if new_expiry > now:
+            _remove_expiration_rule(data, metadata)
+        elif EXPIRATION_ENABLED:
+            _add_expiration_rule(data, registry, user_id)
+        _audit("user.expiration.sync", user_id, expiresAt=metadata["expiresAt"])
+        return {"success": True, "userId": user_id, "expiresAt": metadata["expiresAt"],
+                "expirationStatus": "ACTIVE" if new_expiry > now else "EXPIRED"}
+
+    def apply(data: dict[str, Any], registry: dict[str, Any]) -> dict[str, Any]:
+        results = []
+        outbounds = {outbound.get("tag"): outbound for outbound in data.get("outbounds", [])}
+        for item in items:
+            try:
+                results.append(apply_one(data, registry, item, outbounds))
+            except SingboxConfigError as error:
+                results.append({"userId": item["userId"], "success": False, "error": str(error)})
+        return {"success": all(item["success"] for item in results), "items": results}
+
+    result = mutate_config(apply)
+    expired_ids = {item["userId"] for item in result["items"]
+                   if item["success"] and item["expirationStatus"] == "EXPIRED"}
+    if expired_ids and EXPIRATION_ENABLED:
+        registry = read_registry()
+        for connection_id in _connections_to_close_for_expired_users(registry, expired_ids):
+            singbox_api.close_connection(connection_id)
+    return result
 
 
 def restore_user(user_id: str, expires_at: datetime) -> dict[str, Any]:
@@ -1364,6 +1438,7 @@ def restore_user(user_id: str, expires_at: datetime) -> dict[str, Any]:
         if old_expiry is None or now >= old_expiry + RESTORE_WINDOW:
             raise SingboxConfigError("user restore window has expired")
         metadata["expiresAt"] = _iso(new_expiry)
+        metadata["expirationUpdatedAt"] = _iso(now)
         _remove_expiration_rule(data, metadata)
         _audit("user.expiration.restore", user_id, expiresAt=metadata["expiresAt"])
         return {"success": True, "userId": user_id, "expiresAt": metadata["expiresAt"], "expirationStatus": "ACTIVE"}

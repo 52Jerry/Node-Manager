@@ -39,6 +39,8 @@ from models.request import (
     ResidentialSocksRequest,
     TrafficResponse,
     UpdateUserExpirationRequest,
+    SyncUserExpirationRequest,
+    BatchExpirationSyncRequest,
     UpdateUserPolicyRequest,
     RestoreUserRequest,
     ExpiredUserListResponse,
@@ -96,6 +98,8 @@ from singbox.manager import (
     start_expiration_scheduler,
     stop_expiration_scheduler,
     update_user_expiration,
+    sync_user_expiration,
+    sync_user_expirations,
     reload_singbox,
 )
 
@@ -621,6 +625,23 @@ def restore_user_endpoint(
     return restore_user(userId, request.expiresAt)
 
 
+@app.patch("/api/user/{userId}/expiration/sync", tags=["users"])
+def sync_user_expiration_endpoint(
+    userId: str,
+    request: SyncUserExpirationRequest,
+    _token: str = Depends(verify_token),
+):
+    if not userId or len(userId) > 64:
+        raise HTTPException(status_code=422, detail="invalid userId")
+    return sync_user_expiration(userId, request.expiresAt, request.expectedProxy.model_dump(),
+                                request.expectedExpiresAt, request.snapshotStartedAt)
+
+
+@app.patch("/api/users/expiration/sync", tags=["users"])
+def sync_user_expirations_endpoint(request: BatchExpirationSyncRequest, _token: str = Depends(verify_token)):
+    return sync_user_expirations([item.model_dump() for item in request.items])
+
+
 @app.post("/api/singbox/reload", response_model=ReloadResponse, tags=["sing-box"])
 def singbox_reload(_token: str = Depends(verify_token)):
     return ReloadResponse(success=reload_singbox())
@@ -705,6 +726,7 @@ def get_agent_info(_token: str = Depends(verify_token)):
             "user.policy.update",
             "user.renew",
             "user.expiration.update",
+            "user.expiration.sync",
             "user.expiration.restore",
             "user.expiration.archive",
             "node.heartbeat",

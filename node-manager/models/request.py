@@ -367,6 +367,35 @@ class RestoreUserRequest(UpdateUserExpirationRequest):
     pass
 
 
+class ExpectedExpirationProxy(BaseModel):
+    server: str = Field(min_length=1, max_length=255)
+    port: int = Field(ge=1, le=65535)
+    username: str = Field(min_length=1)
+    password: str = Field(min_length=1)
+
+
+class SyncUserExpirationRequest(BaseModel):
+    expiresAt: datetime
+    snapshotStartedAt: datetime | None = None
+    expectedExpiresAt: datetime | None
+    expectedProxy: ExpectedExpirationProxy
+
+    @field_validator("expiresAt", "expectedExpiresAt", "snapshotStartedAt")
+    @classmethod
+    def synchronization_dates_require_timezone(cls, value: datetime | None) -> datetime | None:
+        if value is not None and value.tzinfo is None:
+            raise ValueError("synchronization dates must include a timezone")
+        return value
+
+
+class BatchExpirationSyncItem(SyncUserExpirationRequest):
+    userId: str = Field(min_length=1, max_length=64)
+
+
+class BatchExpirationSyncRequest(BaseModel):
+    items: list[BatchExpirationSyncItem] = Field(min_length=1, max_length=100)
+
+
 class ExpiredUserSummary(BaseModel):
     userId: str
     createdAt: datetime | None = None
