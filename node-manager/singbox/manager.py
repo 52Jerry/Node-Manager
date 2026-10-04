@@ -1130,6 +1130,27 @@ def update_user_policy(user_id: str, updates: dict[str, Any]) -> dict[str, Any]:
     return mutate_config(apply)
 
 
+def apply_default_traffic_limit(traffic_limit_bytes: int) -> dict[str, Any]:
+    """Update active users' quotas atomically without resetting traffic or reloading sing-box."""
+    if not isinstance(traffic_limit_bytes, int) or isinstance(traffic_limit_bytes, bool) or not 0 <= traffic_limit_bytes <= 1073741824000000:
+        raise SingboxConfigError("invalid trafficLimitBytes")
+    limit = _positive_policy_value(traffic_limit_bytes)
+
+    def apply(data: dict[str, Any], registry: dict[str, Any]) -> dict[str, Any]:
+        user_ids = _discover_user_ids(data, registry)
+        updated = 0
+        for user_id in user_ids:
+            metadata = registry.setdefault("users", {}).setdefault(user_id, {})
+            if metadata.get("trafficLimitBytes") != limit:
+                metadata["trafficLimitBytes"] = limit
+                updated += 1
+        _audit("users.traffic-limit.default", "all", trafficLimitBytes=limit, userCount=len(user_ids), updatedCount=updated)
+        return {"success": True, "trafficLimitBytes": traffic_limit_bytes,
+                "userCount": len(user_ids), "updatedCount": updated}
+
+    return mutate_config(apply)
+
+
 def renew_user(
     user_id: str,
     expires_at: datetime,

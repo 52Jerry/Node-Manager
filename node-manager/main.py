@@ -42,6 +42,7 @@ from models.request import (
     SyncUserExpirationRequest,
     BatchExpirationSyncRequest,
     UpdateUserPolicyRequest,
+    ApplyDefaultTrafficLimitRequest,
     RestoreUserRequest,
     ExpiredUserListResponse,
     UserConnectionResponse,
@@ -87,6 +88,7 @@ from singbox.manager import (
     get_user_policies,
     update_proxy_metadata,
     update_user_policy,
+    apply_default_traffic_limit,
     get_socks_inbound_port,
     is_api_available,
     list_users,
@@ -581,6 +583,14 @@ def update_user_policy_endpoint(
     return update_user_policy(userId, request.model_dump(exclude_unset=True))
 
 
+@app.patch("/api/users/traffic-limit/default", tags=["users"])
+def apply_default_traffic_limit_endpoint(
+    request: ApplyDefaultTrafficLimitRequest,
+    _token: str = Depends(verify_token),
+):
+    return apply_default_traffic_limit(request.trafficLimitBytes)
+
+
 @app.post("/api/user/{userId}/renew", tags=["users"])
 def renew_user_endpoint(
     userId: str,
@@ -731,6 +741,7 @@ def get_agent_info(_token: str = Depends(verify_token)):
             "traffic.reset",
             "user.source-ip-limit",
             "user.policy.update",
+            "users.traffic-limit.default",
             "user.renew",
             "user.expiration.update",
             "user.expiration.sync",

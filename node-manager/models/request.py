@@ -127,6 +127,10 @@ class UpdateUserPolicyRequest(BaseModel):
         return self
 
 
+class ApplyDefaultTrafficLimitRequest(BaseModel):
+    trafficLimitBytes: int = Field(ge=0, le=1073741824000000)
+
+
 class RenewUserRequest(BaseModel):
     expiresAt: datetime
     trafficLimitBytes: int | None = Field(default=None, ge=0)

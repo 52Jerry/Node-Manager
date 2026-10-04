@@ -1417,6 +1417,34 @@ class ApiTestCase(unittest.TestCase):
         self.assertEqual(response.status_code, 200, response.text)
         self.assertTrue(response.json()["trafficReset"])
 
+    def test_default_traffic_bulk_update_preserves_other_fields_traffic_and_config(self):
+        for user_id in ("quota-a", "quota-b"):
+            manager.create_user(user_id, ["socks"], traffic_limit_bytes=200 * 1024 ** 3, max_source_ips=5)
+        before = manager.read_registry()
+        before_config = self.config_path.read_bytes()
+        self.traffic_path.write_text('{"users":{"quota-a":{"upload":123,"download":456}}}', encoding="utf-8")
+        before_traffic = self.traffic_path.read_bytes()
+        path = "/api/users/traffic-limit/default"
+        headers = {"Authorization": "Bearer test-token"}
+        self.assertIn(self.client.patch(path, json={"trafficLimitBytes": 1}).status_code, (401, 403))
+        for value in (-1, 1073741824000001):
+            self.assertEqual(self.client.patch(path, headers=headers, json={"trafficLimitBytes": value}).status_code, 422)
+        with patch.object(manager, "_write_and_reload", side_effect=AssertionError("must not reload")):
+            response = self.client.patch(path, headers=headers, json={"trafficLimitBytes": 350 * 1024 ** 3})
+            self.assertEqual(response.status_code, 200, response.text)
+            self.assertEqual(response.json()["updatedCount"], 2)
+            self.assertEqual(response.json()["userCount"], 2)
+            for user_id, metadata in before["users"].items():
+                expected = dict(metadata, trafficLimitBytes=350 * 1024 ** 3)
+                self.assertEqual(manager.read_registry()["users"][user_id], expected)
+            repeated = self.client.patch(path, headers=headers, json={"trafficLimitBytes": 350 * 1024 ** 3})
+            self.assertEqual(repeated.json()["updatedCount"], 0)
+            unlimited = self.client.patch(path, headers=headers, json={"trafficLimitBytes": 0})
+            self.assertEqual(unlimited.status_code, 200, unlimited.text)
+            self.assertTrue(all(user["trafficLimitBytes"] is None for user in manager.read_registry()["users"].values()))
+        self.assertEqual(self.config_path.read_bytes(), before_config)
+        self.assertEqual(self.traffic_path.read_bytes(), before_traffic)
+
     def test_history_snapshot_is_authenticated_read_only_and_does_not_collect_traffic(self):
         proxy = {"server": "198.51.100.30", "port": 1080,
                  "username": "upstream-account", "password": "upstream-password"}
