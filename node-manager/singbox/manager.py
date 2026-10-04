@@ -2252,6 +2252,32 @@ def _discover_user_ids(data: dict[str, Any], registry: dict[str, Any]) -> set[st
     return user_ids
 
 
+def get_history_user_snapshot() -> dict[str, Any]:
+    """Read matching identity and dates without collecting traffic or protocol credentials."""
+    with _config_lock():
+        data, registry = read_config(), read_registry()
+    outbounds: dict[str, list[dict[str, Any]]] = {}
+    for outbound in data.get("outbounds", []):
+        outbounds.setdefault(str(outbound.get("tag") or ""), []).append(outbound)
+    users = []
+    for user_id in sorted(_discover_user_ids(data, registry)):
+        metadata = _registry_user(registry, user_id)
+        candidates = outbounds.get(USER_OUTBOUND_PREFIX + user_id, [])
+        if len(candidates) > 1:
+            raise SingboxConfigError("ambiguous proxy; historical snapshot refused")
+        outbound = candidates[0] if candidates else None
+        proxy = None
+        if outbound and outbound.get("type") in {"socks", "socks5"}:
+            proxy = {
+                "server": outbound.get("server"), "port": outbound.get("server_port"),
+                "username": outbound.get("username"), "password": outbound.get("password"),
+                "sourceIp": metadata.get("sourceIp"),
+            }
+        users.append({"userId": user_id, "createdAt": metadata.get("createdAt"),
+                      "expiresAt": metadata.get("expiresAt"), "proxy": proxy})
+    return {"version": 1, "users": users}
+
+
 def ensure_user_outbounds() -> int:
     with _config_lock():
         current = read_config()

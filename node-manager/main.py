@@ -293,6 +293,13 @@ def export_replication(response: Response, sharedConfig: bool = False, _token: s
     return export_users(shared_config=sharedConfig)
 
 
+@app.get("/api/users/history-snapshot", tags=["users"])
+def export_history_snapshot(response: Response, _token: str = Depends(verify_token)):
+    from singbox.manager import get_history_user_snapshot
+    response.headers["Cache-Control"] = "no-store"
+    return get_history_user_snapshot()
+
+
 @app.post("/api/users/replication", tags=["users"])
 def apply_replication(request: ReplicationRequest, _token: str = Depends(verify_token)):
     return apply_users(request)

@@ -1417,6 +1417,30 @@ class ApiTestCase(unittest.TestCase):
         self.assertEqual(response.status_code, 200, response.text)
         self.assertTrue(response.json()["trafficReset"])
 
+    def test_history_snapshot_is_authenticated_read_only_and_does_not_collect_traffic(self):
+        proxy = {"server": "198.51.100.30", "port": 1080,
+                 "username": "upstream-account", "password": "upstream-password"}
+        manager.create_user("history-date", ["socks"], proxy=proxy)
+        initial_config, initial_registry = self.config_path.read_bytes(), self.registry_path.read_bytes()
+        path = "/api/users/history-snapshot"
+        self.assertIn(self.client.get(path).status_code, (401, 403))
+        with patch.object(main, "export_users", side_effect=AssertionError("must not collect replication/traffic")):
+            response = self.client.get(path, headers={"Authorization": "Bearer test-token"})
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.headers["Cache-Control"], "no-store")
+        snapshot = response.json()
+        self.assertEqual(snapshot["version"], 1)
+        self.assertEqual(len(snapshot["users"]), 1)
+        user = snapshot["users"][0]
+        self.assertEqual(user["userId"], "history-date")
+        for field, value in proxy.items():
+            self.assertEqual(user["proxy"][field], value)
+        self.assertEqual(user["expiresAt"], manager.read_registry()["users"]["history-date"]["expiresAt"])
+        self.assertNotIn("auth", user)
+        self.assertNotIn("upload", user)
+        self.assertEqual(self.config_path.read_bytes(), initial_config)
+        self.assertEqual(self.registry_path.read_bytes(), initial_registry)
+
     def test_authoritative_expiration_sync_preserves_policy_credentials_and_traffic(self):
         headers = {"Authorization": "Bearer test-token"}
         proxy = {"server": "198.51.100.30", "port": 1080,
