@@ -588,7 +588,7 @@ def renew_user_endpoint(
         traffic_limit_bytes=request.trafficLimitBytes,
         max_source_ips=request.maxSourceIps,
     )
-    if request.resetTraffic:
+    if request.resetTraffic and not result.get("expirationPrecisionOnly", False):
         traffic = reset_user_traffic(userId, renewal_key=result["expiresAt"])
         result.update(traffic)
     else:

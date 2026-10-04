@@ -1149,6 +1149,17 @@ def renew_user(
         old_expiry = _as_utc(metadata.get("expiresAt"))
         if old_expiry is not None and now >= old_expiry + RESTORE_WINDOW:
             raise SingboxConfigError("user restore window has expired")
+        # Legacy clients round timestamps to seconds; that is not a new renewal cycle.
+        if old_expiry is not None and timedelta(0) < abs(new_expiry - old_expiry) < timedelta(seconds=1):
+            return {
+                "success": True,
+                "userId": user_id,
+                "expiresAt": metadata["expiresAt"],
+                "expirationStatus": "ACTIVE" if old_expiry > now else "EXPIRED",
+                "expirationPrecisionOnly": True,
+                "trafficLimitBytes": _positive_policy_value(metadata.get("trafficLimitBytes")),
+                "maxSourceIps": _positive_policy_value(metadata.get("maxSourceIps")),
+            }
         if old_expiry is not None and new_expiry < old_expiry:
             raise SingboxConfigError("renewal cannot shorten the existing expiration")
 

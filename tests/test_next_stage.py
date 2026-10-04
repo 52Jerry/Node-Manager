@@ -1393,6 +1393,30 @@ class ApiTestCase(unittest.TestCase):
         store = json.loads(self.traffic_path.read_text(encoding="utf-8"))
         self.assertEqual(store["users"]["renew-api-user"]["download"], 0)
 
+    def test_rounded_renewal_preserves_authoritative_expiration_and_traffic(self):
+        headers = {"Authorization": "Bearer test-token"}
+        expiry = (datetime.now(timezone.utc) + timedelta(days=30)).replace(microsecond=572000)
+        manager.create_user("rounded-renewal", ["socks"], expires_at=expiry,
+                            traffic_limit_bytes=214748364800, max_source_ips=5)
+        original = manager.read_registry()["users"]["rounded-renewal"]
+        self.traffic_path.write_text(json.dumps({"users": {"rounded-renewal": {"upload": 10, "download": 20}}}),
+                                     encoding="utf-8")
+        traffic_before = self.traffic_path.read_bytes()
+        for rounded in (expiry.replace(microsecond=0), expiry.replace(microsecond=0) + timedelta(seconds=1)):
+            response = self.client.post("/api/user/rounded-renewal/renew", headers=headers, json={
+                "expiresAt": rounded.isoformat(), "resetTraffic": True,
+                "trafficLimitBytes": 100, "maxSourceIps": 1})
+            self.assertEqual(response.status_code, 200, response.text)
+            self.assertFalse(response.json()["trafficReset"])
+            self.assertTrue(response.json()["expirationPrecisionOnly"])
+            self.assertEqual(manager.read_registry()["users"]["rounded-renewal"], original)
+            self.assertEqual(self.traffic_path.read_bytes(), traffic_before)
+
+        response = self.client.post("/api/user/rounded-renewal/renew", headers=headers, json={
+            "expiresAt": (expiry + timedelta(days=30)).isoformat(), "resetTraffic": True})
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertTrue(response.json()["trafficReset"])
+
     def test_authoritative_expiration_sync_preserves_policy_credentials_and_traffic(self):
         headers = {"Authorization": "Bearer test-token"}
         proxy = {"server": "198.51.100.30", "port": 1080,
