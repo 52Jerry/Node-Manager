@@ -131,11 +131,25 @@ class ApplyDefaultTrafficLimitRequest(BaseModel):
     trafficLimitBytes: int = Field(ge=0, le=1073741824000000)
 
 
+class ResetTrafficRequest(BaseModel):
+    cycleStart: datetime | None = None
+
+    @field_validator("cycleStart")
+    @classmethod
+    def cycle_must_have_started(cls, value: datetime | None) -> datetime | None:
+        if value is None:
+            return None
+        normalized = value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+        if normalized > datetime.now(timezone.utc):
+            raise ValueError("cycleStart must not be in the future")
+        return normalized
+
+
 class RenewUserRequest(BaseModel):
     expiresAt: datetime
     trafficLimitBytes: int | None = Field(default=None, ge=0)
     maxSourceIps: int | None = Field(default=None, ge=0, le=1000)
-    resetTraffic: bool = True
+    resetTraffic: bool = False
 
     @field_validator("expiresAt")
     @classmethod

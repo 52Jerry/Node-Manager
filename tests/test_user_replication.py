@@ -222,6 +222,39 @@ class UserReplicationTest(unittest.TestCase):
         self.assertEqual(export_users(), snapshot)
         self.assertEqual(manager.read_config()["inbounds"][-1]["listen_port"], 2443)
 
+    def test_fixed_cycle_reset_propagates_and_stale_snapshots_cannot_restore_old_usage(self):
+        self.create()
+        store = traffic._empty_store()
+        store["users"]["primary-7"] = {"upload": 100, "download": 200, "lastTrafficCycleStart": 1000}
+        traffic._write_store(store)
+        old = export_users()
+        fresh = copy.deepcopy(old)
+        fresh["users"][0].update(upload=0, download=0, trafficCycleStart=2000)
+        self.reset_target()
+        apply_users(self.request(old))
+        apply_users(self.request(fresh))
+        self.assertEqual(export_users()["users"][0]["download"], 0)
+        current = traffic._read_store()
+        current["users"]["primary-7"]["download"] = 25
+        traffic._write_store(current)
+        apply_users(self.request(fresh))
+        self.assertEqual(export_users()["users"][0]["download"], 25)
+        apply_users(self.request(old))
+        self.assertEqual(export_users()["users"][0]["download"], 25)
+        self.assertEqual(export_users()["users"][0]["trafficCycleStart"], 2000)
+        manual = copy.deepcopy(fresh)
+        manual["users"][0]["manualTrafficResetAt"] = 999999
+        apply_users(self.request(manual))
+        self.assertEqual(export_users()["users"][0]["download"], 0)
+        current = traffic._read_store()
+        current["users"]["primary-7"]["download"] = 25
+        traffic._write_store(current)
+        # Extending expiry within the same traffic period is not another clear.
+        renewed = copy.deepcopy(manual)
+        renewed["users"][0]["expiresAt"] = (datetime.now(timezone.utc) + timedelta(days=60)).isoformat()
+        apply_users(self.request(renewed))
+        self.assertEqual(export_users()["users"][0]["download"], 25)
+
     def test_repeated_sync_does_not_reload_or_reset_target_usage(self):
         self.create()
         snapshot = export_users()

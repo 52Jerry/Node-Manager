@@ -50,6 +50,8 @@ class PortableUser(StrictModel):
     maxConnections: int | None = Field(default=None, gt=0, le=100000)
     upload: int = Field(default=0, ge=0)
     download: int = Field(default=0, ge=0)
+    trafficCycleStart: int | None = Field(default=None, ge=0)
+    manualTrafficResetAt: int = Field(default=0, ge=0)
     remark: str | None = Field(default=None, max_length=1024)
     tags: list[str] = Field(default_factory=list, max_length=32)
 
@@ -152,6 +154,8 @@ def export_users(shared_config=False):
                 trafficLimitBytes=metadata.get("trafficLimitBytes"), maxSourceIps=metadata.get("maxSourceIps"),
                 maxConnections=metadata.get("maxConnections"),
                 upload=int(usage.get("upload") or 0), download=int(usage.get("download") or 0),
+                trafficCycleStart=usage.get("lastTrafficCycleStart"),
+                manualTrafficResetAt=int(usage.get("lastManualTrafficResetAt") or 0),
                 remark=metadata.get("remark"), tags=metadata.get("tags") or [],
             ).model_dump(mode="json"))
         if len(users) > 10000:
@@ -285,8 +289,20 @@ def apply_users(request: ReplicationRequest):
                 cycle = metadata["expiresAt"]
                 previous_cycle = previous_metadata.get(user_id, {}).get("expiresAt")
                 same_cycle = usage.get("replicationCycle") == cycle or previous_cycle == cycle
-                usage["upload"] = max(int(usage.get("upload") or 0), user.upload) if same_cycle else user.upload
-                usage["download"] = max(int(usage.get("download") or 0), user.download) if same_cycle else user.download
+                local_start = usage.get("lastTrafficCycleStart")
+                source_start = user.trafficCycleStart
+                local_epoch = (local_start if local_start is not None else -1, int(usage.get("lastManualTrafficResetAt") or 0))
+                source_epoch = (source_start if source_start is not None else -1, user.manualTrafficResetAt)
+                has_reset_epoch = local_epoch != (-1, 0) or source_epoch != (-1, 0)
+                stale_traffic = has_reset_epoch and source_epoch < local_epoch
+                if has_reset_epoch:
+                    same_cycle = source_epoch == local_epoch
+                if not stale_traffic:
+                    usage["upload"] = max(int(usage.get("upload") or 0), user.upload) if same_cycle else user.upload
+                    usage["download"] = max(int(usage.get("download") or 0), user.download) if same_cycle else user.download
+                    if source_start is not None:
+                        usage["lastTrafficCycleStart"] = source_start
+                    usage["lastManualTrafficResetAt"] = user.manualTrafficResetAt
                 usage["replicationCycle"] = cycle
                 limited = bool(user.trafficLimitBytes and usage["upload"] + usage["download"] >= user.trafficLimitBytes)
                 auth_names = sorted({auth.username if auth.protocol == "socks" else manager._auth_name(user_id)

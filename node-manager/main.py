@@ -35,6 +35,7 @@ from models.request import (
     ProxyMetadataUpdateRequest,
     ReloadResponse,
     RenewUserRequest,
+    ResetTrafficRequest,
     ResidentialProtocolsResponse,
     ResidentialSocksRequest,
     TrafficResponse,
@@ -67,6 +68,7 @@ from monitor.traffic import (
     reset_user_traffic,
 )
 from network_check import run_network_check
+from monitor.traffic_reset import reset_traffic
 from user_replication import ReplicationRequest, export_users, apply_users
 from ha_readiness import ReadinessRequest, readiness
 from monitor.health_check import (
@@ -570,6 +572,22 @@ def batch_delete_users_endpoint(
 @app.get("/api/user/{userId}/traffic", response_model=TrafficResponse, tags=["users"])
 def get_user_traffic_endpoint(userId: str, _token: str = Depends(verify_token)):
     return get_user_traffic(userId)
+
+
+@app.post("/api/user/{userId}/traffic/reset", tags=["users"])
+def reset_user_traffic_endpoint(
+    userId: str,
+    request: ResetTrafficRequest,
+    idempotency_key: str = Header(alias="Idempotency-Key", min_length=1, max_length=128),
+    _token: str = Depends(verify_token),
+):
+    if not userId or len(userId) > 64:
+        raise HTTPException(status_code=422, detail="invalid userId")
+    result, _ = execute_idempotent(
+        idempotency_key, "traffic-reset:" + userId, request.model_dump(mode="json"),
+        lambda: reset_traffic(userId, request.cycleStart),
+    )
+    return result
 
 
 @app.patch("/api/user/{userId}/policy", tags=["users"])

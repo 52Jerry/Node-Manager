@@ -1362,6 +1362,91 @@ class ApiTestCase(unittest.TestCase):
             ["sort-z", "sort-a"],
         )
 
+    def test_fixed_cycle_reset_is_idempotent_and_preserves_expiry_policy_and_baselines(self):
+        headers = {"Authorization": "Bearer test-token", "Idempotency-Key": "cycle-1"}
+        expiry = datetime.now(timezone.utc) + timedelta(days=60)
+        manager.create_user("cycle-user", ["socks"], expires_at=expiry,
+                            traffic_limit_bytes=200 * 1024 ** 3, max_source_ips=5)
+        before = manager.read_registry()["users"]["cycle-user"].copy()
+        store = {"users": {"cycle-user": {"upload": 100, "download": 200}},
+                 "connections": {"c1": {"userId": "cycle-user", "upload": 100, "download": 200}}}
+        self.traffic_path.write_text(json.dumps(store), encoding="utf-8")
+        cycle = datetime.now(timezone.utc) - timedelta(days=1)
+        payload = {"cycleStart": cycle.isoformat()}
+        url = "/api/user/cycle-user/traffic/reset"
+        response = self.client.post(url, headers=headers, json=payload)
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertTrue(response.json()["trafficReset"])
+        current = json.loads(self.traffic_path.read_text(encoding="utf-8"))
+        self.assertEqual(current["connections"], store["connections"])
+        self.assertEqual(current["users"]["cycle-user"]["download"], 0)
+        self.assertEqual(manager.read_registry()["users"]["cycle-user"], before)
+        current["users"]["cycle-user"]["download"] = 42
+        self.traffic_path.write_text(json.dumps(current), encoding="utf-8")
+        # A different transport key must still not reset a previously acknowledged cycle.
+        headers["Idempotency-Key"] = "cycle-retry"
+        retry = self.client.post(url, headers=headers, json=payload)
+        self.assertEqual(retry.status_code, 200, retry.text)
+        self.assertFalse(retry.json()["trafficReset"])
+        self.assertEqual(json.loads(self.traffic_path.read_text(encoding="utf-8"))["users"]["cycle-user"]["download"], 42)
+        headers["Idempotency-Key"] = "stale-cycle"
+        stale = self.client.post(url, headers=headers, json={"cycleStart": (cycle - timedelta(days=30)).isoformat()})
+        self.assertFalse(stale.json()["trafficReset"])
+        # Manual resets do not move the fixed-cycle watermark.
+        headers["Idempotency-Key"] = "manual-reset"
+        manual = self.client.post(url, headers=headers, json={})
+        self.assertEqual(manual.status_code, 200, manual.text)
+        self.assertTrue(manual.json()["trafficReset"])
+        after = json.loads(self.traffic_path.read_text(encoding="utf-8"))["users"]["cycle-user"]
+        self.assertEqual(after["lastTrafficCycleStart"], current["users"]["cycle-user"]["lastTrafficCycleStart"])
+
+    def test_traffic_reset_requires_auth_key_and_existing_user(self):
+        url = "/api/user/no-user/traffic/reset"
+        self.assertIn(self.client.post(url, json={}).status_code, (401, 403, 422))
+        headers = {"Authorization": "Bearer test-token"}
+        self.assertEqual(self.client.post(url, headers=headers, json={}).status_code, 422)
+        headers["Idempotency-Key"] = "missing-user"
+        self.assertEqual(self.client.post(url, headers=headers, json={}).status_code, 409)
+        future = datetime.now(timezone.utc) + timedelta(days=1)
+        self.assertEqual(self.client.post(url, headers=headers, json={"cycleStart": future.isoformat()}).status_code, 422)
+
+    def test_traffic_reset_does_not_restore_an_expired_user(self):
+        headers = {"Authorization": "Bearer test-token", "Idempotency-Key": "expired-reset"}
+        manager.create_user("expired-reset", ["socks"])
+        registry = manager.read_registry()
+        registry["users"]["expired-reset"]["expiresAt"] = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
+        manager._write_registry(registry)
+        manager.process_user_expirations()
+        before = manager.read_registry()["users"]["expired-reset"].copy()
+        response = self.client.post("/api/user/expired-reset/traffic/reset", headers=headers, json={})
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(manager.read_registry()["users"]["expired-reset"], before)
+        connection = self.client.get("/api/user/expired-reset/connections", headers=headers)
+        self.assertEqual(connection.status_code, 409)
+
+    def test_default_renewal_preserves_traffic_and_manual_policy(self):
+        headers = {"Authorization": "Bearer test-token"}
+        manager.create_user("renew-preserve", ["socks"], traffic_limit_bytes=12345, max_source_ips=3)
+        self.traffic_path.write_text(json.dumps({"users": {"renew-preserve": {"upload": 10, "download": 20}}}), encoding="utf-8")
+        expiry = datetime.now(timezone.utc) + timedelta(days=60)
+        response = self.client.post("/api/user/renew-preserve/renew", headers=headers,
+                                    json={"expiresAt": expiry.isoformat()})
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertFalse(response.json()["trafficReset"])
+        self.assertEqual(json.loads(self.traffic_path.read_text(encoding="utf-8"))["users"]["renew-preserve"]["download"], 20)
+        self.assertEqual(manager.get_user_policy("renew-preserve")["trafficLimitBytes"], 12345)
+        self.assertEqual(manager.get_user_policy("renew-preserve")["maxSourceIps"], 3)
+
+    def test_cycle_reset_failure_does_not_acknowledge_or_clear_usage(self):
+        manager.create_user("reset-failure", ["socks"])
+        self.traffic_path.write_text(json.dumps({"users": {"reset-failure": {"upload": 12, "download": 34}}}), encoding="utf-8")
+        before = self.traffic_path.read_bytes()
+        from monitor.traffic_reset import reset_traffic
+        with patch.object(traffic, "sync_user_enforcements", side_effect=manager.SingboxConfigError("reload failed")):
+            with self.assertRaises(manager.SingboxConfigError):
+                reset_traffic("reset-failure", datetime.now(timezone.utc) - timedelta(days=1))
+        self.assertEqual(self.traffic_path.read_bytes(), before)
+
     def test_renewal_retries_do_not_reset_new_traffic_or_shorten_expiration(self):
         headers = {"Authorization": "Bearer test-token"}
         manager.create_user("renew-api-user", ["socks"])
