@@ -68,6 +68,8 @@ class SecurityConfig:
     token: str = ""
     # B1: 可选 Control Plane IP 白名单（逗号分隔 CIDR），留空则仅校验 Token。
     allowed_cidrs: str = ""
+    # Only transport peers in these CIDRs may supply X-Forwarded-For.
+    trusted_proxy_cidrs: str = ""
     # B2: revision 签名密钥，留空则复用 token。用于 desired revision 推送校验。
     revision_secret: str = ""
 
@@ -87,6 +89,9 @@ class SingboxConfig:
 class MonitoringConfig:
     traffic_sample_interval_seconds: float = 2.0
     device_active_window_seconds: float = 60.0
+    # Source-IP decisions can alternate while connections are sampled. Apply
+    # them in batches so a busy node does not reload sing-box every few seconds.
+    source_enforcement_update_interval_seconds: float = 60.0
     relay_source_cidrs: str = ""
     # 健康检查：0=禁用，默认 1200 秒（20 分钟）
     health_check_interval_seconds: int = 1200
@@ -216,6 +221,9 @@ def load_config() -> Config:
     result.security.allowed_cidrs = str(
         security.get("allowed_cidrs", result.security.allowed_cidrs)
     )
+    from trusted_source import networks
+    result.security.trusted_proxy_cidrs = str(security.get("trusted_proxy_cidrs", ""))
+    networks(result.security.trusted_proxy_cidrs)
     result.security.revision_secret = str(
         security.get("revision_secret", result.security.revision_secret)
     )
@@ -243,6 +251,15 @@ def load_config() -> Config:
             "monitoring.device_active_window_seconds must be between 1 and 3600"
         )
     result.monitoring.device_active_window_seconds = device_window
+    source_interval = float(monitoring.get(
+        "source_enforcement_update_interval_seconds",
+        result.monitoring.source_enforcement_update_interval_seconds,
+    ))
+    if source_interval < 0 or source_interval > 3600:
+        raise ValueError(
+            "monitoring.source_enforcement_update_interval_seconds must be between 0 and 3600"
+        )
+    result.monitoring.source_enforcement_update_interval_seconds = source_interval
     relay_cidrs = str(monitoring.get("relay_source_cidrs", ""))
     for cidr in relay_cidrs.split(","):
         if cidr.strip():

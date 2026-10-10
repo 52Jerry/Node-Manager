@@ -144,7 +144,10 @@ class ManagerTestCase(unittest.TestCase):
 
     def test_credential_edit_preserves_source_ip_and_expiration_blocks(self):
         manager.create_user("edit-user", ["socks"], socks_username="old-account", socks_password="old")
-        manager.sync_user_enforcements({"edit-user": {"blockedSourceIps": ["198.51.100.3"]}})
+        manager.sync_user_enforcements(
+            {"edit-user": {"blockedSourceIps": ["198.51.100.3"]}},
+            persist_source_blocks=True,
+        )
         now = datetime.now(timezone.utc)
         registry = manager.read_registry()
         registry["users"]["edit-user"]["expiresAt"] = (now - timedelta(hours=1)).isoformat()
@@ -1047,6 +1050,28 @@ class ManagerTestCase(unittest.TestCase):
             self.assertEqual(manager._connections_to_close_for_expired_users({}, set()), set())
         connections.assert_not_called()
 
+    def test_delete_expired_user_removes_expiration_and_enforcement_rules(self):
+        manager.create_user("expired-delete", ["vless", "vmess", "socks"],
+                            socks_username="expired-account", socks_password="secret")
+        now = datetime.now(timezone.utc).replace(microsecond=0)
+        registry = manager.read_registry()
+        registry["users"]["expired-delete"]["expiresAt"] = (now - timedelta(hours=1)).isoformat()
+        manager._write_registry(registry)
+        manager.sync_user_enforcements({"expired-delete": {"trafficBlocked": True, "blockedSourceIps": []}})
+        with patch.object(manager.singbox_api, "get_connections", return_value={"connections": []}):
+            manager.process_user_expirations(now)
+        self.assertEqual(sum(rule.get("action") == "reject"
+                             for rule in manager.read_config()["route"]["rules"]), 2)
+
+        self.assertTrue(manager.delete_user("expired-delete")["success"])
+        self.assertEqual(manager.read_config()["route"]["rules"], [])
+        self.assertEqual(manager.read_config()["outbounds"], [])
+        self.assertNotIn("expired-delete", manager.read_registry()["users"])
+        manager.create_user("expired-delete", ["socks"],
+                            socks_username="expired-account", socks_password="secret")
+        self.assertFalse(any(rule.get("action") == "reject"
+                             for rule in manager.read_config()["route"]["rules"]))
+
     def test_operator_can_pause_expiration_without_changing_dates_or_config(self):
         metadata = {"expiresAt": "2026-01-01T00:00:00+00:00"}
         with (patch.object(manager, "EXPIRATION_ENABLED", False),
@@ -1170,33 +1195,62 @@ class ManagerTestCase(unittest.TestCase):
 
         reload_config.assert_not_called()
 
-    def test_source_ip_enforcement_survives_proxy_rebinding_and_user_deletion(self):
+    def test_dynamic_source_ip_blocks_are_not_written_to_singbox(self):
         manager.create_user("device-user", ["socks"])
-        manager.sync_user_enforcements(
-            {
-                "device-user": {
-                    "trafficBlocked": False,
-                    "blockedSourceIps": ["198.51.100.20", "2001:db8::20"],
+        with patch.object(manager, "_write_and_reload") as reload_config:
+            manager.sync_user_enforcements(
+                {
+                    "device-user": {
+                        "trafficBlocked": False,
+                        "blockedSourceIps": ["198.51.100.20"],
+                    }
                 }
-            }
-        )
-        manager.bind_proxy(
-            "device-user",
-            {"server": "203.0.113.20", "port": 1080},
-        )
-
-        rebound = json.loads(self.config_path.read_text(encoding="utf-8"))
-        self.assertEqual(rebound["route"]["rules"][0]["action"], "reject")
-        self.assertEqual(
-            rebound["route"]["rules"][0]["source_ip_cidr"],
-            ["198.51.100.20/32", "2001:db8::20/128"],
-        )
-        self.assertEqual(rebound["route"]["rules"][1]["action"], "route")
-
-        manager.delete_user("device-user")
-        deleted = json.loads(self.config_path.read_text(encoding="utf-8"))
+            )
+            manager.sync_user_enforcements(
+                {
+                    "device-user": {
+                        "trafficBlocked": False,
+                        "blockedSourceIps": ["198.51.100.21", "2001:db8::20"],
+                    }
+                }
+            )
+        reload_config.assert_not_called()
+        current = json.loads(self.config_path.read_text(encoding="utf-8"))
         self.assertFalse(
-            any(rule.get("action") == "reject" for rule in deleted["route"]["rules"])
+            any("source_ip_cidr" in rule for rule in current["route"]["rules"])
+        )
+        metadata = manager.read_registry()["users"]["device-user"]
+        self.assertNotIn(manager.ENFORCEMENT_SOURCE_CIDRS_KEY, metadata)
+
+    def test_legacy_source_ip_rules_are_removed_once(self):
+        manager.create_user("legacy-source-user", ["socks"])
+        manager.sync_user_enforcements(
+            {"legacy-source-user": {"blockedSourceIps": ["198.51.100.20"]}},
+            persist_source_blocks=True,
+        )
+        self.assertTrue(
+            any(
+                rule.get("source_ip_cidr") == ["198.51.100.20/32"]
+                for rule in manager.read_config()["route"]["rules"]
+            )
+        )
+
+        with patch.object(
+            manager, "_write_and_reload", wraps=self._write_config
+        ) as reload_config:
+            manager.sync_user_enforcements(
+                {"legacy-source-user": {"blockedSourceIps": []}}
+            )
+            manager.sync_user_enforcements(
+                {"legacy-source-user": {"blockedSourceIps": []}}
+            )
+
+        reload_config.assert_called_once()
+        self.assertFalse(
+            any(
+                "source_ip_cidr" in rule
+                for rule in manager.read_config()["route"]["rules"]
+            )
         )
 
     def test_user_auth_map_includes_protocol_and_custom_socks_names(self):
@@ -1702,9 +1756,9 @@ class ApiTestCase(unittest.TestCase):
         )
         self.assertEqual(deleted.status_code, 200, deleted.text)
         body = deleted.json()
-        self.assertFalse(body["success"])
-        self.assertEqual(set(body["deleted"]), {"ip-search-a", "ip-search-b"})
-        self.assertEqual(body["failed"][0]["userId"], "missing-user")
+        self.assertTrue(body["success"])
+        self.assertEqual(set(body["deleted"]), {"ip-search-a", "ip-search-b", "missing-user"})
+        self.assertEqual(body["failed"], [])
 
         remaining = self.client.get("/api/users", headers=headers)
         self.assertEqual(remaining.status_code, 200, remaining.text)
@@ -1780,6 +1834,51 @@ class ApiTestCase(unittest.TestCase):
         self.assertIsNone(response.json()["missingSourceConnections"])
         self.assertIsNone(response.json()["onlineConnections"])
         self.assertEqual(response.json()["trafficLimitBytes"], 200 * 1024 ** 3)
+
+    def test_delete_archived_or_missing_user_is_idempotent(self):
+        headers = {"Authorization": "Bearer test-token", "Idempotency-Key": "revoke:archived"}
+        manager.create_user("archived-delete", ["socks"])
+        now = datetime.now(timezone.utc).replace(microsecond=0)
+        registry = manager.read_registry()
+        registry["users"]["archived-delete"]["expiresAt"] = (now - timedelta(hours=25)).isoformat()
+        manager._write_registry(registry)
+        with patch.object(manager.singbox_api, "get_connections", return_value={"connections": []}):
+            manager.process_user_expirations(now)
+        self.assertIn("archived-delete", manager.read_registry()["expiredUsers"])
+        for _ in range(2):
+            response = self.client.delete("/api/user/delete/archived-delete", headers=headers)
+            self.assertEqual(response.status_code, 200, response.text)
+            self.assertTrue(response.json()["success"])
+        self.assertEqual(response.headers["Idempotency-Replayed"], "true")
+        response = self.client.delete("/api/user/delete/missing-user",
+                                     headers={"Authorization": "Bearer test-token"})
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertTrue(response.json()["success"])
+
+    def test_delete_reload_failure_keeps_user_and_remains_retryable(self):
+        manager.create_user("failed-delete", ["socks"])
+        before_config, before_registry = manager.read_config(), manager.read_registry()
+        headers = {"Authorization": "Bearer test-token", "Idempotency-Key": "revoke:failure"}
+        with patch.object(manager, "_write_and_reload", side_effect=manager.SingboxConfigError("reload failed")):
+            response = self.client.delete("/api/user/delete/failed-delete", headers=headers)
+        self.assertEqual(response.status_code, 409, response.text)
+        self.assertEqual(manager.read_config(), before_config)
+        self.assertEqual(manager.read_registry(), before_registry)
+        response = self.client.delete("/api/user/delete/failed-delete", headers=headers)
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertTrue(response.json()["success"])
+
+    def test_batch_delete_does_not_treat_real_config_failure_as_success(self):
+        manager.create_user("batch-failure", ["socks"])
+        with patch.object(manager, "_write_and_reload", side_effect=manager.SingboxConfigError("reload failed")):
+            response = self.client.post("/api/users/batch-delete",
+                                        headers={"Authorization": "Bearer test-token"},
+                                        json={"userIds": ["batch-failure", "missing-user"]})
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertFalse(response.json()["success"])
+        self.assertEqual(response.json()["deleted"], ["missing-user"])
+        self.assertEqual(response.json()["failed"][0]["userId"], "batch-failure")
+        self.assertTrue(manager._user_exists(manager.read_config(), manager.read_registry(), "batch-failure"))
 
     def test_delete_user_clears_traffic_before_recreating_same_id(self):
         headers = {"Authorization": "Bearer test-token"}
@@ -2478,9 +2577,13 @@ class TrafficTestCase(unittest.TestCase):
             {
                 "device-user": {
                     "trafficBlocked": False,
-                    "blockedSourceIps": ["198.51.100.11"],
+                    "blockedSourceIps": [],
                 }
             }
+        )
+        self.assertEqual(
+            traffic.get_traffic_store_snapshot()["users"]["device-user"]["blockedSourceIps"],
+            ["198.51.100.11"],
         )
 
     def test_custom_auth_metadata_is_attributed_to_the_registered_user(self):
@@ -2589,6 +2692,10 @@ class TrafficTestCase(unittest.TestCase):
         self.assertEqual(result["status"], "device_limited")
         self.assertEqual(
             self.enforcement.call_args_list[-1].args[0]["sticky-user"]["blockedSourceIps"],
+            [],
+        )
+        self.assertEqual(
+            traffic.get_traffic_store_snapshot()["users"]["sticky-user"]["blockedSourceIps"],
             ["198.51.100.51"],
         )
 
@@ -2637,6 +2744,151 @@ class TrafficTestCase(unittest.TestCase):
                 }
             },
         )
+
+    def test_source_enforcement_changes_are_runtime_only(self):
+        policies = {"debounce-user": {"trafficLimitBytes": None, "maxSourceIps": 1}}
+        first = {
+            "connections": [
+                {
+                    "id": "allowed",
+                    "chains": ["node-manager-out:debounce-user"],
+                    "metadata": {"sourceIP": "198.51.100.70"},
+                },
+                {
+                    "id": "blocked-a",
+                    "chains": ["node-manager-out:debounce-user"],
+                    "metadata": {"sourceIP": "198.51.100.71"},
+                },
+            ]
+        }
+        changed = {
+            "connections": [
+                {
+                    "id": "allowed",
+                    "chains": ["node-manager-out:debounce-user"],
+                    "metadata": {"sourceIP": "198.51.100.70"},
+                },
+                {
+                    "id": "blocked-a",
+                    "chains": ["node-manager-out:debounce-user"],
+                    "metadata": {"sourceIP": "198.51.100.71"},
+                },
+                {
+                    "id": "blocked-b",
+                    "chains": ["node-manager-out:debounce-user"],
+                    "metadata": {"sourceIP": "198.51.100.72"},
+                },
+            ]
+        }
+        with (
+            patch.object(
+                traffic.singbox_api,
+                "get_connections",
+                side_effect=[first, changed, changed],
+            ),
+            patch.object(traffic, "get_user_policies", return_value=policies),
+            patch.object(traffic.time, "time", side_effect=[1000, 1010, 1020]),
+            patch.object(
+                traffic.singbox_api, "close_connection", return_value=True
+            ) as close,
+        ):
+            self.assertTrue(traffic.collect_traffic())
+            self.assertTrue(traffic.collect_traffic())
+            self.assertTrue(traffic.collect_traffic())
+
+        desired = [
+            call.args[0]["debounce-user"]
+            for call in self.enforcement.call_args_list[-3:]
+        ]
+        self.assertTrue(all(item["blockedSourceIps"] == [] for item in desired))
+        self.assertCountEqual(
+            [call.args[0] for call in close.call_args_list],
+            ["blocked-a", "blocked-a", "blocked-b", "blocked-a", "blocked-b"],
+        )
+
+    def test_source_changes_apply_immediately_without_persistence_state(self):
+        policies = {"pending-user": {"trafficLimitBytes": None, "maxSourceIps": 1}}
+        store = {"version": 1, "users": {}, "connections": {}}
+
+        def connections(*source_ips):
+            return {
+                "pending-user": [
+                    {"id": f"connection-{index}", "sourceIp": source_ip}
+                    for index, source_ip in enumerate(source_ips)
+                ]
+            }
+
+        first, _ = traffic._enforce_policies(
+            store,
+            connections("198.51.100.100", "198.51.100.101"),
+            policies,
+            1000,
+        )
+        changed, _ = traffic._enforce_policies(
+            store,
+            connections("198.51.100.100", "198.51.100.102"),
+            policies,
+            1010,
+        )
+
+        self.assertEqual(
+            first["pending-user"]["blockedSourceIps"], ["198.51.100.101"]
+        )
+        self.assertEqual(
+            store["users"]["pending-user"]["activeSourceIps"], ["198.51.100.100"]
+        )
+        self.assertEqual(
+            changed["pending-user"]["blockedSourceIps"],
+            ["198.51.100.101", "198.51.100.102"],
+        )
+        self.assertNotIn("sourceEnforcementLastAppliedAt", store)
+        self.assertNotIn("sourceEnforcementPendingCidrs", store["users"]["pending-user"])
+
+    def test_multiple_source_changes_are_sent_in_one_enforcement_batch(self):
+        policies = {
+            "batch-a": {"trafficLimitBytes": None, "maxSourceIps": 1},
+            "batch-b": {"trafficLimitBytes": None, "maxSourceIps": 1},
+        }
+        snapshot = {
+            "connections": [
+                {
+                    "id": "a-allowed",
+                    "chains": ["node-manager-out:batch-a"],
+                    "metadata": {"sourceIP": "198.51.100.80"},
+                },
+                {
+                    "id": "a-blocked",
+                    "chains": ["node-manager-out:batch-a"],
+                    "metadata": {"sourceIP": "198.51.100.81"},
+                },
+                {
+                    "id": "b-allowed",
+                    "chains": ["node-manager-out:batch-b"],
+                    "metadata": {"sourceIP": "198.51.100.90"},
+                },
+                {
+                    "id": "b-blocked",
+                    "chains": ["node-manager-out:batch-b"],
+                    "metadata": {"sourceIP": "198.51.100.91"},
+                },
+            ]
+        }
+        with (
+            patch.object(
+                traffic.singbox_api, "get_connections", return_value=snapshot
+            ),
+            patch.object(traffic, "get_user_policies", return_value=policies),
+            patch.object(traffic.singbox_api, "close_connection", return_value=True),
+        ):
+            self.assertTrue(traffic.collect_traffic())
+
+        self.assertEqual(self.enforcement.call_count, 1)
+        desired = self.enforcement.call_args.args[0]
+        self.assertEqual(desired["batch-a"]["blockedSourceIps"], [])
+        self.assertEqual(desired["batch-b"]["blockedSourceIps"], [])
+        runtime = traffic.get_traffic_store_snapshot()["users"]
+        self.assertEqual(runtime["batch-a"]["blockedSourceIps"], ["198.51.100.81"])
+        self.assertEqual(runtime["batch-b"]["blockedSourceIps"], ["198.51.100.91"])
 
 
 class SingboxWriteReloadTest(unittest.TestCase):

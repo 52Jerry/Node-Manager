@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import ipaddress
 import logging
+import secrets
 from typing import Iterable
 
 from fastapi import HTTPException, Request, Security
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from config import config
+from trusted_source import networks, resolve
 
 logger = logging.getLogger(__name__)
 security = HTTPBearer()
@@ -21,10 +23,8 @@ def _allowed_cidrs() -> list[str]:
 def _client_ip(request: Request | None) -> str | None:
     if request is None or request.client is None:
         return None
-    forwarded = request.headers.get("x-forwarded-for")
-    if forwarded:
-        return forwarded.split(",")[0].strip()
-    return request.client.host
+    return resolve(request.client.host, request.headers.getlist("x-forwarded-for"),
+                   networks(getattr(config.security, "trusted_proxy_cidrs", "") or ""))
 
 
 def _ip_in_allowlist(client_ip: str | None, cidrs: Iterable[str]) -> bool:
@@ -52,7 +52,7 @@ def verify_token(
     # object for Request; Optional[Request] is parsed as a normal model field
     # and raises FastAPIError at route registration, breaking app import.
     token = credentials.credentials
-    if token != config.security.token:
+    if not config.security.token or not secrets.compare_digest(token.encode(), config.security.token.encode()):
         raise HTTPException(status_code=401, detail="Unauthorized")
     # B1: 可选 IP 白名单加固。未配置 allowed_cidrs 时退化为纯 Token 校验，
     # 保持向后兼容；配置后仅允许指定 CIDR 的 Control Plane 调用。

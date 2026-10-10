@@ -311,12 +311,6 @@ def apply_users(request: ReplicationRequest):
                     metadata[manager.ENFORCEMENT_TRAFFIC_KEY] = True
                     metadata[manager.ENFORCEMENT_AUTH_USERS_KEY] = auth_names
                     enforcement_rules.append({"auth_user": auth_names, "action": "reject"})
-                else:
-                    blocked = previous_metadata.get(user_id, {}).get(manager.ENFORCEMENT_SOURCE_CIDRS_KEY)
-                    if blocked and same_cycle:
-                        metadata[manager.ENFORCEMENT_SOURCE_CIDRS_KEY] = blocked
-                        metadata[manager.ENFORCEMENT_AUTH_USERS_KEY] = auth_names
-                        enforcement_rules.append({"auth_user": auth_names, "source_ip_cidr": blocked, "action": "reject"})
             data.setdefault("route", {}).setdefault("rules", [])[0:0] = enforcement_rules
             for user_id in removed:
                 store["users"].pop(user_id, None)

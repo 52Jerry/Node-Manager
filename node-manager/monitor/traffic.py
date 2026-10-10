@@ -20,6 +20,7 @@ from singbox.manager import (
 )
 from config import config
 from monitor.source_identity import normalize_ip, source_ip_diagnostics
+from monitor.telemetry import connection_summary, sample_state
 
 
 logger = logging.getLogger(__name__)
@@ -32,6 +33,8 @@ traffic_lock = threading.Lock()
 collection_lock = threading.Lock()
 stop_event = threading.Event()
 collector_thread: threading.Thread | None = None
+collection_health: dict[str, dict[str, Any]] = {}
+connection_details: dict[str, dict[str, dict[str, Any]]] = {}
 
 
 def _now() -> str:
@@ -48,10 +51,18 @@ def _read_store() -> dict[str, Any]:
     try:
         with TRAFFIC_PATH.open("r", encoding="utf-8") as handle:
             data = json.load(handle)
-    except (OSError, json.JSONDecodeError):
-        return _empty_store()
+    except (OSError, json.JSONDecodeError) as exc:
+        raise OSError("traffic_store_unreadable") from exc
     if not isinstance(data, dict) or not isinstance(data.get("users"), dict):
-        return _empty_store()
+        raise OSError("traffic_store_invalid")
+    if not isinstance(data.get("connections", {}), dict):
+        raise OSError("traffic_store_invalid")
+    for section in (data["users"], data.get("connections", {})):
+        for item in section.values():
+            if not isinstance(item, dict) or any(
+                    type(item[field]) is not int or not 0 <= item[field] <= 2**63 - 1
+                    for field in ("upload", "download") if field in item):
+                raise OSError("traffic_store_invalid_counters")
     data.setdefault("connections", {})
     data.setdefault("collectedAt", None)
     return data
@@ -121,6 +132,18 @@ def _connection_source_ip(connection: dict[str, Any]) -> str | None:
     return _connection_ip(connection, "sourceIP", "source_ip")
 
 
+def _normalized_source_cidrs(value: Any) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    return sorted(
+        {
+            normalized
+            for source_ip in value
+            if (normalized := normalize_ip(source_ip)) is not None
+        }
+    )
+
+
 def _enforce_policies(
     store: dict[str, Any],
     connections_by_user: dict[str, list[dict[str, Any]]],
@@ -161,6 +184,15 @@ def _enforce_policies(
             if source_ip is not None:
                 normalized_last_seen[str(source_ip)] = sampled_at
         user["sourceIpLastSeen"] = normalized_last_seen
+        confidence = source_ip_diagnostics(
+            [{"sourceIp": source} for source in normalized_last_seen]
+            + [{"sourceIp": None} for connection in connections if connection.get("sourceIp") is None]
+        )["sourceConfidence"]
+        reliable_source_policy = confidence in {"observed", "idle"}
+        user["sourceLimitDecision"] = (
+            "not_configured" if not max_source_ips else "observed_address_only"
+            if reliable_source_policy else "suspended_unreliable_source_review_required"
+        )
 
         if traffic_limit and int(user.get("upload") or 0) + int(user.get("download") or 0) >= traffic_limit:
             user["status"] = "traffic_limited"
@@ -180,7 +212,7 @@ def _enforce_policies(
             for source_ip in user.get("blockedSourceIps", [])
             if normalize_ip(source_ip)
         }
-        if max_source_ips:
+        if max_source_ips and reliable_source_policy:
             allowed = list(dict.fromkeys(previous_allowed_ips))[:max_source_ips]
             # Once a slot is available, release old rejected addresses so one
             # of them can become the next active source. While all slots stay
@@ -199,21 +231,23 @@ def _enforce_policies(
             )
             allowed_set = set(allowed)
             blocked_ips = retained_blocked_ips | (active_ips - allowed_set)
-            for connection in connections:
-                source_ip = connection.get("sourceIp")
-                if source_ip is not None and source_ip in blocked_ips:
-                    connections_to_close.add(str(connection["id"]))
-            user["activeSourceIps"] = sorted(allowed_set)
-            user["blockedSourceIps"] = sorted(blocked_ips)
-            user["status"] = "device_limited" if blocked_ips else "active"
-            enforcements[user_id] = {
-                "trafficBlocked": False,
-                "blockedSourceIps": sorted(blocked_ips),
-            }
         else:
-            user["activeSourceIps"] = sorted(active_ips)
-            user["blockedSourceIps"] = []
-            enforcements[user_id] = {"trafficBlocked": False, "blockedSourceIps": []}
+            allowed_set = set(active_ips)
+            blocked_ips = set()
+
+        blocked_source_ips = sorted(blocked_ips)
+        for connection in connections:
+            source_ip = connection.get("sourceIp")
+            if source_ip is not None and source_ip in blocked_ips:
+                connections_to_close.add(str(connection["id"]))
+        user["activeSourceIps"] = sorted(allowed_set)
+        user["blockedSourceIps"] = blocked_source_ips
+        user["status"] = "device_limited" if blocked_source_ips else "active"
+        user["enforcedBlockedSourceIps"] = blocked_source_ips
+        enforcements[user_id] = {
+            "trafficBlocked": False,
+            "blockedSourceIps": blocked_source_ips,
+        }
         if max_connections:
             candidates = [item for item in connections if str(item["id"]) not in connections_to_close]
             # Retain admitted sessions before new arrivals to avoid evicting long-lived connections.
@@ -231,6 +265,9 @@ def _enforce_policies(
 def _collect_traffic() -> bool:
     snapshot = singbox_api.get_connections()
     if not isinstance(snapshot, dict) or not isinstance(snapshot.get("connections"), list):
+        collection_health[str(TRAFFIC_PATH)] = {"reason": "api_unavailable"}
+        connection_details.pop(str(TRAFFIC_PATH), None)
+        logger.warning("traffic telemetry unavailable; retaining prior enforcement, review required")
         return False
 
     policies = get_user_policies()
@@ -240,6 +277,8 @@ def _collect_traffic() -> bool:
         store = _read_store()
         previous_connections = store.get("connections", {})
         active_connections: dict[str, Any] = {}
+        transient_details: dict[str, dict[str, Any]] = {}
+        seen_connection_ids: set[str] = set()
         connections_by_user: dict[str, list[dict[str, Any]]] = {}
         collected_at = _now()
         for connection in snapshot["connections"]:
@@ -249,11 +288,20 @@ def _collect_traffic() -> bool:
             connection_id = connection.get("id")
             if not user_id or not connection_id:
                 continue
-            upload = max(0, int(connection.get("upload") or 0))
-            download = max(0, int(connection.get("download") or 0))
+            if not isinstance(connection_id, str) or connection_id in seen_connection_ids:
+                raise ValueError("invalid_or_duplicate_connection_id")
+            seen_connection_ids.add(connection_id)
+            upload = connection.get("upload", 0)
+            download = connection.get("download", 0)
+            if any(type(value) is not int or not 0 <= value <= 2**63 - 1
+                   for value in (upload, download)):
+                raise ValueError("invalid_connection_counter")
             previous = previous_connections.get(connection_id, {})
             previous_upload = int(previous.get("upload") or 0)
             previous_download = int(previous.get("download") or 0)
+            if previous and (previous.get("userId") != user_id or upload < previous_upload
+                             or download < previous_download):
+                raise ValueError("connection_identity_or_counter_reset")
             source_ip = _connection_source_ip(connection)
             metadata = connection.get("metadata")
             if not isinstance(metadata, dict):
@@ -266,21 +314,22 @@ def _collect_traffic() -> bool:
                 0, download - previous_download
             )
             user["updatedAt"] = collected_at
+            transient_details[connection_id] = {
+                "destinationIp": _connection_ip(connection, "destinationIP", "destination_ip"),
+                "destinationPort": metadata.get("destinationPort"),
+                "host": metadata.get("host"),
+            }
             active_connections[connection_id] = {
                 "userId": user_id,
                 "upload": upload,
                 "download": download,
                 "sourceIp": source_ip,
                 "sourcePort": metadata.get("sourcePort"),
-                "destinationIp": _connection_ip(connection, "destinationIP", "destination_ip"),
-                "destinationPort": metadata.get("destinationPort"),
-                "host": metadata.get("host"),
                 "network": metadata.get("network"),
                 "protocol": metadata.get("type"),
                 "startedAt": connection.get("start"),
                 # Stock VLESS/Clash telemetry has no verified per-device identity.
                 "deviceId": None,
-                "credentialId": hashlib.sha256(user_id.encode("utf-8")).hexdigest()[:24],
             }
             connections_by_user.setdefault(user_id, []).append(
                 {"id": connection_id, "sourceIp": source_ip, "startedAt": connection.get("start")}
@@ -293,17 +342,35 @@ def _collect_traffic() -> bool:
             connection["online"] = connection_id not in connections_to_close
         store["connections"] = active_connections
         store["collectedAt"] = collected_at
+        store["nodeCumulativeCounters"] = singbox_api.cumulative_counters(snapshot)
         _write_store(store)
+        connection_details[str(TRAFFIC_PATH)] = transient_details
 
     enforcement_available = True
     try:
-        sync_user_enforcements(enforcements)
+        # Source-IP limits are runtime decisions enforced by closing the
+        # offending Clash connections. Persisting those volatile CIDRs into
+        # sing-box would rewrite the full config and reload the process as
+        # clients move between source addresses.
+        sync_user_enforcements(
+            {
+                user_id: {
+                    "trafficBlocked": bool(desired.get("trafficBlocked")),
+                    "blockedSourceIps": [],
+                }
+                for user_id, desired in enforcements.items()
+            }
+        )
     except Exception:
         enforcement_available = False
         logger.exception("could not synchronize sing-box user enforcement rules")
     for connection_id in connections_to_close:
         if not singbox_api.close_connection(connection_id):
             enforcement_available = False
+    collection_health[str(TRAFFIC_PATH)] = {
+        "reason": None if enforcement_available else "enforcement_unavailable"}
+    if not enforcement_available:
+        connection_details.pop(str(TRAFFIC_PATH), None)
     return enforcement_available
 
 
@@ -312,7 +379,13 @@ def collect_traffic() -> bool:
     # Serialize complete samples so an older snapshot cannot overwrite a newer
     # baseline and cause traffic to be counted twice on the next pass.
     with collection_lock:
-        return _collect_traffic()
+        try:
+            return _collect_traffic()
+        except (OSError, ValueError, TypeError, KeyError):
+            collection_health[str(TRAFFIC_PATH)] = {"reason": "collection_or_persistence_failed"}
+            connection_details.pop(str(TRAFFIC_PATH), None)
+            logger.exception("traffic collection failed; no new enforcement applied")
+            return False
 
 
 def get_traffic_store_snapshot() -> dict[str, Any]:
@@ -333,9 +406,20 @@ def get_user_traffic(
         available = collect_traffic()
     if store is None:
         with traffic_lock:
-            store = _read_store()
+            try:
+                store = _read_store()
+            except OSError:
+                store = _empty_store()
+                available = False
+                collection_health[str(TRAFFIC_PATH)] = {"reason": "traffic_store_unreadable"}
     if available is None:
-        available = store.get("collectedAt") is not None
+        available = (store.get("collectedAt") is not None
+                     and not collection_health.get(str(TRAFFIC_PATH), {}).get("reason"))
+    freshness = sample_state(store.get("collectedAt"), bool(available),
+                             SAMPLE_INTERVAL_SECONDS * 3,
+                             collection_health.get(str(TRAFFIC_PATH), {}).get("reason"))
+    if not freshness["telemetryAvailable"]:
+        connection_details.pop(str(TRAFFIC_PATH), None)
     user = store["users"].get(user_id, {})
     policy = get_user_policies().get(user_id, {}) if policy is None else policy
     upload = int(user.get("upload") or 0)
@@ -353,18 +437,20 @@ def get_user_traffic(
         {"id": connection_id, **{
             field: item.get(field) for field in (
                 "sourceIp", "sourcePort", "network", "protocol", "startedAt", "upload", "download",
-                "destinationIp", "destinationPort", "host", "deviceId", "credentialId"
             )
-        }}
+        }, **{field: connection_details.get(str(TRAFFIC_PATH), {}).get(connection_id, {}).get(field)
+              for field in ("destinationIp", "destinationPort", "host")},
+         "deviceId": None,
+         "credentialId": hashlib.sha256(user_id.encode("utf-8")).hexdigest()[:24]}
         for connection_id, item in store.get("connections", {}).items()
         if item.get("userId") == user_id and item.get("online", True)
-    ] if available and include_online else None
+    ] if freshness["telemetryAvailable"] and include_online else None
     return {
         "userId": user_id,
         "upload": upload,
         "download": download,
         "total": upload + download,
-        "available": available,
+        "available": freshness["telemetryAvailable"],
         "source": "clash-api-sampled",
         "collectedAt": store.get("collectedAt"),
         "trafficLimitBytes": traffic_limit,
@@ -374,8 +460,19 @@ def get_user_traffic(
         "activeSourceIps": user.get("activeSourceIps", []),
         "onlineConnections": online_connections,
         "sourceIpActiveWindowSeconds": DEVICE_ACTIVE_WINDOW_SECONDS,
-        "blockedSourceIps": user.get("blockedSourceIps", []) if available else [],
+        "blockedSourceIps": user.get("blockedSourceIps", []) if freshness["telemetryAvailable"] else [],
         **source_ip_diagnostics(online_connections),
+        **connection_summary(online_connections),
+        **freshness,
+        "measurementQuality": "sampled_lower_bound",
+        "measuredTotal": upload + download if freshness["telemetryAvailable"] else None,
+        "lastKnownTotal": upload + download if store.get("collectedAt") else None,
+        "quotaDecision": "legacy_sampled_enforcement" if freshness["telemetryAvailable"]
+                         else "retain_prior_enforcement_review_required",
+        "sourceLimitDecision": user.get("sourceLimitDecision", "not_evaluated"),
+        "alertRequired": (not freshness["telemetryAvailable"] or
+                          user.get("sourceLimitDecision") == "suspended_unreliable_source_review_required"),
+        "policyStatus": "source_limited" if status == "device_limited" else status,
         "status": status,
     }
 
@@ -383,18 +480,34 @@ def get_user_traffic(
 def get_traffic_totals(refresh: bool = True) -> dict[str, Any]:
     available = collect_traffic() if refresh else None
     with traffic_lock:
-        store = _read_store()
+        try:
+            store = _read_store()
+        except OSError:
+            store = _empty_store()
+            available = False
+            collection_health[str(TRAFFIC_PATH)] = {"reason": "traffic_store_unreadable"}
     if available is None:
-        available = store.get("collectedAt") is not None
+        available = (store.get("collectedAt") is not None
+                     and not collection_health.get(str(TRAFFIC_PATH), {}).get("reason"))
+    freshness = sample_state(store.get("collectedAt"), bool(available),
+                             SAMPLE_INTERVAL_SECONDS * 3,
+                             collection_health.get(str(TRAFFIC_PATH), {}).get("reason"))
     upload = sum(int(item.get("upload") or 0) for item in store["users"].values())
     download = sum(int(item.get("download") or 0) for item in store["users"].values())
     return {
         "upload": upload,
         "download": download,
         "total": upload + download,
-        "available": available,
+        "available": freshness["telemetryAvailable"],
         "source": "clash-api-sampled",
         "collectedAt": store.get("collectedAt"),
+        **freshness,
+        "measurementQuality": "sampled_lower_bound",
+        "measuredTotal": upload + download if freshness["telemetryAvailable"] else None,
+        "lastKnownTotal": upload + download if store.get("collectedAt") else None,
+        "nodeCumulativeCounters": store.get("nodeCumulativeCounters")
+                                  if freshness["telemetryAvailable"] else None,
+        "alertRequired": not freshness["telemetryAvailable"],
     }
 
 
@@ -470,3 +583,4 @@ def stop_traffic_collector() -> None:
     stop_event.set()
     if collector_thread and collector_thread.is_alive():
         collector_thread.join(timeout=SAMPLE_INTERVAL_SECONDS + 1)
+    connection_details.clear()

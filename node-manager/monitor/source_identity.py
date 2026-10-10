@@ -26,11 +26,12 @@ def normalize_ip(value: Any) -> str | None:
 def source_ip_diagnostics(connections: list[dict[str, Any]] | None) -> dict[str, Any]:
     if connections is None:
         return {"sourceIpVisibility": "unavailable", "suspectedRelaySourceIps": [],
-                "missingSourceConnections": None}
+                "missingSourceConnections": None, "sourceConfidence": "unknown"}
     relay_networks = tuple(ipaddress.ip_network(item.strip(), strict=False)
                            for item in config.monitoring.relay_source_cidrs.split(",")
                            if item.strip())
     suspicious = set()
+    configured_relay = False
     missing = 0
     for connection in connections:
         source = normalize_ip(connection.get("sourceIp"))
@@ -38,6 +39,7 @@ def source_ip_diagnostics(connections: list[dict[str, Any]] | None) -> dict[str,
             missing += 1
             continue
         address = ipaddress.ip_address(source)
+        configured_relay = configured_relay or any(address in network for network in relay_networks)
         if (address.is_loopback or address.is_link_local or address.is_unspecified
                 or address.is_multicast
                 or any(address in network for network in PRIVATE_SOURCE_NETWORKS + relay_networks)):
@@ -46,4 +48,6 @@ def source_ip_diagnostics(connections: list[dict[str, Any]] | None) -> dict[str,
     visibility = ("relay_detected" if suspicious else "missing" if missing
                   else "observed" if connections else "idle")
     return {"sourceIpVisibility": visibility, "suspectedRelaySourceIps": sorted(suspicious),
-            "missingSourceConnections": missing}
+            "missingSourceConnections": missing,
+            "sourceConfidence": "relay" if configured_relay else "private" if suspicious
+            else "unknown" if missing else "observed" if connections else "idle"}

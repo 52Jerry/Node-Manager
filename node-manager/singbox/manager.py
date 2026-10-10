@@ -1612,12 +1612,18 @@ def _remove_managed_enforcement_rules(
     rules[:] = remaining
 
 
-def sync_user_enforcements(enforcements: dict[str, dict[str, Any]]) -> bool:
-    """Persist traffic and source-IP blocks as sing-box reject rules.
+def sync_user_enforcements(
+    enforcements: dict[str, dict[str, Any]],
+    *,
+    persist_source_blocks: bool = False,
+) -> bool:
+    """Persist stable traffic blocks as sing-box reject rules.
 
     The registry stores the exact rule identity so later policy changes can
     remove only rules created by Node Manager. Reapplying the same desired
-    state is a no-op and does not reload sing-box.
+    state is a no-op and does not reload sing-box. Dynamic source-IP limits
+    are runtime-only by default because writing their constantly changing
+    CIDRs to the static config would repeatedly reload sing-box.
     """
 
     def apply(data: dict[str, Any], registry: dict[str, Any]) -> bool:
@@ -1652,6 +1658,8 @@ def sync_user_enforcements(enforcements: dict[str, dict[str, Any]]) -> bool:
                     if (cidr := _source_ip_cidr(str(source_ip))) is not None
                 }
             )
+            if not persist_source_blocks:
+                source_cidrs = []
             raw_current_auth_users = metadata.get(ENFORCEMENT_AUTH_USERS_KEY)
             current_auth_users = sorted(
                 str(value) for value in raw_current_auth_users if value
@@ -2229,9 +2237,8 @@ def update_proxy_metadata(user_id: str, metadata: dict[str, Any]) -> dict[str, A
 
 def delete_user(user_id: str) -> dict[str, Any]:
     def apply(data: dict[str, Any], registry: dict[str, Any]) -> dict[str, Any]:
-        if not _user_exists(data, registry, user_id):
-            raise SingboxConfigError(f"user not found: {user_id}")
-
+        existed = _user_exists(data, registry, user_id)
+        metadata = _registry_user(registry, user_id)
         auth_names = _user_auth_names(registry, user_id)
         for inbound in data.get("inbounds", []):
             inbound["users"] = [
@@ -2242,16 +2249,19 @@ def delete_user(user_id: str) -> dict[str, Any]:
 
         outbound_tag = f"{USER_OUTBOUND_PREFIX}{user_id}"
         data["outbounds"] = [item for item in data.get("outbounds", []) if item.get("tag") != outbound_tag]
-        route = data.get("route", {})
+        route = data.setdefault("route", {})
+        _remove_expiration_rule(data, metadata)
         _remove_managed_enforcement_rules(
-            route.setdefault("rules", []), _registry_user(registry, user_id)
+            route.setdefault("rules", []), metadata
         )
         route["rules"] = [
             rule for rule in route.get("rules", []) if rule.get("outbound") != outbound_tag
         ]
         registry.setdefault("users", {}).pop(user_id, None)
-        _audit("user.delete", user_id)
-        return {"success": True, "userId": user_id, "message": "user deleted"}
+        if existed:
+            _audit("user.delete", user_id)
+        return {"success": True, "userId": user_id,
+                "message": "user deleted" if existed else "user already absent"}
 
     return mutate_config(apply)
 

@@ -32,11 +32,21 @@ class SingboxAPI:
             )
             if response.status_code == 200:
                 return response.json()
-            logger.error("Failed to get connections: %s", response.text)
+            logger.error("Failed to get connections: HTTP %s", response.status_code)
             return None
         except Exception as exc:
-            logger.warning("Sing-box connection metrics are not available: %s", exc)
+            logger.warning("Sing-box connection metrics are not available: %s", type(exc).__name__)
             return None
+
+    @staticmethod
+    def cumulative_counters(snapshot):
+        """Native Clash node-wide absolute counters, not user counters or rates."""
+        if not isinstance(snapshot, dict):
+            return None
+        values = (snapshot.get("uploadTotal"), snapshot.get("downloadTotal"))
+        if any(type(value) is not int or not 0 <= value <= 2**63 - 1 for value in values):
+            return None
+        return {"upload": values[0], "download": values[1]}
 
     def close_connection(self, connection_id: str) -> bool:
         try:

@@ -281,7 +281,7 @@ class UserReplicationTest(unittest.TestCase):
         apply_users(self.request(snapshot))
         self.assertTrue(any(r.get("action") == "reject" for r in manager.read_config()["route"]["rules"]))
 
-    def test_local_device_block_is_preserved_with_multiple_users_and_noop_sync(self):
+    def test_dynamic_device_block_is_not_persisted_during_sync(self):
         self.create()
         manager.create_user("second", ["vless"])
         snapshot = export_users()
@@ -293,7 +293,7 @@ class UserReplicationTest(unittest.TestCase):
             apply_users(self.request(snapshot))
             reload.assert_not_called()
         self.assertEqual(manager.read_config(), before)
-        self.assertTrue(any(rule.get("source_ip_cidr") == ["198.51.100.1/32"] for rule in before["route"]["rules"]))
+        self.assertFalse(any("source_ip_cidr" in rule for rule in before["route"]["rules"]))
 
     def test_renewed_copy_removes_old_expiration_rule_and_starts_new_cycle(self):
         self.create()
