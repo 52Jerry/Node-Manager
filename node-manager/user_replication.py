@@ -14,6 +14,7 @@ from config import config
 from monitor import traffic
 from singbox import manager
 from ha_template import export_template, apply_template
+from replication_snapshot import capture, ReplicationConflict
 
 
 class StrictModel(BaseModel):
@@ -52,6 +53,7 @@ class PortableUser(StrictModel):
     download: int = Field(default=0, ge=0)
     trafficCycleStart: int | None = Field(default=None, ge=0)
     manualTrafficResetAt: int = Field(default=0, ge=0)
+    accessEnabled: bool | None = None
     remark: str | None = Field(default=None, max_length=1024)
     tags: list[str] = Field(default_factory=list, max_length=32)
 
@@ -124,46 +126,30 @@ def export_users(shared_config=False):
         with manager._config_lock():
             data, registry = manager.read_config(), manager.read_registry()
         store = traffic.get_traffic_store_snapshot()
-        users = []
-        for user_id in sorted(manager._discover_user_ids(data, registry)):
-            metadata = manager._registry_user(registry, user_id)
-            if manager._as_utc(metadata.get("expiresAt")) is None:
-                raise manager.SingboxConfigError("missing expiration; repair historical data before replication")
-            outbound = next((item for item in data.get("outbounds", [])
-                             if item.get("tag") == manager.USER_OUTBOUND_PREFIX + user_id), None)
-            if any(manager._is_user_proxy_outbound_tag(str(item.get("tag") or ""), user_id)
-                   and item.get("tag") != manager.USER_OUTBOUND_PREFIX + user_id
-                   for item in data.get("outbounds", [])):
-                raise manager.SingboxConfigError("multi-proxy users require a separate migration; replication refused")
-            proxy = None
-            portable_outbound_fields = {"type", "tag", "server", "server_port", "username", "password"}
-            if outbound and (set(outbound) - portable_outbound_fields
-                             or (outbound.get("type") == "direct" and set(outbound) - {"type", "tag"})):
-                raise manager.SingboxConfigError("custom outbound options require a separate migration; replication refused")
-            if outbound and outbound.get("type") in {"socks", "socks5"}:
-                proxy = {"server": outbound["server"], "port": outbound["server_port"],
-                         "username": outbound.get("username"), "password": outbound.get("password")}
-                proxy.update({key: metadata.get(key) for key in
-                              ("sourceIp", "countryCode", "countryName", "provinceName", "cityName")})
-            elif outbound and outbound.get("type") != "direct":
-                raise manager.SingboxConfigError("unsupported outbound; replication refused")
-            usage = store["users"].get(user_id, {})
-            users.append(PortableUser(
-                userId=user_id, auth=_auth(data, registry, user_id), proxy=proxy,
-                createdAt=metadata.get("createdAt"), expiresAt=metadata["expiresAt"],
-                trafficLimitBytes=metadata.get("trafficLimitBytes"), maxSourceIps=metadata.get("maxSourceIps"),
-                maxConnections=metadata.get("maxConnections"),
-                upload=int(usage.get("upload") or 0), download=int(usage.get("download") or 0),
-                trafficCycleStart=usage.get("lastTrafficCycleStart"),
-                manualTrafficResetAt=int(usage.get("lastManualTrafficResetAt") or 0),
-                remark=metadata.get("remark"), tags=metadata.get("tags") or [],
-            ).model_dump(mode="json"))
-        if len(users) > 10000:
-            raise manager.SingboxConfigError("replication supports at most 10000 users per group")
-        snapshot = {"version": 1, "users": users}
-        if shared_config:
-            snapshot["sharedConfig"] = export_template(data)
-        return snapshot
+    snapshot = capture(data, registry, shared_config)
+    if snapshot["errors"]:
+        raise ReplicationConflict(snapshot["errors"][0])
+    users = []
+    for row in snapshot["users"]:
+        user_id = row["userId"]
+        if row["serializationIssues"]:
+            raise ReplicationConflict(row["serializationIssues"][0])
+        if manager._as_utc(row.get("expiresAt")) is None:
+            raise ReplicationConflict("MISSING_EXPIRATION")
+        usage = store["users"].get(user_id, {})
+        portable = {key: value for key, value in row.items()
+                    if key not in {"serializationIssues", "directConfirmed"}}
+        portable.update(upload=int(usage.get("upload") or 0), download=int(usage.get("download") or 0),
+            trafficCycleStart=usage.get("lastTrafficCycleStart"),
+            manualTrafficResetAt=int(usage.get("lastManualTrafficResetAt") or 0))
+        try:
+            users.append(PortableUser(**portable).model_dump(mode="json"))
+        except ValueError:
+            raise ReplicationConflict("INVALID_PORTABLE_USER") from None
+    result = {"version": 1, "users": users}
+    if shared_config:
+        result["sharedConfig"] = snapshot["sharedConfig"]
+    return result
 
 
 def _remove(data, registry, user_id):
@@ -177,6 +163,7 @@ def _remove(data, registry, user_id):
     data["outbounds"] = [entry for entry in data.get("outbounds", []) if entry.get("tag") != tag]
     rules = data.setdefault("route", {}).setdefault("rules", [])
     manager._remove_managed_enforcement_rules(rules, manager._registry_user(registry, user_id))
+    manager._remove_access_rule(data, manager._registry_user(registry, user_id))
     manager._remove_expiration_rule(data, manager._registry_user(registry, user_id))
     rules[:] = [rule for rule in rules if rule.get("outbound") != tag]
     registry.setdefault("users", {}).pop(user_id, None)
@@ -206,6 +193,13 @@ def apply_users(request: ReplicationRequest):
                     raise manager.SingboxConfigError("replication generation content conflict")
             enforcement_rules = []
             existing_ids = manager._discover_user_ids(data, registry)
+            if set(retired) & existing_ids or any(old in existing_ids and new in retired
+                                                  for old, new in request.aliases.items()):
+                raise ReplicationConflict("RETIREMENT_REVIEW_REQUIRED")
+            if any(manager._registry_user(registry, user_id).get("replicationOwner") == request.groupKey
+                   and user_id not in desired and request.aliases.get(user_id) not in desired
+                   for user_id in existing_ids):
+                raise ReplicationConflict("OMITTED_MANAGED_USER_REVIEW_REQUIRED")
             previous_metadata = {user_id: dict(manager._registry_user(registry, user_id)) for user_id in existing_ids}
             for user_id in existing_ids:
                 owned = previous_metadata[user_id].get("replicationOwner") == request.groupKey
@@ -261,6 +255,8 @@ def apply_users(request: ReplicationRequest):
                             "expiresAt": manager._iso(manager._as_utc(user.expiresAt)),
                             "trafficLimitBytes": user.trafficLimitBytes, "maxSourceIps": user.maxSourceIps,
                             "maxConnections": user.maxConnections,
+                            "accessEnabled": (user.accessEnabled if user.accessEnabled is not None
+                                              else previous_metadata.get(user_id, {}).get("accessEnabled", True) is not False),
                             "remark": user.remark, "tags": user.tags}
                 registry.setdefault("users", {})[user_id] = metadata
                 registry.setdefault("expiredUsers", {}).pop(user_id, None)
@@ -305,8 +301,11 @@ def apply_users(request: ReplicationRequest):
                     usage["lastManualTrafficResetAt"] = user.manualTrafficResetAt
                 usage["replicationCycle"] = cycle
                 limited = bool(user.trafficLimitBytes and usage["upload"] + usage["download"] >= user.trafficLimitBytes)
-                auth_names = sorted({auth.username if auth.protocol == "socks" else manager._auth_name(user_id)
-                                     for auth in user.auth})
+                auth_names = sorted(manager._user_auth_names(registry, user_id))
+                if metadata["accessEnabled"] is False:
+                    metadata[manager.ACCESS_AUTH_USERS_KEY] = auth_names
+                    metadata[manager.ACCESS_BLOCKED_KEY] = True
+                    enforcement_rules.append({"auth_user": auth_names, "action": "reject"})
                 if limited:
                     metadata[manager.ENFORCEMENT_TRAFFIC_KEY] = True
                     metadata[manager.ENFORCEMENT_AUTH_USERS_KEY] = auth_names
@@ -325,7 +324,8 @@ def apply_users(request: ReplicationRequest):
             return len(desired)
 
         try:
-            count = manager.mutate_config(apply)
+            with manager.without_restart():
+                count = manager.mutate_config(apply)
         except Exception:
             with traffic.traffic_lock:
                 if store_existed:

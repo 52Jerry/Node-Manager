@@ -25,6 +25,7 @@ import json
 import logging
 import os
 import tempfile
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -286,9 +287,9 @@ def _archive_rejected(payload: dict[str, Any], reason: str) -> None:
         REJECTED_DIR.mkdir(parents=True, exist_ok=True)
         moment = datetime.now(timezone.utc)
         timestamp = moment.strftime("%Y%m%dT%H%M%SZ")
-        # 文件名带微秒：同一秒内多次拒绝必须各自留档（真机验证曾出现互相覆盖）
+        # Keep a random suffix because datetime precision can collide on fast retries.
         target = REJECTED_DIR / ("rejected-{stamp}.json".format(
-            stamp=moment.strftime("%Y%m%dT%H%M%S%fZ")
+            stamp=moment.strftime("%Y%m%dT%H%M%S%fZ") + "-" + uuid.uuid4().hex
         ))
         fd, temp_name = tempfile.mkstemp(prefix="rejected.", suffix=".json", dir=REJECTED_DIR)
         temp_path = Path(temp_name)

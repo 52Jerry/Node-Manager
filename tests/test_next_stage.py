@@ -1087,7 +1087,7 @@ class ManagerTestCase(unittest.TestCase):
             thread.assert_not_called()
         self.assertEqual(metadata["expiresAt"], "2026-01-01T00:00:00+00:00")
 
-    def test_user_expiration_is_archived_after_restore_window(self):
+    def test_user_expiration_after_restore_window_waits_for_verified_database_retirement(self):
         manager.create_user("archive-user", ["socks"])
         now = datetime.now(timezone.utc).replace(microsecond=0)
         registry = json.loads(self.registry_path.read_text(encoding="utf-8"))
@@ -1096,24 +1096,24 @@ class ManagerTestCase(unittest.TestCase):
 
         self.assertEqual(manager.process_user_expirations(now), 1)
         current = json.loads(self.config_path.read_text(encoding="utf-8"))
-        self.assertFalse(any(
+        self.assertTrue(any(
             user.get("username") == "archive-user"
             for inbound in current["inbounds"]
             for user in inbound["users"]
         ))
-        self.assertFalse(any(item.get("tag") == "node-manager-out:archive-user" for item in current["outbounds"]))
-        self.assertFalse(any(rule.get("outbound") == "node-manager-out:archive-user" for rule in current["route"]["rules"]))
+        self.assertTrue(any(item.get("tag") == "node-manager-out:archive-user" for item in current["outbounds"]))
+        self.assertTrue(any(rule.get("outbound") == "node-manager-out:archive-user" for rule in current["route"]["rules"]))
         archived = json.loads(self.registry_path.read_text(encoding="utf-8"))
-        self.assertNotIn("archive-user", archived["users"])
-        self.assertEqual(archived["expiredUsers"]["archive-user"]["status"], "ARCHIVED")
+        self.assertIn("archive-user", archived["users"])
+        self.assertNotIn("archive-user", archived["expiredUsers"])
 
         self.assertEqual(manager.ensure_user_outbounds(), 0)
         after_compensation = json.loads(self.config_path.read_text(encoding="utf-8"))
-        self.assertFalse(any(
+        self.assertTrue(any(
             item.get("tag") == "node-manager-out:archive-user"
             for item in after_compensation["outbounds"]
         ))
-        self.assertFalse(any(
+        self.assertTrue(any(
             rule.get("outbound") == "node-manager-out:archive-user"
             for rule in after_compensation["route"]["rules"]
         ))
@@ -1842,8 +1842,9 @@ class ApiTestCase(unittest.TestCase):
         registry = manager.read_registry()
         registry["users"]["archived-delete"]["expiresAt"] = (now - timedelta(hours=25)).isoformat()
         manager._write_registry(registry)
-        with patch.object(manager.singbox_api, "get_connections", return_value={"connections": []}):
-            manager.process_user_expirations(now)
+        # Already archived users retain idempotent legacy absence handling;
+        # unarchived expired users must use the guarded DB/probe workflow.
+        manager.mutate_config(lambda data, registry: manager._archive_user(data, registry, "archived-delete", now))
         self.assertIn("archived-delete", manager.read_registry()["expiredUsers"])
         for _ in range(2):
             response = self.client.delete("/api/user/delete/archived-delete", headers=headers)

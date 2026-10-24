@@ -18,7 +18,8 @@ from pydantic import BaseModel, Field
 
 from auth import verify_token
 from config import config
-from idempotency import IdempotencyConflict, execute_idempotent
+from idempotency import (IdempotencyConflict, execute_idempotent,
+                         execute_reconciling_idempotent)
 from models.request import (
     AgentHeartbeatResponse,
     AgentInfoResponse,
@@ -27,6 +28,7 @@ from models.request import (
     BindMultipleProxiesRequest,
     BindProxyRequest,
     CreateUserRequest,
+    MigrateResidentialOwnershipRequest,
     CreateUserResponse,
     NodeListResponse,
     NodeStatusResponse,
@@ -43,11 +45,16 @@ from models.request import (
     SyncUserExpirationRequest,
     BatchExpirationSyncRequest,
     UpdateUserPolicyRequest,
+    UserAccessRequest,
     ApplyDefaultTrafficLimitRequest,
     RestoreUserRequest,
     ExpiredUserListResponse,
     UserConnectionResponse,
     UserListResponse,
+    WireguardPeerApplyRequest,
+    WireguardPeerApplyBatchRequest,
+    WireguardPeerApplyBatchResponse,
+    WireguardPeerRevokeRequest,
 )
 from protocols import ProtocolData, generate_all, protocol_info
 from residential import ResidentialConfigError, validate_config
@@ -70,7 +77,10 @@ from monitor.traffic import (
 from network_check import run_network_check
 from monitor.traffic_reset import reset_traffic
 from user_replication import ReplicationRequest, export_users, apply_users
+from replication_snapshot import inspect_users, ReplicationConflict
 from ha_readiness import ReadinessRequest, readiness
+from wireguard import (WireguardError, apply_peer, apply_peers, revoke_peer, status as wireguard_status,
+                       wireguard_access_snapshot, start_reconciler, stop_reconciler)
 from monitor.health_check import (
     start_health_checker,
     stop_health_checker,
@@ -85,8 +95,12 @@ from singbox.manager import (
     delete_user,
     ensure_user_outbounds,
     migrate_legacy_socks_usernames,
+    migrate_residential_ownership,
     get_user_connection,
+    get_user_access_snapshot,
     get_user_proxy,
+    set_user_access,
+    UserAccessConnectionError,
     get_user_policies,
     update_proxy_metadata,
     update_user_policy,
@@ -119,6 +133,18 @@ app = FastAPI(
     description="Single-node sing-box agent API for a Spring Boot multi-node control plane.",
 )
 
+from wireguard_migration_recovery import router as wireguard_migration_recovery_router
+app.include_router(wireguard_migration_recovery_router)
+
+from wireguard_owner_adoption import router as wireguard_owner_adoption_router
+app.include_router(wireguard_owner_adoption_router)
+
+from wireguard_renewal_reopen import router as wireguard_renewal_reopen_router
+app.include_router(wireguard_renewal_reopen_router)
+
+from user_cleanup import router as user_cleanup_router, reject_unguarded_expired_deletion
+app.include_router(user_cleanup_router)
+
 static_dir = os.path.join(os.path.dirname(__file__), "static")
 app.mount("/static", StaticFiles(directory=static_dir), name="static")
 
@@ -126,8 +152,15 @@ app.mount("/static", StaticFiles(directory=static_dir), name="static")
 @app.exception_handler(SingboxConfigError)
 async def singbox_error_handler(_request: Request, exc: SingboxConfigError):
     if _request.url.path.startswith("/api/users/replication"):
-        return JSONResponse(status_code=409, content={"detail": "replication configuration conflict or runtime validation failed"})
+        return JSONResponse(status_code=409, headers={"Cache-Control": "no-store"}, content={
+            "detail": "replication configuration conflict or runtime validation failed",
+            "code": exc.public_code if isinstance(exc, ReplicationConflict) else "REPLICATION_CONFLICT"})
     return JSONResponse(status_code=409, content={"detail": str(exc)})
+
+
+@app.exception_handler(UserAccessConnectionError)
+async def user_access_connection_error_handler(_request: Request, exc: UserAccessConnectionError):
+    return JSONResponse(status_code=503, content={"detail": str(exc)})
 
 
 @app.exception_handler(IdempotencyConflict)
@@ -137,9 +170,16 @@ async def idempotency_error_handler(_request: Request, exc: IdempotencyConflict)
 
 @app.exception_handler(RequestValidationError)
 async def validation_error_handler(request: Request, exc: RequestValidationError):
-    if request.url.path.startswith("/api/users/replication"):
-        # Pydantic errors otherwise echo submitted credentials in the input field.
-        return JSONResponse(status_code=422, content={"detail": "invalid replication payload"})
+    if request.url.path == "/api/user/migrate-residential-ownership":
+        return JSONResponse(status_code=422, content={"detail": "invalid residential ownership migration request"})
+    if request.url.path.startswith(("/api/users/replication", "/api/wireguard")):
+        # These payloads contain credentials or peer keys; never echo them.
+        detail = (
+            "invalid WireGuard request"
+            if request.url.path.startswith("/api/wireguard")
+            else "invalid replication payload"
+        )
+        return JSONResponse(status_code=422, content={"detail": detail})
     return await request_validation_exception_handler(request, exc)
 
 
@@ -160,10 +200,12 @@ def startup_tasks():
     start_traffic_collector()
     start_health_checker()
     start_expiration_scheduler()
+    start_reconciler()
 
 
 @app.on_event("shutdown")
 def shutdown_tasks():
+    stop_reconciler()
     stop_expiration_scheduler()
     stop_health_checker()
     stop_traffic_collector()
@@ -205,6 +247,132 @@ def network_check_endpoint(_token: str = Depends(verify_token)):
     在非 Linux 开发环境退化为仅报告不可用，不抛异常。
     """
     return run_network_check().to_dict()
+
+
+@app.post("/api/wireguard/peer/apply", tags=["wireguard"])
+def wireguard_peer_apply(
+    request: WireguardPeerApplyRequest,
+    response: Response,
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key", min_length=1, max_length=128),
+    _token: str = Depends(verify_token),
+):
+    try:
+        # Peer operations reconcile live state; an old cache receipt cannot
+        # prove that a kernel peer survived a restart or has been removed.
+        result = apply_peer(request.peerId, request.publicKey, request.address,
+                            request.allowedIps, request.nodeUserId, request.expiresAt)
+    except (WireguardError, OSError) as exc:
+        if isinstance(exc, OSError):
+            raise HTTPException(status_code=503, detail="WireGuard state persistence failed") from None
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    response.headers["Cache-Control"] = "no-store"
+    response.headers["Idempotency-Replayed"] = "false"
+    return result
+
+
+@app.post(
+    "/api/wireguard/peers/apply",
+    response_model=WireguardPeerApplyBatchResponse,
+    tags=["wireguard"],
+)
+def wireguard_peers_apply(
+    request: WireguardPeerApplyBatchRequest,
+    response: Response,
+    idempotency_key: str = Header(..., alias="Idempotency-Key", min_length=1, max_length=128),
+    _token: str = Depends(verify_token),
+):
+    payload = request.model_dump(mode="json")
+    try:
+        result, replayed = execute_reconciling_idempotent(
+            idempotency_key,
+            "wireguard-apply-batch",
+            payload,
+            lambda: apply_peers(payload["peers"]),
+        )
+    except IdempotencyConflict:
+        raise
+    except WireguardError as exc:
+        detail = str(exc)
+        unavailable = {
+            "wireguard peer management is disabled",
+            "WireGuard registry invalid or unreadable",
+            "WireGuard command failed",
+            "WireGuard command unavailable",
+            "invalid WireGuard status",
+            "node user or residential binding unavailable",
+            "dedicated WireGuard residential gateway is not ready",
+            "WireGuard residential routes could not be applied",
+            "WireGuard batch application failed; peers disabled",
+            "WireGuard batch cleanup could not be verified",
+            "WireGuard batch cleanup left peers present",
+        }
+        status_code = 503 if detail in unavailable else 409
+        raise HTTPException(status_code=status_code, detail=detail) from None
+    except OSError:
+        raise HTTPException(
+            status_code=503,
+            detail="WireGuard batch or idempotency state could not be persisted; retry with the same key",
+        ) from None
+    except Exception:
+        raise HTTPException(
+            status_code=503,
+            detail="WireGuard batch apply failed; inspect peer status and retry with the same key",
+        ) from None
+    response.headers["Cache-Control"] = "no-store"
+    response.headers["Idempotency-Replayed"] = str(replayed).lower()
+    return result
+
+
+@app.post("/api/wireguard/peer/revoke", tags=["wireguard"])
+def wireguard_peer_revoke(
+    request: WireguardPeerRevokeRequest,
+    response: Response,
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key", min_length=1, max_length=128),
+    _token: str = Depends(verify_token),
+):
+    try:
+        result = revoke_peer(request.peerId, request.publicKey)
+    except (WireguardError, OSError) as exc:
+        if isinstance(exc, OSError):
+            raise HTTPException(status_code=503, detail="WireGuard state persistence failed") from None
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    response.headers["Cache-Control"] = "no-store"
+    response.headers["Idempotency-Replayed"] = "false"
+    return result
+
+
+@app.get("/api/wireguard/status", tags=["wireguard"])
+def wireguard_peer_status(response: Response, _token: str = Depends(verify_token)):
+    response.headers["Cache-Control"] = "no-store"
+    try:
+        return wireguard_status()
+    except WireguardError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@app.get("/api/wireguard/peer-status", tags=["wireguard"])
+def wireguard_delivery_status_endpoint(
+    response: Response,
+    peerId: str = Query(min_length=1, max_length=128, pattern=r"^[A-Za-z0-9._-]+$"),
+    nodeUserId: str = Query(min_length=1, max_length=128, pattern=r"^[A-Za-z0-9._-]+$"),
+    includeRuntime: bool = Query(default=True),
+    _token: str = Depends(verify_token),
+):
+    from wireguard import peer_delivery_status
+    response.headers["Cache-Control"] = "no-store"
+    try:
+        return peer_delivery_status(peerId, nodeUserId, includeRuntime)
+    except WireguardError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@app.get("/api/wireguard/access-snapshot", tags=["wireguard"])
+def wireguard_access_snapshot_endpoint(response: Response, _token: str = Depends(verify_token)):
+    response.headers["Cache-Control"] = "no-store"
+    try:
+        return wireguard_access_snapshot()
+    except WireguardError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
 @app.post("/api/user/create", response_model=CreateUserResponse, tags=["users"])
@@ -273,7 +441,7 @@ def generate_residential_protocols(
         uuid=effective_uuid,
         acceleration_domain=(
             request.accelerationDomain
-            or config.node.acceleration_domain
+            or config.node.random_acceleration_domain()
             or config.node.host
         ),
     )
@@ -297,11 +465,23 @@ def export_replication(response: Response, sharedConfig: bool = False, _token: s
     return export_users(shared_config=sharedConfig)
 
 
+@app.get("/api/users/replication/inspection", tags=["users"])
+def inspect_replication(response: Response, sharedConfig: bool = False, _token: str = Depends(verify_token)):
+    response.headers["Cache-Control"] = "no-store"
+    return inspect_users(shared_config=sharedConfig)
+
+
 @app.get("/api/users/history-snapshot", tags=["users"])
 def export_history_snapshot(response: Response, _token: str = Depends(verify_token)):
     from singbox.manager import get_history_user_snapshot
     response.headers["Cache-Control"] = "no-store"
     return get_history_user_snapshot()
+
+
+@app.get("/api/users/access-snapshot", tags=["users"])
+def export_user_access_snapshot(response: Response, _token: str = Depends(verify_token)):
+    response.headers["Cache-Control"] = "no-store"
+    return get_user_access_snapshot()
 
 
 @app.post("/api/users/replication", tags=["users"])
@@ -349,6 +529,8 @@ def get_users(
             activeSourceIps=traffic["activeSourceIps"],
             status=traffic["status"],
         )
+        if item.get("accessEnabled") is False:
+            item["status"] = "suspended"
     if keyword:
         normalized = keyword.casefold()
         items = [
@@ -422,6 +604,30 @@ def get_user_connections(
     return get_user_connection(userId)
 
 
+@app.patch("/api/user/{userId}/access", tags=["users"])
+def update_user_access_endpoint(
+    userId: str,
+    request: UserAccessRequest,
+    response: Response,
+    idempotency_key: str | None = Header(
+        default=None, alias="Idempotency-Key", min_length=1, max_length=128
+    ),
+    _token: str = Depends(verify_token),
+):
+    if not userId or len(userId) > 64:
+        raise HTTPException(status_code=422, detail="invalid userId")
+    if not idempotency_key:
+        raise HTTPException(status_code=428, detail="Idempotency-Key is required")
+    result, replayed = execute_idempotent(
+        idempotency_key,
+        "user-access",
+        {"userId": userId, **request.model_dump(mode="json")},
+        lambda: set_user_access(userId, request.enabled),
+    )
+    response.headers["Idempotency-Replayed"] = str(replayed).lower()
+    return result
+
+
 @app.get(
     "/api/user/{userId}/proxy",
     response_model=ProxyDetailsResponse,
@@ -436,6 +642,24 @@ def get_user_proxy_endpoint(
         raise HTTPException(status_code=422, detail="invalid userId")
     response.headers["Cache-Control"] = "no-store"
     return get_user_proxy(userId)
+
+
+@app.post("/api/user/migrate-residential-ownership", tags=["users"])
+def migrate_residential_ownership_endpoint(
+    request: MigrateResidentialOwnershipRequest,
+    response: Response,
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key", min_length=1, max_length=128),
+    _token: str = Depends(verify_token),
+):
+    if not idempotency_key:
+        raise HTTPException(status_code=428, detail="Idempotency-Key is required")
+    result, replayed = execute_reconciling_idempotent(
+        idempotency_key, "migrate-residential-ownership", request.model_dump(mode="json"),
+        lambda: migrate_residential_ownership(request.model_dump()),
+    )
+    response.headers["Idempotency-Replayed"] = str(replayed).lower()
+    response.headers["Cache-Control"] = "no-store"
+    return result
 
 
 @app.post("/api/user/bind-proxy", response_model=OperationResponse, tags=["users"])
@@ -517,6 +741,7 @@ def delete_user_endpoint(
     if not userId or len(userId) > 64:
         raise HTTPException(status_code=422, detail="invalid userId")
     def perform_delete():
+        reject_unguarded_expired_deletion(userId)
         result = delete_user(userId)
         try:
             delete_user_traffic(userId)
@@ -550,6 +775,7 @@ def batch_delete_users_endpoint(
     logger = logging.getLogger(__name__)
     for userId in request.userIds:
         try:
+            reject_unguarded_expired_deletion(userId)
             delete_user(userId)
             try:
                 delete_user_traffic(userId)
@@ -749,6 +975,8 @@ def get_agent_info(_token: str = Depends(verify_token)):
             "user.delete",
             "user.list",
             "user.replication.v1",
+            "user.replication.inspection.v1",
+            "user.replication.preserve.v1",
             "user.replication.ha.v1",
             "user.connections",
             "proxy.bind",
@@ -767,6 +995,7 @@ def get_agent_info(_token: str = Depends(verify_token)):
             "user.expiration.archive",
             "node.heartbeat",
             "request.idempotency",
+            "wireguard.peer.batch-apply",
             "revision.desired",
             "revision.apply",
             "revision.rollback",

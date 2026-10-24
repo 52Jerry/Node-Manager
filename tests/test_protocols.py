@@ -22,6 +22,7 @@ from protocols import (
     socks_acceleration,
     vmess,
     trojan,
+    residential_alias,
 )
 from residential import (
     ResidentialConfigError,
@@ -58,7 +59,7 @@ class ProtocolGenerationTest(unittest.TestCase):
         link = socks5_original(sample_data())
         encoded = base64.b64encode(b"a1b2c3d4e5f6a7b8:888888").decode("ascii")
         self.assertTrue(link.startswith(f"socks://{encoded}@149.52.53.230:5001#"))
-        self.assertIn("#US-149.52.53.230", link)
+        self.assertIn("#%5BUS%5D%20149.52.53.230", link)
 
     def test_bitbrowser_format(self):
         link = bitbrowser(sample_data())
@@ -164,6 +165,30 @@ class ProtocolGenerationTest(unittest.TestCase):
         })
         for value in links.values():
             self.assertTrue(value)
+
+    def test_all_uri_protocols_share_the_residential_alias_and_keep_bitbrowser_shape(self):
+        data = sample_data(country_code="us", endpoint_host="socks-entry.example.test")
+        links = generate_all(data)
+        expected = "[US] 149.52.53.230"
+
+        for key in ("socks5", "vless", "socksAcceleration", "trojan"):
+            self.assertEqual(unquote(links[key].rsplit("#", 1)[1]), expected)
+        self.assertEqual(
+            json.loads(base64.b64decode(links["vmess"].split("//", 1)[1]))["ps"],
+            expected,
+        )
+        self.assertEqual(links["socks5"].split("@", 1)[0], socks5_original(data).split("@", 1)[0])
+        self.assertTrue(links["socks5"].startswith("socks://"))
+        self.assertIn("@socks-entry.example.test:5001#", links["socks5"])
+        self.assertEqual(bitbrowser(data), "socks-entry.example.test:5001:a1b2c3d4e5f6a7b8:888888")
+        self.assertEqual(data.remark_label(), expected)
+
+    def test_alias_uses_xx_for_unknown_country_and_requires_a_valid_ip(self):
+        self.assertEqual(residential_alias("ZZ", "198.65.60.27"), "[XX] 198.65.60.27")
+        self.assertEqual(residential_alias("!", "198.65.60.27"), "[XX] 198.65.60.27")
+        self.assertEqual(residential_alias("US", "gateway.example.test"), "")
+        link = socks5_original(sample_data(ip="gateway.example.test"))
+        self.assertEqual(link.split("#", 1)[0], link)
 
 
 class ResidentialValidationTest(unittest.TestCase):

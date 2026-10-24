@@ -4,6 +4,8 @@ import os
 import socket
 import hashlib
 import ipaddress
+import random
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -56,6 +58,21 @@ class NodeConfig:
     # deliberately falls back to this node's configured host, so a fresh
     # installation never emits a stale domain belonging to another deployment.
     acceleration_domain: str = ""
+    # Optional failover hosts. The legacy acceleration_domain remains the
+    # first compatible value when this list is omitted.
+    acceleration_domains: list[str] = field(default_factory=list)
+
+    def acceleration_domain_list(self) -> list[str]:
+        values: list[str] = []
+        for raw in [*self.acceleration_domains, self.acceleration_domain]:
+            for value in str(raw or "").replace("\r", "\n").replace(",", "\n").split("\n"):
+                value = value.strip()
+                if value and value not in values:
+                    values.append(value)
+        return values or [str(self.host).strip()]
+
+    def random_acceleration_domain(self) -> str:
+        return random.choice(self.acceleration_domain_list())
 
 
 @dataclass
@@ -180,6 +197,22 @@ class NetworkConfig:
             parsed.append((name, int(port_text), protocol))
         return parsed
 
+
+@dataclass
+class WireguardConfig:
+    """Runtime controls for the optional WireGuard peer manager.
+
+    The manager only changes peers on an already configured interface. It does
+    not create interfaces, alter routing, or enable IP forwarding.
+    """
+
+    enabled: bool = False
+    interface: str = "wg0"
+    command: str = "wg"
+    # Temporary, operator-controlled migration switch. Adoption still requires
+    # the kernel peer to have the exact requested public key and single /32.
+    allow_legacy_peer_adoption: bool = False
+
 @dataclass
 class Config:
     node: NodeConfig = field(default_factory=NodeConfig)
@@ -188,6 +221,7 @@ class Config:
     singbox: SingboxConfig = field(default_factory=SingboxConfig)
     monitoring: MonitoringConfig = field(default_factory=MonitoringConfig)
     network: NetworkConfig = field(default_factory=NetworkConfig)
+    wireguard: WireguardConfig = field(default_factory=WireguardConfig)
 
 
 def load_config() -> Config:
@@ -212,6 +246,11 @@ def load_config() -> Config:
     result.node.acceleration_domain = str(
         node.get("acceleration_domain", result.node.acceleration_domain)
     )
+    raw_domains = node.get("acceleration_domains", result.node.acceleration_domains)
+    if isinstance(raw_domains, str):
+        result.node.acceleration_domains = [item.strip() for item in raw_domains.replace(",", "\n").splitlines() if item.strip()]
+    elif isinstance(raw_domains, list):
+        result.node.acceleration_domains = [str(item).strip() for item in raw_domains if str(item).strip()]
 
     server = data.get("server", {})
     result.server.port = int(server.get("port", result.server.port))
@@ -286,6 +325,22 @@ def load_config() -> Config:
     result.network.conntrack_warn_ratio = float(
         network.get("conntrack_warn_ratio", result.network.conntrack_warn_ratio)
     )
+    wireguard = data.get("wireguard", {}) or {}
+    enabled = wireguard.get("enabled", False)
+    if not isinstance(enabled, bool):
+        raise ValueError("wireguard.enabled must be a YAML boolean")
+    result.wireguard.enabled = enabled
+    interface = str(wireguard.get("interface", result.wireguard.interface)).strip()
+    command = str(wireguard.get("command", result.wireguard.command)).strip()
+    if not re.fullmatch(r"[A-Za-z0-9_.-]{1,15}", interface):
+        raise ValueError("invalid wireguard.interface")
+    result.wireguard.interface = interface
+    if command:
+        result.wireguard.command = command
+    allow_legacy_peer_adoption = wireguard.get("allow_legacy_peer_adoption", False)
+    if not isinstance(allow_legacy_peer_adoption, bool):
+        raise ValueError("wireguard.allow_legacy_peer_adoption must be a YAML boolean")
+    result.wireguard.allow_legacy_peer_adoption = allow_legacy_peer_adoption
     result.monitoring.health_check_interval_seconds = int(
         monitoring.get("health_check_interval_seconds", 1200)
     )

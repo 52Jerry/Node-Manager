@@ -224,6 +224,7 @@ curl 'http://<NODE_MANAGER_HOST>:8088/api/users?page=1&pageSize=20' \
       "download": 2048,
       "total": 3072,
       "status": "active",
+      "accessEnabled": true,
       "createdAt": "2026-07-22T10:00:00Z"
     }
   ],
@@ -257,6 +258,38 @@ curl 'http://<NODE_MANAGER_HOST>:8088/api/users?page=1&pageSize=20' \
 ```
 
 Node Manager 管理页提供“连接信息”按钮，点击后才读取并显示完整连接信息；批量用户列表仍不返回密码。
+
+#### `PATCH /api/user/{userId}/access`
+
+统一启用或停用该用户的 VLESS、VMess、Trojan、SOCKS 和绑定到该用户的 WireGuard 出口。请求必须带新的 `Idempotency-Key`；同一次请求重试必须复用相同键和请求体。
+
+```bash
+curl -X PATCH http://<NODE_MANAGER_HOST>:8088/api/user/user-10001/access \
+  -H "Authorization: Bearer <NODE_TOKEN>" \
+  -H "Idempotency-Key: order-10001-access-off" \
+  -H "Content-Type: application/json" \
+  -d '{"enabled":false}'
+```
+
+成功停用会先写入並重载 sing-box 拒绝规则，再枚举、关闭並复核该账号的现有会话。响应包含 `blockedProtocols`、`configApplied` 和 `activeConnectionsClosed`。WireGuard TPROXY 路由在账号停用时也会 fail closed；WireGuard peer 生命周期仍由控制面按业务状态撤销。
+
+若配置已阻断，但 sing-box 连接接口不可用、会话关闭失败或关闭结果无法复核，返回 `503`。停用状态和拒绝规则会保留；调用方应显示为停用中，并使用相同幂等键重试，直到收到成功响应。该失败响应不会被幂等缓存。
+
+停用账号的 `GET /api/user/{userId}/connections` 和 `/proxy` 返回 `409`，避免返回连接 URI 或住宅代理凭据。`GET /api/users` 中该账号的 `accessEnabled` 为 `false`、`status` 为 `suspended`。启用操作只移除账号级别拥有的拒绝规则，不会解除到期或流量限额拒绝规则。
+
+成功响应示例：
+
+```json
+{
+  "success": true,
+  "userId": "user-10001",
+  "enabled": false,
+  "status": "suspended",
+  "blockedProtocols": ["vless", "vmess", "socks"],
+  "configApplied": true,
+  "activeConnectionsClosed": 2
+}
+```
 
 ### 2.5 节点列表
 
@@ -420,6 +453,7 @@ Spring Boot 接入节点时先调用该接口，确认版本和能力：
     "proxy.bind",
     "traffic.sampled",
     "node.heartbeat",
+    "wireguard.peer.batch-apply",
     "request.idempotency"
   ],
   "controlPlaneResponsibilities": [
@@ -474,6 +508,53 @@ Spring Boot 建议每 15 到 30 秒轮询一次，并在连续 3 次失败或超
 | `online` | sing-box 正常，Clash API 指标可用 |
 | `degraded` | sing-box 正常，但指标 API 不可用 |
 | `offline` | sing-box 服务未运行 |
+
+### 2.13 WireGuard 批量创建 peer
+
+#### `POST /api/wireguard/peers/apply`
+
+使用 Bearer Token 对 1 到 4,000 个 WireGuard peer 执行批量 apply。请求必须包含 `Idempotency-Key`，长度为 1 到 128 个字符。每个 peer 的 `allowedIps` 必须恰好等于该 peer 的单个 IPv4 `/32` 地址；用户必须存在、未过期且已绑定有效住宅 SOCKS 出口。
+
+```bash
+curl -X POST http://<NODE_MANAGER_HOST>:8088/api/wireguard/peers/apply \
+  -H "Authorization: Bearer <NODE_TOKEN>" \
+  -H "Idempotency-Key: wg-order-10001-apply-1" \
+  -H "Content-Type: application/json" \
+  -d '{"peers":[{"peerId":"peer-10001","publicKey":"AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=","address":"10.77.0.2/32","allowedIps":["10.77.0.2/32"],"nodeUserId":"user-10001","expiresAt":"2026-12-31T23:59:59Z"}]}'
+```
+
+成功响应只包含已核对为 `ACTIVE` 的 peer：
+
+```json
+{
+  "success": true,
+  "peers": [
+    {
+      "success": true,
+      "interface": "wg0",
+      "serverPublicKey": "//////////////////////////////////////////8=",
+      "peerId": "peer-10001",
+      "publicKey": "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=",
+      "address": "10.77.0.2/32",
+      "allowedIps": ["10.77.0.2/32"],
+      "nodeUserId": "user-10001",
+      "expiresAt": "2026-12-31T23:59:59+00:00",
+      "status": "ACTIVE"
+    }
+  ]
+}
+```
+
+相同幂等键与相同请求会重新运行 live apply 和内核核对，响应头 `Idempotency-Replayed` 为 `true`；同一键换请求体返回 `409`。核心 apply 的失败不会登记为成功，因此调用方可用原键安全重试。幂等存储只保留请求指纹，不保存 WireGuard 响应或 peer key。
+
+| HTTP 状态码 | 含义 |
+| --- | --- |
+| `401` / `403` | Bearer Token 无效，或来源 IP 不在允许列表 |
+| `409` | peer 身份、用户/住宅绑定冲突，或幂等键对应了不同请求 |
+| `422` | 请求格式无效、缺少幂等键，或 peer 数量不在 1 到 4,000 范围内 |
+| `503` | WireGuard/住宅路由运行时不可用、批量 apply 失败，或状态未能持久化；响应会说明是否已完成禁用清理 |
+
+接口只接收客户端公钥，不接收客户端私钥。不要把客户端私钥加入请求或写入日志；API 请求校验错误也不会回显请求体。
 
 ## 3. 域名绑定方案
 

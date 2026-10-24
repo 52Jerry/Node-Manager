@@ -21,6 +21,12 @@ STORE_PATH = Path(
 RETENTION_SECONDS = 24 * 60 * 60
 MAX_ENTRIES = 1000
 store_lock = threading.Lock()
+_request_locks = [threading.Lock() for _ in range(64)]
+
+
+def _request_lock(key: str) -> threading.Lock:
+    slot = int(hashlib.sha256(key.encode("utf-8")).hexdigest()[:8], 16) % len(_request_locks)
+    return _request_locks[slot]
 
 
 class IdempotencyConflict(RuntimeError):
@@ -117,31 +123,76 @@ def execute_idempotent(
         return callback(), False
 
     fingerprint = _fingerprint(operation, payload)
-    with store_lock:
-        store = _read_store()
-        entries = store["entries"]
-        now = time.time()
-        _prune(entries, now)
-        existing = entries.get(key)
-        if existing:
-            if existing.get("fingerprint") != fingerprint:
+    with _request_lock(key):
+        with store_lock:
+            store = _read_store()
+            entries = store["entries"]
+            now = time.time()
+            _prune(entries, now)
+            existing = entries.get(key)
+            if existing:
+                if existing.get("fingerprint") != fingerprint:
+                    raise IdempotencyConflict(
+                        "the idempotency key was already used with a different request"
+                    )
+                response = _decrypt_response(existing.get("responseEncrypted"))
+                if response is None and isinstance(existing.get("response"), dict):
+                    response = existing["response"]
+                if response is not None:
+                    return response, True
+                raise IdempotencyConflict(
+                    "the stored idempotent response cannot be decrypted; use a new key"
+                )
+
+            result = callback()
+            entries[key] = {
+                "fingerprint": fingerprint,
+                "createdAt": now,
+                "responseEncrypted": _encrypt_response(result),
+            }
+            _write_store(store)
+            return result, False
+
+
+def execute_reconciling_idempotent(
+    key: str,
+    operation: str,
+    payload: Any,
+    callback: Callable[[], dict[str, Any]],
+) -> tuple[dict[str, Any], bool]:
+    """Run a live reconciliation on every retry while binding a key to a payload.
+
+    Unlike ``execute_idempotent``, this does not persist a response receipt:
+    the callback must verify current external state each time. Only successful
+    request fingerprints are retained, so failed attempts remain retryable.
+    """
+    fingerprint = _fingerprint(operation, payload)
+    with _request_lock(key):
+        with store_lock:
+            store = _read_store()
+            entries = store["entries"]
+            _prune(entries, time.time())
+            existing = entries.get(key)
+            if existing and existing.get("fingerprint") != fingerprint:
                 raise IdempotencyConflict(
                     "the idempotency key was already used with a different request"
                 )
-            response = _decrypt_response(existing.get("responseEncrypted"))
-            if response is None and isinstance(existing.get("response"), dict):
-                response = existing["response"]
-            if response is not None:
-                return response, True
-            raise IdempotencyConflict(
-                "the stored idempotent response cannot be decrypted; use a new key"
-            )
-
+            replayed = existing is not None
         result = callback()
-        entries[key] = {
-            "fingerprint": fingerprint,
-            "createdAt": now,
-            "responseEncrypted": _encrypt_response(result),
-        }
-        _write_store(store)
-        return result, False
+        with store_lock:
+            store = _read_store()
+            entries = store["entries"]
+            now = time.time()
+            _prune(entries, now)
+            existing = entries.get(key)
+            if existing and existing.get("fingerprint") != fingerprint:
+                raise IdempotencyConflict(
+                    "the idempotency key was already used with a different request"
+                )
+            entries[key] = {
+                "fingerprint": fingerprint,
+                "createdAt": now,
+                "reconcileOnly": True,
+            }
+            _write_store(store)
+            return result, replayed

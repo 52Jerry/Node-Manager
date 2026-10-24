@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import copy
+import hashlib
 import ipaddress
 import json
 import logging
@@ -13,6 +14,7 @@ import tempfile
 import threading
 import uuid
 from contextlib import contextmanager
+from contextvars import ContextVar
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable
@@ -41,6 +43,18 @@ except ImportError:  # Windows development fallback; production deployment uses 
 
 
 logger = logging.getLogger(__name__)
+_restart_allowed = ContextVar("singbox_restart_allowed", default=True)
+
+
+@contextmanager
+def without_restart():
+    token = _restart_allowed.set(False)
+    try:
+        yield
+    finally:
+        _restart_allowed.reset(token)
+
+
 CONFIG_PATH = Path(config.singbox.config)
 LOCK_PATH = Path("/run/lock/node-manager-singbox.lock")
 REGISTRY_PATH = Path(os.environ.get("NODE_MANAGER_USER_REGISTRY", "/var/lib/node-manager/users.json"))
@@ -51,6 +65,8 @@ ENFORCEMENT_SOURCE_CIDRS_KEY = "enforcementBlockedSourceCidrs"
 ENFORCEMENT_AUTH_USERS_KEY = "enforcementAuthUsers"
 EXPIRATION_AUTH_USERS_KEY = "expirationAuthUsers"
 EXPIRATION_BLOCKED_KEY = "expirationBlocked"
+ACCESS_AUTH_USERS_KEY = "accessBlockedAuthUsers"
+ACCESS_BLOCKED_KEY = "accessBlocked"
 DEFAULT_USER_LIFETIME = timedelta(days=30)
 RESTORE_WINDOW = timedelta(hours=24)
 EXPIRATION_ENABLED = os.environ.get("NODE_MANAGER_EXPIRATION_ENABLED", "true").lower() not in {
@@ -224,6 +240,98 @@ def migrate_user_expirations() -> int:
     return mutate_config(apply)
 
 
+def recover_wireguard_user_metadata(user_expirations: dict[str, datetime]) -> int:
+    """Recover registry rows for legacy users proven by their live config.
+
+    WireGuard reconciliation supplies the authoritative subscription expiry,
+    but recovery is allowed only when the same user identity already exists in
+    a managed inbound and owns an exact residential SOCKS outbound. Existing
+    registry rows are never changed here, including suspended or blocked rows.
+    """
+    if not isinstance(user_expirations, dict) or not user_expirations:
+        return 0
+
+    normalized: dict[str, datetime] = {}
+    now = datetime.now(timezone.utc)
+    for raw_user_id, raw_expiry in user_expirations.items():
+        user_id = str(raw_user_id or "").strip()
+        expires_at = _as_utc(raw_expiry)
+        if not user_id or expires_at is None or expires_at <= now:
+            raise SingboxConfigError("legacy WireGuard user recovery requires a future expiration")
+        normalized[user_id] = expires_at
+
+    def apply(data: dict[str, Any], registry: dict[str, Any]) -> int:
+        users = registry.setdefault("users", {})
+        if not isinstance(users, dict):
+            raise SingboxConfigError("the user registry has an invalid structure")
+
+        outbounds = {
+            str(item.get("tag")): item
+            for item in data.get("outbounds", [])
+            if isinstance(item, dict) and item.get("tag")
+        }
+        recovered = 0
+        for user_id, expires_at in normalized.items():
+            existing = users.get(user_id)
+            if user_id in users:
+                if not isinstance(existing, dict):
+                    raise SingboxConfigError("the user registry has an invalid user entry")
+                if _as_utc(existing.get("expiresAt")) is not None:
+                    continue
+                if (existing.get("accessEnabled") is False
+                        or any(existing.get(flag) for flag in (
+                            ACCESS_BLOCKED_KEY,
+                            EXPIRATION_BLOCKED_KEY,
+                            ENFORCEMENT_TRAFFIC_KEY,
+                        ))):
+                    continue
+
+            auth_names = {_auth_name(user_id), user_id}
+            matching_users = [
+                auth_user
+                for inbound in data.get("inbounds", [])
+                if isinstance(inbound, dict)
+                and inbound.get("tag") in {
+                    config.singbox.vless_tag,
+                    config.singbox.vmess_tag,
+                    config.singbox.socks_tag,
+                }
+                for auth_user in inbound.get("users", [])
+                if isinstance(auth_user, dict)
+                and (auth_user.get("name") in auth_names
+                     or auth_user.get("username") in auth_names)
+            ]
+            if not matching_users:
+                raise SingboxConfigError("legacy WireGuard user is absent from managed inbounds")
+
+            outbound = outbounds.get(USER_OUTBOUND_PREFIX + user_id)
+            server = str((outbound or {}).get("server") or "").strip()
+            port = (outbound or {}).get("server_port")
+            if (not isinstance(outbound, dict) or outbound.get("type") != "socks"
+                    or not server or not isinstance(port, int) or isinstance(port, bool)
+                    or not 1 <= port <= 65535):
+                raise SingboxConfigError("legacy WireGuard user has no residential SOCKS outbound")
+
+            socks_username = next(
+                (str(item.get("username")) for item in matching_users if item.get("username")),
+                None,
+            )
+            metadata = existing if isinstance(existing, dict) else {}
+            metadata.setdefault("socksUsername", socks_username)
+            metadata.setdefault("createdAt", _iso(now))
+            metadata["expiresAt"] = _iso(expires_at)
+            metadata.setdefault("accessEnabled", True)
+            metadata.setdefault("sourceIp", server)
+            metadata.setdefault("sourceAddress", server)
+            metadata.setdefault("sourcePort", port)
+            users[user_id] = metadata
+            recovered += 1
+            _audit("user.registry.recover.wireguard", user_id, expiresAt=_iso(expires_at))
+        return recovered
+
+    return mutate_config(apply)
+
+
 def get_user_policy(user_id: str) -> dict[str, int | None]:
     with _config_lock():
         metadata = _registry_user(read_registry(), user_id)
@@ -302,10 +410,10 @@ def is_singbox_running() -> bool:
 
 
 def reload_singbox() -> bool:
-    for command in (
-        ["systemctl", "reload", "sing-box"],
-        ["systemctl", "restart", "sing-box"],
-    ):
+    commands = [["systemctl", "reload", "sing-box"]]
+    if _restart_allowed.get():
+        commands.append(["systemctl", "restart", "sing-box"])
+    for command in commands:
         try:
             result = _run(command)
         except (FileNotFoundError, subprocess.TimeoutExpired):
@@ -603,7 +711,7 @@ def _reality_client_options(inbound: dict[str, Any]) -> tuple[str, str, str]:
 
 def _acceleration_host() -> str:
     """Return the configured public endpoint, accepting either IP or DNS."""
-    value = str(config.node.acceleration_domain or config.node.host or "").strip()
+    value = str(config.node.random_acceleration_domain() or config.node.host or "").strip()
     return value or str(config.node.host)
 
 
@@ -1107,6 +1215,212 @@ def create_user(
     return mutate_config(apply)
 
 
+def migrate_residential_ownership(payload: dict[str, Any]) -> dict[str, Any]:
+    """Transfer a proven legacy owner without a delete/create availability gap.
+
+    Keep this inside one mutate_config transaction: WireGuard snapshots take the
+    same configuration lock, so they see either the old owner or the new owner.
+    Existing WireGuard peers are deliberately not adopted by a different user.
+    """
+    from models.request import MigrateResidentialOwnershipRequest
+
+    try:
+        request = MigrateResidentialOwnershipRequest.model_validate(payload)
+    except ValueError:
+        raise SingboxConfigError("invalid residential ownership migration request") from None
+    source, target = request.sourceUserId, request.targetUserId
+    expected = request.expectedProxy.model_dump()
+    identity = _proxy_identity(expected["server"], expected["port"],
+                               expected.get("username"), expected.get("password"))
+    proof = {
+        "sourceUserId": source, "resourceId": request.resourceId,
+        "subscriptionId": request.subscriptionId,
+        "accessProfileId": request.accessProfileId,
+        "fingerprint": hashlib.sha256(json.dumps(
+            [identity, request.targetUuid.lower(), _iso(_as_utc(request.expiresAt))],
+            separators=(",", ":"), ensure_ascii=True).encode()).hexdigest(),
+    }
+
+    def apply(data: dict[str, Any], registry: dict[str, Any]) -> dict[str, Any]:
+        users = registry.setdefault("users", {})
+        source_tag, target_tag = USER_OUTBOUND_PREFIX + source, USER_OUTBOUND_PREFIX + target
+        source_present = _user_exists(data, registry, source)
+        target_present = _user_exists(data, registry, target)
+        replay = not source_present and target_present
+        merge_existing_target = source_present and target_present
+        owner = target if replay else source
+        metadata = _registry_user(registry, owner)
+        if replay:
+            if (metadata.get("residentialOwnershipMigration") != proof
+                    or _as_utc(metadata.get("expiresAt")) != _as_utc(request.expiresAt)):
+                raise SingboxConfigError("residential target belongs to another allocation or has changed")
+        elif not source_present:
+            raise SingboxConfigError("residential source is missing or target is already occupied")
+        if not metadata:
+            raise SingboxConfigError("residential source registry is required")
+        for field, value in (("resourceId", request.resourceId), ("userIpResourceId", request.resourceId),
+                             ("subscriptionId", request.subscriptionId),
+                             ("accessProfileId", request.accessProfileId)):
+            if metadata.get(field) is not None and str(metadata[field]) != str(value):
+                raise SingboxConfigError("residential owner belongs to another resource")
+        if metadata.get("accessEnabled") is False or any(metadata.get(key) for key in (
+                ACCESS_BLOCKED_KEY, ENFORCEMENT_TRAFFIC_KEY)):
+            raise SingboxConfigError("blocked residential owner cannot be migrated")
+        target_metadata = _registry_user(registry, target) if merge_existing_target else {}
+        if merge_existing_target:
+            if not target_metadata or target_metadata.get("residentialOwnershipMigration"):
+                raise SingboxConfigError("residential target belongs to another allocation or has changed")
+            for field, value in (("resourceId", request.resourceId),
+                                 ("userIpResourceId", request.resourceId),
+                                 ("subscriptionId", request.subscriptionId),
+                                 ("accessProfileId", request.accessProfileId)):
+                if target_metadata.get(field) is not None and str(target_metadata[field]) != str(value):
+                    raise SingboxConfigError("residential target belongs to another resource")
+            if target_metadata.get("accessEnabled") is False or any(target_metadata.get(key) for key in (
+                    ACCESS_BLOCKED_KEY, ENFORCEMENT_TRAFFIC_KEY)):
+                raise SingboxConfigError("blocked residential target cannot be migrated")
+        owned = [item for item in data.get("outbounds", [])
+                 if _is_user_proxy_outbound_tag(str(item.get("tag") or ""), owner)]
+        if len(owned) != 1 or owned[0].get("tag") != USER_OUTBOUND_PREFIX + owner:
+            raise SingboxConfigError("ambiguous residential outbound ownership")
+        outbound = owned[0]
+        if (outbound.get("type") != "socks"
+                or not isinstance(outbound.get("server_port"), int)
+                or isinstance(outbound.get("server_port"), bool)
+                or _proxy_identity(str(outbound.get("server") or ""), outbound["server_port"],
+                                   outbound.get("username"), outbound.get("password")) != identity):
+            raise SingboxConfigError("residential proxy identity does not match")
+        _assert_proxy_available(data, owner, expected)
+        auth_names = _user_auth_names(registry, owner)
+        managed_tags = {config.singbox.vless_tag, config.singbox.vmess_tag,
+                        config.singbox.socks_tag, config.singbox.trojan_tag}
+        matched = []
+        for inbound in data.get("inbounds", []):
+            for auth in inbound.get("users", []):
+                if auth.get("name") in auth_names or auth.get("username") in auth_names:
+                    if inbound.get("tag") not in managed_tags:
+                        raise SingboxConfigError("residential identity appears in an unmanaged inbound")
+                    matched.append(auth)
+        uuids = {str(item["uuid"]).lower() for item in matched if item.get("uuid")}
+        if len(uuids) != 1 or (replay and uuids != {request.targetUuid.lower()}):
+            raise SingboxConfigError("residential UUID ownership is ambiguous or changed")
+        source_uuid = next(iter(uuids))
+        target_auth_names = _user_auth_names(registry, target) if merge_existing_target else set()
+        target_matched = [auth for inbound in data.get("inbounds", [])
+                          if inbound.get("tag") in managed_tags
+                          for auth in inbound.get("users", [])
+                          if auth.get("name") in target_auth_names or auth.get("username") in target_auth_names]
+        if merge_existing_target:
+            target_uuids = {str(item["uuid"]).lower() for item in target_matched if item.get("uuid")}
+            if not target_matched or target_uuids != {request.targetUuid.lower()}:
+                raise SingboxConfigError("residential target UUID is missing or changed")
+        for inbound in data.get("inbounds", []):
+            for auth in inbound.get("users", []):
+                if any(auth is item for item in matched):
+                    if inbound.get("tag") == config.singbox.trojan_tag and str(auth.get("password", "")).lower() != source_uuid:
+                        raise SingboxConfigError("residential protocol credentials are inconsistent")
+                elif merge_existing_target and any(auth is item for item in target_matched):
+                    continue
+                elif (str(auth.get("uuid", "")).lower() in {source_uuid, request.targetUuid.lower()}
+                      or (inbound.get("type") == "trojan" and str(auth.get("password", "")).lower()
+                          in {source_uuid, request.targetUuid.lower()})):
+                    raise SingboxConfigError("residential UUID is shared by another owner")
+        if any(other != owner and auth_names.intersection(_user_auth_names(registry, other))
+               for other in users):
+            raise SingboxConfigError("residential authentication identity is shared")
+        rules = data.setdefault("route", {}).setdefault("rules", [])
+        owned_tag = USER_OUTBOUND_PREFIX + owner
+        owned_rules = [rule for rule in rules if rule.get("outbound") == owned_tag]
+        if not owned_rules or any(not rule.get("auth_user")
+                                  or not set(rule["auth_user"]).issubset(auth_names)
+                                  for rule in owned_rules):
+            raise SingboxConfigError("residential route ownership does not match")
+        if any(owned_tag in item.get("outbounds", []) for item in data.get("outbounds", [])):
+            raise SingboxConfigError("residential outbound is referenced by another owner")
+        if merge_existing_target:
+            target_outbounds = [item for item in data.get("outbounds", [])
+                                if _is_user_proxy_outbound_tag(str(item.get("tag") or ""), target)]
+            if len(target_outbounds) != 1 or target_outbounds[0].get("tag") != target_tag \
+                    or target_outbounds[0].get("type") != "direct":
+                raise SingboxConfigError("residential target is not an unbound direct user")
+            target_rules = [rule for rule in rules if rule.get("outbound") == target_tag]
+            if not target_rules or any(not rule.get("auth_user")
+                                       or not set(rule["auth_user"]).issubset(target_auth_names)
+                                       for rule in target_rules):
+                raise SingboxConfigError("residential target route ownership does not match")
+            if any(target_tag in item.get("outbounds", []) for item in data.get("outbounds", [])):
+                raise SingboxConfigError("residential target outbound is referenced by another owner")
+        result = {"success": True, "userId": target, "sourceUserId": source,
+                  "resourceId": request.resourceId, "subscriptionId": request.subscriptionId,
+                  "uuid": request.targetUuid, "expiresAt": _iso(_as_utc(request.expiresAt)),
+                  "migrated": not replay}
+        if replay:
+            return result
+        if merge_existing_target:
+            _remove_expiration_rule(data, metadata)
+            _remove_managed_enforcement_rules(rules, metadata)
+            for inbound in data.get("inbounds", []):
+                inbound["users"] = [auth for auth in inbound.get("users", [])
+                                    if auth.get("name") not in auth_names
+                                    and auth.get("username") not in auth_names]
+            rules[:] = [rule for rule in rules
+                        if rule.get("outbound") not in {source_tag, target_tag}]
+            data["outbounds"] = [item for item in data.get("outbounds", [])
+                                 if item.get("tag") not in {source_tag, target_tag}]
+            merged_metadata = copy.deepcopy(target_metadata)
+            for field in ("sourceIp", "sourceAddress", "sourcePort", "countryCode",
+                          "countryName", "provinceName", "cityName"):
+                if metadata.get(field) not in (None, ""):
+                    merged_metadata[field] = metadata[field]
+            merged_metadata.update(resourceId=request.resourceId, subscriptionId=request.subscriptionId,
+                                   accessProfileId=request.accessProfileId,
+                                   expiresAt=result["expiresAt"], residentialOwnershipMigration=proof)
+            users[target] = merged_metadata
+            users.pop(source)
+            _set_proxy_binding(data, registry, target, expected)
+            _audit("user.residential.ownership.migrate", target, sourceUserId=source,
+                   resourceId=request.resourceId, subscriptionId=request.subscriptionId,
+                   mergedExistingTarget=True)
+            return result
+        if any(_is_user_proxy_outbound_tag(str(item.get("tag") or ""), target)
+               for item in data.get("outbounds", [])):
+            raise SingboxConfigError("residential target outbound is already occupied")
+        replacements = {_auth_name(source): _auth_name(target), source: target}
+        replacement_names = set(replacements.values())
+        if any(_auth_identifier_exists(data, name) for name in replacement_names):
+            raise SingboxConfigError("residential target authentication is already occupied")
+        _remove_expiration_rule(data, metadata)
+        for auth in matched:
+            if "uuid" in auth:
+                auth["uuid"] = request.targetUuid
+            elif "password" in auth and auth.get("name") in auth_names:
+                auth["password"] = request.targetUuid
+            for field in ("name", "username"):
+                if auth.get(field) in replacements:
+                    auth[field] = replacements[auth[field]]
+        for rule in rules:
+            if "auth_user" in rule:
+                rule["auth_user"] = [replacements.get(value, value) for value in rule["auth_user"]]
+            if rule.get("outbound") == source_tag:
+                rule["outbound"] = target_tag
+        outbound["tag"] = target_tag
+        metadata = copy.deepcopy(metadata)
+        metadata["socksUsername"] = replacements.get(metadata.get("socksUsername"), metadata.get("socksUsername"))
+        for field in (ENFORCEMENT_AUTH_USERS_KEY, EXPIRATION_AUTH_USERS_KEY, ACCESS_AUTH_USERS_KEY):
+            if isinstance(metadata.get(field), list):
+                metadata[field] = [replacements.get(value, value) for value in metadata[field]]
+        metadata.update(resourceId=request.resourceId, subscriptionId=request.subscriptionId,
+                        accessProfileId=request.accessProfileId,
+                        expiresAt=result["expiresAt"], residentialOwnershipMigration=proof)
+        users[target] = metadata
+        users.pop(source)
+        _audit("user.residential.ownership.migrate", target, sourceUserId=source,
+               resourceId=request.resourceId, subscriptionId=request.subscriptionId)
+        return result
+
+    return mutate_config(apply)
+
+
 def update_user_policy(user_id: str, updates: dict[str, Any]) -> dict[str, Any]:
     supported = {"trafficLimitBytes", "maxSourceIps", "maxConnections"}
     unknown = set(updates) - supported
@@ -1233,6 +1547,103 @@ def _remove_expiration_rule(data: dict[str, Any], metadata: dict[str, Any]) -> N
     metadata.pop(EXPIRATION_BLOCKED_KEY, None)
 
 
+def _remove_access_rule(data: dict[str, Any], metadata: dict[str, Any]) -> None:
+    raw_auth_users = metadata.get(ACCESS_AUTH_USERS_KEY)
+    if metadata.get(ACCESS_BLOCKED_KEY) is True and isinstance(raw_auth_users, list) and raw_auth_users:
+        expected = {"auth_user": sorted(str(value) for value in raw_auth_users if value), "action": "reject"}
+        rules = data.setdefault("route", {}).setdefault("rules", [])
+        for index, rule in enumerate(rules):
+            if isinstance(rule, dict) and _same_rule(rule, expected):
+                rules.pop(index)
+                break
+    metadata.pop(ACCESS_AUTH_USERS_KEY, None)
+    metadata.pop(ACCESS_BLOCKED_KEY, None)
+
+
+class UserAccessConnectionError(SingboxConfigError):
+    pass
+
+
+def set_user_access(user_id: str, enabled: bool) -> dict[str, Any]:
+    """Enable or suspend all managed protocols for one user."""
+    def apply(data: dict[str, Any], registry: dict[str, Any]) -> dict[str, Any]:
+        if not _user_exists(data, registry, user_id):
+            raise SingboxConfigError(f"user not found: {user_id}")
+        metadata = _registry_user(registry, user_id)
+        rules = data.setdefault("route", {}).setdefault("rules", [])
+        if enabled:
+            _remove_access_rule(data, metadata)
+            metadata["accessEnabled"] = True
+        else:
+            auth_users = sorted(_user_auth_names(registry, user_id))
+            expected = {"auth_user": auth_users, "action": "reject"}
+            if (metadata.get(ACCESS_BLOCKED_KEY) is not True
+                    or metadata.get(ACCESS_AUTH_USERS_KEY) != auth_users
+                    or expected not in rules):
+                _remove_access_rule(data, metadata)
+                rules.insert(0, expected)
+                metadata[ACCESS_AUTH_USERS_KEY] = auth_users
+                metadata[ACCESS_BLOCKED_KEY] = True
+            metadata["accessEnabled"] = False
+        _audit("user.access.update", user_id, enabled=enabled)
+        return {"success": True, "userId": user_id, "enabled": enabled,
+                "status": "active" if enabled else "suspended",
+                "blockedProtocols": [] if enabled else [
+                    protocol for protocol, tag in (("vless", config.singbox.vless_tag),
+                                                   ("vmess", config.singbox.vmess_tag),
+                                                   ("trojan", config.singbox.trojan_tag),
+                                                   ("socks", config.singbox.socks_tag))
+                    if any(item.get("tag") == tag and any(
+                        user.get("name") in _user_auth_names(registry, user_id)
+                        or user.get("username") in _user_auth_names(registry, user_id)
+                        for user in item.get("users", [])) for item in data.get("inbounds", []))
+                ], "configApplied": True, "activeConnectionsClosed": 0}
+
+    result = mutate_config(apply)
+    if enabled:
+        return result
+
+    snapshot = singbox_api.get_connections()
+    if not isinstance(snapshot, dict) or not isinstance(snapshot.get("connections"), list):
+        raise UserAccessConnectionError("user blocked, but active connections could not be inspected")
+    with _config_lock():
+        registry = read_registry()
+    names = _user_auth_names(registry, user_id)
+    outbound_tag = USER_OUTBOUND_PREFIX + user_id
+    auth_fields = ("inboundUser", "inbound_user", "authUser", "auth_user", "user")
+
+    def belongs_to_user(connection: dict[str, Any]) -> bool:
+        if outbound_tag in (connection.get("chains") or []):
+            return True
+        connection_metadata = connection.get("metadata")
+        candidates = [connection.get(field) for field in auth_fields]
+        if isinstance(connection_metadata, dict):
+            candidates.extend(connection_metadata.get(field) for field in auth_fields)
+        return any(value is not None and str(value) in names for value in candidates)
+
+    connections: set[str] = set()
+    for connection in snapshot["connections"]:
+        if not isinstance(connection, dict) or not connection.get("id"):
+            raise UserAccessConnectionError("user blocked, but a connection entry could not be identified")
+        if belongs_to_user(connection):
+            connections.add(str(connection["id"]))
+    closed = 0
+    for connection_id in connections:
+        if not singbox_api.close_connection(connection_id):
+            raise UserAccessConnectionError("user blocked, but an active connection could not be closed")
+        closed += 1
+    verified = singbox_api.get_connections()
+    if not isinstance(verified, dict) or not isinstance(verified.get("connections"), list):
+        raise UserAccessConnectionError("user blocked, but connection closure could not be verified")
+    for connection in verified["connections"]:
+        if not isinstance(connection, dict) or not connection.get("id"):
+            raise UserAccessConnectionError("user blocked, but connection closure could not be verified")
+        if belongs_to_user(connection):
+            raise UserAccessConnectionError("user blocked, but an active connection remains")
+    result["activeConnectionsClosed"] = closed
+    return result
+
+
 def _add_expiration_rule(data: dict[str, Any], registry: dict[str, Any], user_id: str) -> bool:
     metadata = _registry_user(registry, user_id)
     auth_users = sorted(_user_auth_names(registry, user_id))
@@ -1346,10 +1757,9 @@ def process_user_expirations(now: datetime | None = None) -> int:
                 continue
             if expires_at > current_time:
                 continue
-            if current_time >= expires_at + RESTORE_WINDOW:
-                _archive_user(data, registry, user_id, current_time)
-                changed += 1
-            elif _add_expiration_rule(data, registry, user_id):
+            # Removing a route requires an encrypted website DB backup and a
+            # fresh invalid SOCKS proof via user_cleanup; age alone is insufficient.
+            if _add_expiration_rule(data, registry, user_id):
                 changed += 1
         return changed
 
@@ -2309,6 +2719,17 @@ def get_history_user_snapshot() -> dict[str, Any]:
     return {"version": 1, "users": users}
 
 
+def get_user_access_snapshot() -> dict[str, bool]:
+    """Read the effective access flag for every configured user without mutation."""
+    with _config_lock():
+        data = read_config()
+        registry = read_registry()
+    return {
+        user_id: _registry_user(registry, user_id).get("accessEnabled") is not False
+        for user_id in sorted(_discover_user_ids(data, registry))
+    }
+
+
 def ensure_user_outbounds() -> int:
     with _config_lock():
         current = read_config()
@@ -2394,6 +2815,7 @@ def list_users() -> list[dict[str, Any]]:
         item["createdAt"] = metadata.get("createdAt")
         item["expiresAt"] = metadata.get("expiresAt")
         item["expirationStatus"] = _expiration_status(metadata)
+        item["accessEnabled"] = metadata.get("accessEnabled") is not False
         item["sourceIp"] = metadata.get("sourceIp")
         item["countryCode"] = metadata.get("countryCode")
         item["countryName"] = metadata.get("countryName")
@@ -2401,7 +2823,7 @@ def list_users() -> list[dict[str, Any]]:
         item["cityName"] = metadata.get("cityName")
         item["trafficLimitBytes"] = _positive_policy_value(metadata.get("trafficLimitBytes"))
         item["maxSourceIps"] = _positive_policy_value(metadata.get("maxSourceIps"))
-        item["status"] = "active"
+        item["status"] = "suspended" if metadata.get("accessEnabled") is False else "active"
         result.append(item)
 
     return sorted(result, key=lambda item: item["userId"].lower())
@@ -2416,6 +2838,8 @@ def get_user_connection(user_id: str) -> dict[str, Any]:
     expiration_status = _expiration_status(metadata)
     if expiration_status == "EXPIRED":
         raise SingboxConfigError(f"user connection expired: {user_id}")
+    if metadata.get("accessEnabled") is False:
+        raise SingboxConfigError(f"user access suspended: {user_id}")
     auth_name = _auth_name(user_id)
     socks_username = _public_socks_username(registry, user_id)
     protocols: list[str] = []
@@ -2591,6 +3015,8 @@ def get_user_proxy(user_id: str) -> dict[str, Any]:
         None,
     )
     metadata = _registry_user(registry, user_id)
+    if metadata.get("accessEnabled") is False:
+        raise SingboxConfigError(f"user access suspended: {user_id}")
     if not outbound or outbound.get("type") not in {"socks", "socks5"}:
         return {
             "userId": user_id,

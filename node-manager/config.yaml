@@ -5,6 +5,10 @@ node:
   # 加速线路对外公网地址。支持：域名、IPv4、IPv6。
   # 未配置时自动回退到 node.host。用于 VLESS/SOCKS加速/VMess 链接的 add/host 字段。
   acceleration_domain: ""
+  # 多域名故障切换。每次生成一组协议会随机选择其中一个域名。
+  # acceleration_domains:
+  #   - edge-a.example.com
+  #   - edge-b.example.com
 
 server:
   port: 8088
@@ -17,6 +21,13 @@ singbox:
   api_port: 9090
   api_secret: ""
   trojan_tag: "trojan"
+
+# WireGuard peer 管理默认关闭。开启前必须由运维预先创建并配置 wg0、路由、
+# 防火墙和香港出口处理层；Node Manager 只执行 wg set peer/remove/show。
+wireguard:
+  enabled: false
+  interface: wg0
+  command: wg
 
 monitoring:
   # 大批量节点可调高到 5-10 秒以降低采样开销。

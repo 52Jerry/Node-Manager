@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 import re
 
 _UUID_PATTERN = re.compile(
@@ -115,6 +115,28 @@ class CreateUserRequest(BaseModel):
         return value
 
 
+class MigrateResidentialOwnershipRequest(BaseModel):
+    """Explicit proof for transferring one legacy residential allocation."""
+    model_config = ConfigDict(extra="forbid")
+    sourceUserId: str = Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]*$", max_length=64)
+    targetUserId: str = Field(pattern=r"^primary-[1-9][0-9]*$", max_length=64)
+    resourceId: int = Field(gt=0)
+    subscriptionId: int = Field(gt=0)
+    accessProfileId: int = Field(gt=0)
+    targetUuid: str = Field(pattern=_UUID_PATTERN.pattern)
+    expectedProxy: ProxyConfig
+    expiresAt: datetime
+
+    @model_validator(mode="after")
+    def validate_target(self):
+        if self.targetUserId != f"primary-{self.accessProfileId}":
+            raise ValueError("targetUserId must match accessProfileId")
+        if self.sourceUserId == self.targetUserId:
+            raise ValueError("sourceUserId must differ from targetUserId")
+        CreateUserRequest.expiration_must_be_in_the_future(self.expiresAt)
+        return self
+
+
 class UpdateUserPolicyRequest(BaseModel):
     trafficLimitBytes: int | None = Field(default=None, ge=0)
     maxSourceIps: int | None = Field(default=None, ge=0, le=1000)
@@ -125,6 +147,10 @@ class UpdateUserPolicyRequest(BaseModel):
         if not self.model_fields_set:
             raise ValueError("at least one policy field is required")
         return self
+
+
+class UserAccessRequest(BaseModel):
+    enabled: bool
 
 
 class ApplyDefaultTrafficLimitRequest(BaseModel):
@@ -313,7 +339,7 @@ class TrafficResponse(BaseModel):
     sourceIpVisibility: Literal["observed", "relay_detected", "missing", "idle", "unavailable"] = "unavailable"
     suspectedRelaySourceIps: list[str] = Field(default_factory=list)
     missingSourceConnections: int | None = None
-    status: Literal["active", "traffic_limited", "device_limited", "connection_limited"] = "active"
+    status: Literal["active", "suspended", "traffic_limited", "device_limited", "connection_limited"] = "active"
 
 
 class ReloadResponse(BaseModel):
@@ -337,10 +363,11 @@ class UserSummary(BaseModel):
     trafficLimitBytes: int | None = None
     maxSourceIps: int | None = None
     activeSourceIps: list[str] = Field(default_factory=list)
-    status: Literal["active", "traffic_limited", "device_limited", "connection_limited"] = "active"
+    status: Literal["active", "suspended", "traffic_limited", "device_limited", "connection_limited"] = "active"
     createdAt: datetime | None = None
     expiresAt: datetime | None = None
     expirationStatus: Literal["ACTIVE", "EXPIRED"] = "ACTIVE"
+    accessEnabled: bool = True
 
 
 class UserListResponse(BaseModel):
@@ -505,3 +532,43 @@ class AgentHeartbeatResponse(BaseModel):
     traffic: TrafficTotals
     deadOutbounds: list[DeadOutboundInfo] = Field(default_factory=list)
     reportedAt: datetime
+
+
+class WireguardPeerApplyRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    peerId: str = Field(min_length=1, max_length=128)
+    publicKey: str = Field(min_length=40, max_length=64)
+    address: str = Field(min_length=7, max_length=32)
+    allowedIps: list[str] = Field(min_length=1, max_length=1)
+    nodeUserId: str = Field(min_length=1, max_length=64)
+    expiresAt: datetime
+
+
+class WireguardPeerApplyBatchRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    peers: list[WireguardPeerApplyRequest] = Field(min_length=1, max_length=4000)
+
+
+class WireguardPeerReceipt(BaseModel):
+    success: bool
+    interface: str
+    serverPublicKey: str
+    peerId: str
+    publicKey: str
+    address: str
+    allowedIps: list[str]
+    nodeUserId: str
+    expiresAt: str
+    status: Literal["ACTIVE"]
+
+
+class WireguardPeerApplyBatchResponse(BaseModel):
+    success: bool
+    peers: list[WireguardPeerReceipt] = Field(min_length=1, max_length=4000)
+
+
+class WireguardPeerRevokeRequest(BaseModel):
+    peerId: str = Field(min_length=1, max_length=128)
+    publicKey: str = Field(min_length=40, max_length=64)

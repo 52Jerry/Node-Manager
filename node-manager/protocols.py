@@ -16,6 +16,7 @@ URI 备注和其他参数继续按 URI 规则编码，只有 VMess 的完整 JSO
 from __future__ import annotations
 
 import base64
+import ipaddress
 import json
 from dataclasses import asdict, dataclass, field
 from typing import Any
@@ -54,9 +55,19 @@ def _uri_host(value: str) -> str:
 def normalize_country_code(value: str | None) -> str:
     """Return an uppercase ISO alpha-2 code, or ``XX`` when unavailable."""
     normalized = str(value or "").strip().upper()
-    if len(normalized) == 2 and normalized.isascii() and normalized.isalpha():
+    if len(normalized) == 2 and normalized.isascii() and normalized.isalpha() and normalized != "ZZ":
         return normalized
     return "XX"
+
+
+def residential_alias(country_code: str | None, ip: str | None) -> str:
+    """Format a residential alias only when the display IP is a valid address."""
+    display_ip = str(ip or "").strip()
+    try:
+        ipaddress.ip_address(display_ip)
+    except ValueError:
+        return ""
+    return f"[{normalize_country_code(country_code)}] {display_ip}"
 
 
 @dataclass
@@ -125,13 +136,8 @@ class ProtocolData:
     trojan_security: str = "reality"
 
     def remark_label(self) -> str:
-        """生成标准备注：原始地址用 `US-1.2.3.4`，加速线路用 `[US] 1.2.3.4`。"""
-        if self.remark:
-            return self.remark
-        base = self.ip
-        if self.city_name:
-            return f"{self.city_name}"
-        return base
+        """Return the same residential alias used by generated protocol links."""
+        return residential_alias(self.country_code, self.ip)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -142,16 +148,17 @@ class ProtocolData:
 # ---------------------------------------------------------------------------
 
 def socks5_original(data: ProtocolData) -> str:
-    """原始地址 - SOCKS5：socks://user:pass@ip:port#备注。
+    """原始地址 - SOCKS5：socks://user:pass@ip:port#[CC] IP。
 
     V2Ray/V2RayN 兼容完整凭据 Base64 userinfo：先编码
     ``username:password``，再放到 URI 的 ``@`` 前。该格式只用于分享链接，
     不改变服务器端 SOCKS 的实际用户名和密码字段。
     """
-    remark = f"{normalize_country_code(data.country_code)}-{data.ip}"
+    remark = residential_alias(data.country_code, data.ip)
     auth = _socks_uri_auth(str(data.username), str(data.password))
     endpoint = data.endpoint_host or data.ip
-    return f"socks://{auth}@{_uri_host(endpoint)}:{data.port}#{_url_encode(remark)}"
+    link = f"socks://{auth}@{_uri_host(endpoint)}:{data.port}"
+    return f"{link}#{_url_encode(remark)}" if remark else link
 
 
 def bitbrowser(data: ProtocolData) -> str:
@@ -162,8 +169,8 @@ def bitbrowser(data: ProtocolData) -> str:
 
 def vless(data: ProtocolData) -> str:
     """加速线路 - VLESS：vless://uuid@域名:端口?参数#备注"""
-    remark = f"[{normalize_country_code(data.country_code)}] {data.ip}"
-    return (
+    remark = residential_alias(data.country_code, data.ip)
+    link = (
         f"vless://{data.uuid}@{_uri_host(data.acceleration_domain)}:{data.vless_port}"
         f"?encryption={data.vless_encryption}"
         f"&security={data.vless_security}"
@@ -175,8 +182,8 @@ def vless(data: ProtocolData) -> str:
         f"&type={data.vless_type}"
         f"&headerType={data.vless_header_type}"
         f"&flow={data.vless_flow}"
-        f"#{_url_encode(remark)}"
     )
+    return f"{link}#{_url_encode(remark)}" if remark else link
 
 
 def socks_acceleration(data: ProtocolData) -> str:
@@ -187,20 +194,20 @@ def socks_acceleration(data: ProtocolData) -> str:
     sing-box itself continues to authenticate with the original separate
     username/password fields.
     """
-    remark = f"[{normalize_country_code(data.country_code)}] {data.ip}"
+    remark = residential_alias(data.country_code, data.ip)
     auth = _socks_uri_auth(str(data.username), str(data.password))
-    return (
+    link = (
         f"socks://{auth}"
         f"@{_uri_host(data.acceleration_domain)}:{data.acceleration_port_socks}"
-        f"#{_url_encode(remark)}"
     )
+    return f"{link}#{_url_encode(remark)}" if remark else link
 
 
 def vmess(data: ProtocolData) -> str:
     """加速线路 - VMess：vmess://base64(JSON 配置)"""
     config = {
         "v": data.vmess_v,
-        "ps": f"[{normalize_country_code(data.country_code)}] {data.ip}",
+        "ps": residential_alias(data.country_code, data.ip),
         "add": data.acceleration_domain,
         "port": str(data.vmess_port),
         "id": data.uuid,
@@ -224,9 +231,9 @@ def trojan(data: ProtocolData) -> str:
     第 6 种协议。复用 Reality TLS（与 VLESS 共享 pbk/sid/sni），
     认证凭据使用 trojan_password（默认回退到 uuid，保持单凭据体验）。
     """
-    remark = f"[{normalize_country_code(data.country_code)}] {data.ip}"
+    remark = residential_alias(data.country_code, data.ip)
     password = data.trojan_password or data.uuid
-    return (
+    link = (
         f"trojan://{password}@{_uri_host(data.acceleration_domain)}:{data.trojan_port}"
         f"?type={data.trojan_type}"
         f"&security={data.trojan_security}"
@@ -234,8 +241,8 @@ def trojan(data: ProtocolData) -> str:
         f"&fp={data.trojan_fp}"
         f"&pbk={data.trojan_pbk}"
         f"&sid={data.trojan_sid}"
-        f"#{_url_encode(remark)}"
     )
+    return f"{link}#{_url_encode(remark)}" if remark else link
 
 
 def _url_encode(value: str) -> str:

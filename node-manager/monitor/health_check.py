@@ -132,7 +132,7 @@ def _health_check_loop(interval: int, fail_threshold: int, tcp_timeout: float, b
             for d in newly_dead:
                 logger.warning(
                     "  [DEAD] user=%s server=%s:%d tag=%s fail_count=%d",
-                    d["user_id"], d["server"], d["port"], d["tag"], d["fail_count"],
+                    d["userId"], d["server"], d["port"], d["tag"], d["failCount"],
                 )
             logger.warning("Manual action required: review and delete via node-manager API")
             logger.warning("Dead outbounds list (total %d):", len(_dead_outbounds))

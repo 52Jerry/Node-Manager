@@ -329,14 +329,17 @@ class UserReplicationTest(unittest.TestCase):
         self.assertEqual(result.status_code, 422)
         self.assertNotIn("private-password", result.text)
 
-    def test_source_deletion_only_removes_group_owned_accounts(self):
+    def test_source_omission_requires_retirement_review_and_preserves_accounts(self):
         self.create()
         snapshot = export_users()
         self.reset_target()
         manager.create_user("independent", ["socks"], socks_username="other", socks_password="other-secret")
         apply_users(self.request(snapshot))
-        apply_users(ReplicationRequest(groupKey="test-group", users=[]))
-        self.assertEqual(set(manager.read_registry()["users"]), {"independent"})
+        before = self.config_path.read_bytes(), self.registry_path.read_bytes(), self.traffic_path.read_bytes()
+        with self.assertRaisesRegex(manager.SingboxConfigError, "OMITTED_MANAGED_USER_REVIEW_REQUIRED"):
+            apply_users(ReplicationRequest(groupKey="test-group", users=[]))
+        self.assertEqual(before, (self.config_path.read_bytes(), self.registry_path.read_bytes(), self.traffic_path.read_bytes()))
+        self.assertEqual(set(manager.read_registry()["users"]), {"independent", "primary-7"})
 
     def test_conflicting_target_credentials_roll_back_entire_batch(self):
         self.create()
@@ -359,7 +362,7 @@ class UserReplicationTest(unittest.TestCase):
         self.assertEqual(set(manager.read_registry()["users"]), {"primary-7"})
         self.assertEqual(export_users(), snapshot)
 
-    def test_retired_alias_is_removed_on_initial_sync(self):
+    def test_retired_alias_requires_review_and_preserves_configuration(self):
         self.create()
         snapshot = export_users()
         manager_user = snapshot["users"][0]
@@ -367,9 +370,11 @@ class UserReplicationTest(unittest.TestCase):
         old = copy.deepcopy(manager_user)
         old["userId"] = "backup-7"
         apply_users(ReplicationRequest(groupKey="test-group", users=[old]))
-        apply_users(ReplicationRequest(groupKey="test-group", users=[], retired=[manager_user],
-                                       aliases={"backup-7": "primary-7"}))
-        self.assertEqual(manager.read_registry()["users"], {})
+        before = self.config_path.read_bytes(), self.registry_path.read_bytes()
+        with self.assertRaisesRegex(manager.SingboxConfigError, "RETIREMENT_REVIEW_REQUIRED"):
+            apply_users(ReplicationRequest(groupKey="test-group", users=[], retired=[manager_user],
+                                           aliases={"backup-7": "primary-7"}))
+        self.assertEqual(before, (self.config_path.read_bytes(), self.registry_path.read_bytes()))
 
     def test_expired_snapshot_never_resurrects_account(self):
         self.create()
