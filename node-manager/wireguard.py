@@ -852,13 +852,16 @@ def _fail_closed(data, reason, error):
 
 
 def status():
+    """Fresh read-only snapshot without waiting for an entire reconcile/hotload."""
     _require_enabled()
-    with _locked():
+    for _ in range(2):
+        before = _delivery_versions()
+        recovery_reason = _recovery_error
         data, kernel = _read(), _kernel()
         public_key = _key(_invoke(["show", config.wireguard.interface, "public-key"]).strip())
         try:
             runtime_ready = bool(_runtime_ready())
-            routing_ready = runtime_ready and _recovery_error is None
+            routing_ready = runtime_ready and recovery_reason is None
         except Exception:
             runtime_ready = routing_ready = False
         handshakes = {f[0]: int(f[1]) for line in _invoke(["show", config.wireguard.interface, "latest-handshakes"]).splitlines() if len(f := line.split()) == 2}
@@ -869,12 +872,17 @@ def status():
                   "latestHandshake": handshakes.get(p["publicKey"], 0),
                   "receiveBytes": transfer.get(p["publicKey"], (0, 0))[0],
                   "transmitBytes": transfer.get(p["publicKey"], (0, 0))[1]} for p in data["peers"].values()]
+        interface_addresses = _interface_addresses()
+        runtime_reason = None if runtime_ready else _runtime_failure_reason()
+        if before != _delivery_versions() or recovery_reason != _recovery_error:
+            continue
         return {"success": True, "interface": config.wireguard.interface, "serverPublicKey": public_key,
-                "interfaceAddresses": _interface_addresses(),
-                "routingReady": routing_ready, "recoveryReason": _recovery_error,
-                "runtimeReason": None if runtime_ready else _runtime_failure_reason(), "peers": peers,
+                "interfaceAddresses": interface_addresses,
+                "routingReady": routing_ready, "recoveryReason": recovery_reason,
+                "runtimeReason": runtime_reason, "peers": peers,
                 "occupiedAddresses": sorted({a for values in kernel.values() for a in values}),
                 "trafficSource": "wireguard kernel cumulative counters; reset when peer or interface resets; not billing"}
+    raise WireguardError("WireGuard state changed during status snapshot; retry", "DELIVERY_SNAPSHOT_CHANGED")
 
 
 def _delivery_versions():
@@ -944,14 +952,13 @@ def peer_delivery_status(peer_id, node_user_id, include_runtime=True):
 
 
 def wireguard_access_snapshot():
-    """Return whether each discovered node user is eligible for WireGuard now.
-
-    This is a read-only projection of the same binding, expiry, access and
-    residential SOCKS checks used by the peer apply path. It intentionally
-    excludes credentials and peer material.
-    """
+    """Validate fresh user rights from one matching atomic-file generation."""
     _require_enabled()
-    with _locked():
+    for _ in range(2):
+        before = _delivery_versions()
+        recovery_reason = _recovery_error
+        # Keep the short manager lock for the two-file binding transaction;
+        # only the long WireGuard reconcile/hotload lock is removed.
         source_config, user_registry = _read_binding_snapshot()
         outbounds_by_tag = _outbounds_by_tag(source_config)
         now = _now()
@@ -971,7 +978,10 @@ def wireguard_access_snapshot():
                 result[user_id] = False
             else:
                 result[user_id] = True
+        if before != _delivery_versions() or recovery_reason != _recovery_error:
+            continue
         return result
+    raise WireguardError("WireGuard state changed during access snapshot; retry", "DELIVERY_SNAPSHOT_CHANGED")
 
 
 def start_reconciler():

@@ -350,7 +350,7 @@ def wireguard_peer_status(response: Response, _token: str = Depends(verify_token
     try:
         return wireguard_status()
     except WireguardError as exc:
-        raise HTTPException(status_code=409, detail=str(exc)) from exc
+        raise HTTPException(status_code=503 if exc.code == "DELIVERY_SNAPSHOT_CHANGED" else 409, detail=str(exc)) from exc
 
 
 @app.get("/api/wireguard/peer-status", tags=["wireguard"])
@@ -375,7 +375,7 @@ def wireguard_access_snapshot_endpoint(response: Response, _token: str = Depends
     try:
         return wireguard_access_snapshot()
     except WireguardError as exc:
-        raise HTTPException(status_code=409, detail=str(exc)) from exc
+        raise HTTPException(status_code=503 if exc.code == "DELIVERY_SNAPSHOT_CHANGED" else 409, detail=str(exc)) from exc
 
 
 @app.post("/api/user/create", response_model=CreateUserResponse, tags=["users"])
