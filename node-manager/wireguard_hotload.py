@@ -18,7 +18,7 @@ from typing import Any
 
 
 BASE_PORT = 61037
-SLOT_COUNT = 8
+SLOT_COUNT = 10
 PORT_LIMIT = BASE_PORT + SLOT_COUNT
 COOKIE_MASK = 0xFF000000
 COOKIE_MASK_TEXT = "0xff000000"
@@ -693,7 +693,7 @@ def _start_new_candidate(routes, state, rendered, config_path) -> int:
     digest = _config_hash(rendered)
     port = _allocate_port(state)
     if port is None:
-        raise HotloadPendingError("all eight WireGuard hotload slots are occupied or not safely reclaimable")
+        raise HotloadPendingError("all ten WireGuard hotload slots are occupied or not safely reclaimable")
 
     path = _save_generation(config_path, port, rendered)
     try:

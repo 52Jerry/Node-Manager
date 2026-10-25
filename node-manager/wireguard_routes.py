@@ -270,7 +270,7 @@ def _hotload_generation_rules(state: dict[str, Any]) -> list[list[str]]:
     active_port = state["activePort"]
     if (not ports or PORT not in ports or len(ports) != len(set(ports))
             or type(active_port) is not int or active_port not in ports
-            or any(type(port) is not int or not PORT <= port < PORT + 8 for port in ports)):
+            or any(type(port) is not int or not PORT <= port < PORT + 10 for port in ports)):
         raise RuntimeError("WireGuard hotload generation ownership is invalid")
     mask = "0xff000000"
 
