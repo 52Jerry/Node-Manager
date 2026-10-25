@@ -409,9 +409,16 @@ def is_singbox_running() -> bool:
         return False
 
 
-def reload_singbox() -> bool:
+def reload_singbox(restart_if_reload_fails: bool = False) -> bool:
+    """Hot-reload sing-box without restarting shared processes by default.
+
+    A failed reload keeps the current process and lets mutate_config restore the
+    previous config/registry. Only an explicit emergency caller may request the
+    restart fallback; ordinary user, route, credential and rollback writes must
+    never restart the shared proxy.
+    """
     commands = [["systemctl", "reload", "sing-box"]]
-    if _restart_allowed.get():
+    if restart_if_reload_fails and _restart_allowed.get():
         commands.append(["systemctl", "restart", "sing-box"])
     for command in commands:
         try:
@@ -1465,71 +1472,85 @@ def apply_default_traffic_limit(traffic_limit_bytes: int) -> dict[str, Any]:
     return mutate_config(apply)
 
 
-def renew_user(
-    user_id: str,
+def renew_users(
+    user_ids: list[str],
     expires_at: datetime,
     traffic_limit_bytes: int | None = None,
     max_source_ips: int | None = None,
 ) -> dict[str, Any]:
-    """Atomically update a user's expiration and quota policy."""
+    """Atomically renew up to one full node snapshot with one hot reload.
+
+    All identities are validated and committed inside the same config lock.
+    If any item fails validation, no item is published; mutate_config also
+    restores the prior registry/config and never restarts sing-box by default.
+    """
+    unique_ids = list(dict.fromkeys(user_id for user_id in user_ids if user_id))
+    if not unique_ids or len(unique_ids) != len(user_ids):
+        raise SingboxConfigError("userIds must be non-empty and unique")
+    if len(unique_ids) > 1000:
+        raise SingboxConfigError("too many users in one renewal batch")
     new_expiry = _as_utc(expires_at)
     now = datetime.now(timezone.utc)
     if new_expiry is None or new_expiry <= now:
         raise SingboxConfigError("expiresAt must be in the future")
 
     def apply(data: dict[str, Any], registry: dict[str, Any]) -> dict[str, Any]:
-        if not _user_exists(data, registry, user_id):
-            raise SingboxConfigError(f"user not found: {user_id}")
-        metadata = _registry_user(registry, user_id)
-        old_expiry = _as_utc(metadata.get("expiresAt"))
-        if old_expiry is not None and now >= old_expiry + RESTORE_WINDOW:
-            raise SingboxConfigError("user restore window has expired")
-        # Legacy clients round timestamps to seconds; that is not a new renewal cycle.
-        if old_expiry is not None and timedelta(0) < abs(new_expiry - old_expiry) < timedelta(seconds=1):
-            return {
-                "success": True,
-                "userId": user_id,
-                "expiresAt": metadata["expiresAt"],
-                "expirationStatus": "ACTIVE" if old_expiry > now else "EXPIRED",
-                "expirationPrecisionOnly": True,
+        items: list[dict[str, Any]] = []
+        for user_id in unique_ids:
+            if not _user_exists(data, registry, user_id):
+                raise SingboxConfigError(f"user not found: {user_id}")
+            metadata = _registry_user(registry, user_id)
+            old_expiry = _as_utc(metadata.get("expiresAt"))
+            if old_expiry is not None and now >= old_expiry + RESTORE_WINDOW:
+                raise SingboxConfigError(f"user restore window has expired: {user_id}")
+            # Legacy clients round timestamps to seconds; that is not a new renewal cycle.
+            if old_expiry is not None and timedelta(0) < abs(new_expiry - old_expiry) < timedelta(seconds=1):
+                items.append({
+                    "success": True,
+                    "userId": user_id,
+                    "expiresAt": metadata["expiresAt"],
+                    "expirationStatus": "ACTIVE" if old_expiry > now else "EXPIRED",
+                    "expirationPrecisionOnly": True,
+                    "trafficLimitBytes": _positive_policy_value(metadata.get("trafficLimitBytes")),
+                    "maxSourceIps": _positive_policy_value(metadata.get("maxSourceIps")),
+                })
+                continue
+            if old_expiry is not None and new_expiry < old_expiry:
+                raise SingboxConfigError(f"renewal cannot shorten the existing expiration: {user_id}")
+
+            if traffic_limit_bytes is not None:
+                metadata["trafficLimitBytes"] = _positive_policy_value(traffic_limit_bytes)
+            if max_source_ips is not None:
+                metadata["maxSourceIps"] = _positive_policy_value(max_source_ips)
+
+            metadata["expiresAt"] = _iso(new_expiry)
+            metadata["expirationUpdatedAt"] = _iso(now)
+            _remove_expiration_rule(data, metadata)
+            policy = {
                 "trafficLimitBytes": _positive_policy_value(metadata.get("trafficLimitBytes")),
                 "maxSourceIps": _positive_policy_value(metadata.get("maxSourceIps")),
             }
-        if old_expiry is not None and new_expiry < old_expiry:
-            raise SingboxConfigError("renewal cannot shorten the existing expiration")
-
-        if traffic_limit_bytes is not None:
-            metadata["trafficLimitBytes"] = _positive_policy_value(
-                traffic_limit_bytes
-            )
-        if max_source_ips is not None:
-            metadata["maxSourceIps"] = _positive_policy_value(max_source_ips)
-
-        metadata["expiresAt"] = _iso(new_expiry)
-        metadata["expirationUpdatedAt"] = _iso(now)
-        _remove_expiration_rule(data, metadata)
-        policy = {
-            "trafficLimitBytes": _positive_policy_value(
-                metadata.get("trafficLimitBytes")
-            ),
-            "maxSourceIps": _positive_policy_value(metadata.get("maxSourceIps")),
-        }
-        _audit(
-            "user.renew",
-            user_id,
-            expiresAt=metadata["expiresAt"],
-            **policy,
-        )
-        return {
-            "success": True,
-            "userId": user_id,
-            "expiresAt": metadata["expiresAt"],
-            "expirationStatus": "ACTIVE",
-            **policy,
-        }
+            _audit("user.renew", user_id, expiresAt=metadata["expiresAt"], **policy)
+            items.append({
+                "success": True,
+                "userId": user_id,
+                "expiresAt": metadata["expiresAt"],
+                "expirationStatus": "ACTIVE",
+                **policy,
+            })
+        return {"success": True, "items": items, "userCount": len(items)}
 
     return mutate_config(apply)
 
+
+def renew_user(
+    user_id: str,
+    expires_at: datetime,
+    traffic_limit_bytes: int | None = None,
+    max_source_ips: int | None = None,
+) -> dict[str, Any]:
+    """Compatibility wrapper for the atomic batch renewal implementation."""
+    return renew_users([user_id], expires_at, traffic_limit_bytes, max_source_ips)["items"][0]
 
 def _remove_expiration_rule(data: dict[str, Any], metadata: dict[str, Any]) -> None:
     rules = data.setdefault("route", {}).setdefault("rules", [])

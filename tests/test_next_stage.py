@@ -9,7 +9,7 @@ import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import unquote
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from fastapi.testclient import TestClient
 
@@ -91,7 +91,8 @@ class ManagerTestCase(unittest.TestCase):
         )
         self.config_patch = patch.object(manager, "CONFIG_PATH", self.config_path)
         self.registry_patch = patch.object(manager, "REGISTRY_PATH", self.registry_path)
-        self.write_patch = patch.object(manager, "_write_and_reload", self._write_config)
+        self.write_mock = MagicMock(side_effect=self._write_config)
+        self.write_patch = patch.object(manager, "_write_and_reload", self.write_mock)
         self.idempotency_patch = patch.object(
             idempotency, "STORE_PATH", self.idempotency_path
         )
@@ -112,6 +113,40 @@ class ManagerTestCase(unittest.TestCase):
 
     def _write_config(self, data):
         self.config_path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+
+    def test_batch_renewal_commits_all_users_with_one_config_publication(self):
+        manager.create_user("renew-batch-a", ["socks"])
+        manager.create_user("renew-batch-b", ["socks"])
+        registry = manager.read_registry()
+        expired_at = datetime.now(timezone.utc) - timedelta(hours=1)
+        for user_id in ("renew-batch-a", "renew-batch-b"):
+            registry["users"][user_id]["expiresAt"] = expired_at.isoformat()
+        manager._write_registry(registry)
+        self.assertEqual(manager.process_user_expirations(), 2)
+        expiry = datetime.now(timezone.utc) + timedelta(days=60)
+        self.write_mock.reset_mock()
+
+        result = manager.renew_users(["renew-batch-a", "renew-batch-b"], expiry)
+
+        self.assertEqual(result["userCount"], 2)
+        self.assertEqual(self.write_mock.call_count, 1)
+        registry = manager.read_registry()["users"]
+        self.assertEqual(registry["renew-batch-a"]["expiresAt"], expiry.isoformat())
+        self.assertEqual(registry["renew-batch-b"]["expiresAt"], expiry.isoformat())
+
+    def test_batch_renewal_with_one_invalid_user_publishes_nothing(self):
+        manager.create_user("renew-valid", ["socks"])
+        before_config = self.config_path.read_bytes()
+        before_registry = self.registry_path.read_bytes()
+        self.write_mock.reset_mock()
+        expiry = datetime.now(timezone.utc) + timedelta(days=60)
+
+        with self.assertRaisesRegex(manager.SingboxConfigError, "user not found: renew-missing"):
+            manager.renew_users(["renew-valid", "renew-missing"], expiry)
+
+        self.write_mock.assert_not_called()
+        self.assertEqual(self.config_path.read_bytes(), before_config)
+        self.assertEqual(self.registry_path.read_bytes(), before_registry)
 
     def test_explicit_credential_edit_updates_inbound_outbound_links_and_enforcement(self):
         created = manager.create_user(
@@ -1275,7 +1310,8 @@ class ApiTestCase(unittest.TestCase):
         )
         self.config_patch = patch.object(manager, "CONFIG_PATH", self.config_path)
         self.registry_patch = patch.object(manager, "REGISTRY_PATH", self.registry_path)
-        self.write_patch = patch.object(manager, "_write_and_reload", self._write_config)
+        self.write_mock = MagicMock(side_effect=self._write_config)
+        self.write_patch = patch.object(manager, "_write_and_reload", self.write_mock)
         self.idempotency_patch = patch.object(
             idempotency, "STORE_PATH", self.idempotency_path
         )
@@ -2895,14 +2931,19 @@ class TrafficTestCase(unittest.TestCase):
 class SingboxWriteReloadTest(unittest.TestCase):
     def setUp(self):
         self.temp_dir = tempfile.TemporaryDirectory()
-        self.config_path = Path(self.temp_dir.name) / "sing-box.json"
+        root = Path(self.temp_dir.name)
+        self.config_path = root / "sing-box.json"
+        self.registry_path = root / "users.json"
         self.config_path.write_text(
             json.dumps(base_singbox_config(), indent=2) + "\n", encoding="utf-8"
         )
         self.path_patch = patch.object(manager, "CONFIG_PATH", self.config_path)
+        self.registry_patch = patch.object(manager, "REGISTRY_PATH", self.registry_path)
         self.path_patch.start()
+        self.registry_patch.start()
 
     def tearDown(self):
+        self.registry_patch.stop()
         self.path_patch.stop()
         self.temp_dir.cleanup()
 
@@ -2921,6 +2962,35 @@ class SingboxWriteReloadTest(unittest.TestCase):
         )
 
 
+    def test_failed_reload_restores_registry_and_config_without_restart(self):
+        def write_config(updated):
+            self.config_path.write_text(json.dumps(updated, indent=2) + "\n", encoding="utf-8")
+
+        with patch.object(manager, "_write_and_reload", side_effect=write_config):
+            manager.create_user("rollback-a", ["socks"])
+            manager.create_user("rollback-b", ["socks"])
+        now = datetime.now(timezone.utc)
+        registry = manager.read_registry()
+        for user_id in ("rollback-a", "rollback-b"):
+            registry["users"][user_id]["expiresAt"] = (now - timedelta(hours=1)).isoformat()
+        manager._write_registry(registry)
+        success = subprocess.CompletedProcess([], 0, "active", "")
+        with patch.object(manager.singbox_api, "get_connections", return_value={"connections": []}), \
+             patch.object(manager, "check_config", return_value=(True, "")), \
+             patch.object(manager, "_run", return_value=success):
+            manager.process_user_expirations(now)
+        before = self.config_path.read_bytes(), self.registry_path.read_bytes()
+        failed = subprocess.CompletedProcess([], 1, "", "reload unsupported")
+        expiry = now + timedelta(days=60)
+
+        with patch.object(manager, "check_config", return_value=(True, "")), \
+             patch.object(manager, "_run", return_value=failed) as run:
+            with self.assertRaisesRegex(manager.SingboxConfigError, "previous config was restored"):
+                manager.renew_users(["rollback-a", "rollback-b"], expiry)
+
+        self.assertEqual(before, (self.config_path.read_bytes(), self.registry_path.read_bytes()))
+        self.assertEqual([call.args[0] for call in run.call_args_list],
+                         [["systemctl", "reload", "sing-box"]] * 2)
 class MonitoringConfigTest(unittest.TestCase):
     def test_relay_source_cidrs_are_validated_without_network_changes(self):
         with tempfile.TemporaryDirectory() as temp_dir:

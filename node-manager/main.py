@@ -24,6 +24,7 @@ from models.request import (
     AgentHeartbeatResponse,
     AgentInfoResponse,
     BatchDeleteUsersRequest,
+    BatchRenewUsersRequest,
     BatchDeleteUsersResponse,
     BindMultipleProxiesRequest,
     BindProxyRequest,
@@ -112,6 +113,7 @@ from singbox.manager import (
     migrate_user_expirations,
     process_user_expirations,
     renew_user,
+    renew_users,
     restore_user,
     start_expiration_scheduler,
     stop_expiration_scheduler,
@@ -836,6 +838,25 @@ def apply_default_traffic_limit_endpoint(
     _token: str = Depends(verify_token),
 ):
     return apply_default_traffic_limit(request.trafficLimitBytes)
+
+
+@app.post("/api/users/renew", tags=["users"])
+def renew_users_endpoint(
+    request: BatchRenewUsersRequest,
+    _token: str = Depends(verify_token),
+):
+    result = renew_users(
+        request.userIds,
+        expires_at=request.expiresAt,
+        traffic_limit_bytes=request.trafficLimitBytes,
+        max_source_ips=request.maxSourceIps,
+    )
+    if request.resetTraffic:
+        for item in result["items"]:
+            if not item.get("expirationPrecisionOnly", False):
+                traffic = reset_user_traffic(item["userId"], renewal_key=item["expiresAt"])
+                item.update(traffic)
+    return result
 
 
 @app.post("/api/user/{userId}/renew", tags=["users"])

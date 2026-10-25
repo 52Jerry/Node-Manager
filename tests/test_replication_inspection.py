@@ -67,15 +67,20 @@ class ReplicationInspectionTest(unittest.TestCase):
         row = next(row for row in result["users"] if row["userId"] == "primary-7")
         self.assertIn("MULTI_PROXY_UNSUPPORTED", row["serializationIssues"])
 
-    def test_reload_only_context_never_falls_back_to_restart_and_restores_context(self):
+    def test_reload_is_hot_only_by_default_and_restart_requires_explicit_emergency_opt_in(self):
         failed = subprocess.CompletedProcess([], 1, "", "not supported")
+        reload_command = ["systemctl", "reload", "sing-box"]
+        restart_command = ["systemctl", "restart", "sing-box"]
         with patch.object(manager, "_run", return_value=failed) as run:
-            with manager.without_restart():
-                self.assertFalse(manager.reload_singbox())
-            self.assertEqual([call.args[0] for call in run.call_args_list], [["systemctl", "reload", "sing-box"]])
+            self.assertFalse(manager.reload_singbox())
+            self.assertEqual([call.args[0] for call in run.call_args_list], [reload_command])
             run.reset_mock()
-            manager.reload_singbox()
-            self.assertEqual(len(run.call_args_list), 2)
+            self.assertFalse(manager.reload_singbox(restart_if_reload_fails=True))
+            self.assertEqual([call.args[0] for call in run.call_args_list], [reload_command, restart_command])
+            run.reset_mock()
+            with manager.without_restart():
+                self.assertFalse(manager.reload_singbox(restart_if_reload_fails=True))
+            self.assertEqual([call.args[0] for call in run.call_args_list], [reload_command])
 
     def test_replication_applies_with_restart_forbidden(self):
         self.create()

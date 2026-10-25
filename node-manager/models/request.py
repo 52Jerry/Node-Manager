@@ -186,6 +186,20 @@ class RenewUserRequest(BaseModel):
         return value
 
 
+class BatchRenewUsersRequest(RenewUserRequest):
+    userIds: list[str] = Field(min_length=1, max_length=1000)
+
+    @field_validator("userIds")
+    @classmethod
+    def user_ids_must_be_unique_and_safe(cls, value: list[str]) -> list[str]:
+        if len(set(value)) != len(value):
+            raise ValueError("userIds must be unique")
+        for user_id in value:
+            if not re.fullmatch(r"[A-Za-z0-9._-]{1,64}", user_id or ""):
+                raise ValueError("invalid userId")
+        return value
+
+
 class BindProxyRequest(BaseModel):
     userId: str = Field(min_length=1, max_length=64, pattern=r"^[A-Za-z0-9._-]+$")
     proxy: ProxyDescriptor
