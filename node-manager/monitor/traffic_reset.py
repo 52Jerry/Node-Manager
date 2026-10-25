@@ -1,13 +1,20 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import re
 
 from monitor import traffic
+from monitor.shared_quota import clear_for_reset
 from singbox.manager import SingboxConfigError, get_user_policies
 
 
 def reset_traffic(user_id: str, cycle_start: datetime | None = None) -> dict:
     """Reset usage only, without changing expiry, credentials, policy or sampling baselines."""
+    if not re.fullmatch(r"[A-Za-z0-9._-]{1,64}", user_id):
+        raise SingboxConfigError("invalid userId")
+    if cycle_start is not None and (cycle_start.tzinfo is None
+            or cycle_start.utcoffset() is None or cycle_start > datetime.now(timezone.utc)):
+        raise SingboxConfigError("cycleStart must be timezone-aware and not in the future")
     if user_id not in get_user_policies():
         raise SingboxConfigError("user not found")
     cycle_key = int(cycle_start.timestamp() * 1000) if cycle_start else None
@@ -19,6 +26,7 @@ def reset_traffic(user_id: str, cycle_start: datetime | None = None) -> dict:
                 return {"success": True, "userId": user_id, "trafficReset": False}
             # Do not acknowledge/reset counters if removing the quota block fails.
             traffic.sync_user_enforcements({user_id: {"trafficBlocked": False, "blockedSourceIps": []}})
+            clear_for_reset(user)
             user.update(upload=0, download=0, activeSourceIps=[], blockedSourceIps=[],
                         sourceIpLastSeen={}, status="active", updatedAt=datetime.now(timezone.utc).isoformat())
             if cycle_key is not None:

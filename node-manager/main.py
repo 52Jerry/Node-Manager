@@ -145,6 +145,9 @@ app.include_router(wireguard_renewal_reopen_router)
 from user_cleanup import router as user_cleanup_router, reject_unguarded_expired_deletion
 app.include_router(user_cleanup_router)
 
+from shared_quota_routes import router as shared_quota_router
+app.include_router(shared_quota_router)
+
 static_dir = os.path.join(os.path.dirname(__file__), "static")
 app.mount("/static", StaticFiles(directory=static_dir), name="static")
 

@@ -19,6 +19,7 @@ from singbox.manager import (
     sync_user_enforcements,
 )
 from config import config
+from monitor.shared_quota import peer_used_bytes, clear_for_reset
 from monitor.source_identity import normalize_ip, source_ip_diagnostics
 from monitor.telemetry import connection_summary, sample_state
 
@@ -194,7 +195,7 @@ def _enforce_policies(
             if reliable_source_policy else "suspended_unreliable_source_review_required"
         )
 
-        if traffic_limit and int(user.get("upload") or 0) + int(user.get("download") or 0) >= traffic_limit:
+        if traffic_limit and int(user.get("upload") or 0) + int(user.get("download") or 0) + peer_used_bytes(user, traffic_limit) >= traffic_limit:
             user["status"] = "traffic_limited"
             user["activeSourceIps"] = []
             user["blockedSourceIps"] = []
@@ -429,7 +430,7 @@ def get_user_traffic(
     max_source_ips = policy.get("maxSourceIps", user.get("maxSourceIps"))
     max_connections = policy.get("maxConnections", user.get("maxConnections"))
     status = user.get("status", "active")
-    if traffic_limit and upload + download >= int(traffic_limit):
+    if traffic_limit and upload + download + peer_used_bytes(user, traffic_limit) >= int(traffic_limit):
         status = "traffic_limited"
     elif status == "traffic_limited":
         status = "active"
@@ -537,6 +538,9 @@ def reset_user_traffic(user_id: str, renewal_key: str | None = None) -> dict[str
             user = store["users"].setdefault(user_id, {})
             if renewal_key is not None and user.get("lastRenewalResetKey") == renewal_key:
                 return {"success": True, "userId": user_id, "trafficReset": False}
+            clear_for_reset(user)
+            if renewal_key is None:
+                user["lastManualTrafficResetAt"] = int(datetime.now(timezone.utc).timestamp() * 1000000)
             user.update(
                 {
                     "upload": 0,
