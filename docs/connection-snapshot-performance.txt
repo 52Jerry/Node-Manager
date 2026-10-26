@@ -1,0 +1,30 @@
+Connection-detail lookup performance
+
+Connection detail requests formerly re-read the complete sing-box configuration
+and registry and scanned each inbound's users for every user lookup. Large
+installations repeatedly paid JSON decoding and O(user count) lookup costs.
+
+singbox.connection_snapshot keeps one read-only version of these two files for
+get_user_connection only. The version includes file path, device, inode, size,
+mtime_ns and ctime_ns. The existing configuration lock protects snapshot
+construction; publication happens only after both loaders succeed. Changed
+unreadable/invalid files fail the request rather than returning old credentials.
+
+Inbound names, SOCKS usernames and outbound tags are indexed once per version.
+Legacy alias collisions preserve the original first-inbound-user behavior.
+Mutation paths still obtain fresh dictionaries. Expiration/access checks and
+public protocol construction run for every request; complete endpoint responses
+are not cached. Deploy only this module and its manager.py call-site changes
+when the live release has other independent changes.
+
+Validation on 2026-10-27:
+- 10000 synthetic identity lookups decode each file once.
+- Atomic replacement invalidates the snapshot, including same-length data.
+- Invalid changed files fail closed; alias order and SOCKS lookup are covered.
+- Existing access/protocol tests: 28 passed.
+- Live-source before/after test: identical 20-response SHA256; 3.65s -> 0.26s.
+- Released the control API only; the sing-box process remained unchanged.
+
+These measurements do not certify 10000 authenticated users or WAN throughput.
+Capacity planning must also budget per-user connections, source ports, kernel
+socket memory, quota aggregation and node-level failover.

@@ -35,6 +35,7 @@ from protocols import (
     trojan,
 )
 from .api import SingboxAPI
+from .connection_snapshot import ConnectionSnapshotCache
 
 try:
     import fcntl
@@ -75,6 +76,7 @@ EXPIRATION_ENABLED = os.environ.get("NODE_MANAGER_EXPIRATION_ENABLED", "true").l
 expiration_stop = threading.Event()
 expiration_thread: threading.Thread | None = None
 singbox_api = SingboxAPI()
+_connection_snapshot_cache = ConnectionSnapshotCache()
 thread_lock = threading.Lock()
 
 
@@ -2852,8 +2854,8 @@ def list_users() -> list[dict[str, Any]]:
 
 def get_user_connection(user_id: str) -> dict[str, Any]:
     with _config_lock():
-        data = read_config()
-        registry = read_registry()
+        snapshot = _connection_snapshot_cache.get(CONFIG_PATH, REGISTRY_PATH, read_config, read_registry)
+        data, registry = snapshot.data, snapshot.registry
 
     metadata = _registry_user(registry, user_id)
     expiration_status = _expiration_status(metadata)
@@ -2890,28 +2892,14 @@ def get_user_connection(user_id: str) -> dict[str, Any]:
         tag = inbound.get("tag")
         if tag == config.singbox.vless_tag:
             vless_inbound = inbound
-            user = next(
-                (
-                    item
-                    for item in inbound.get("users", [])
-                    if item.get("name") in _legacy_auth_names(user_id)
-                ),
-                None,
-            )
+            user = snapshot.find(inbound, _legacy_auth_names(user_id))
             if user:
                 user_uuid = str(user.get("uuid") or "")
                 protocols.append("vless")
                 response["vless"] = _vless_connection(user_id, user_uuid, inbound)
         elif tag == config.singbox.vmess_tag:
             vmess_inbound = inbound
-            user = next(
-                (
-                    item
-                    for item in inbound.get("users", [])
-                    if item.get("name") in _legacy_auth_names(user_id)
-                ),
-                None,
-            )
+            user = snapshot.find(inbound, _legacy_auth_names(user_id))
             if user:
                 vmess_uuid = str(user.get("uuid") or "")
                 user_uuid = user_uuid or vmess_uuid
@@ -2919,14 +2907,7 @@ def get_user_connection(user_id: str) -> dict[str, Any]:
                 response["vmess"] = _vmess_connection(user_id, vmess_uuid, inbound)
         elif tag == config.singbox.trojan_tag:
             trojan_inbound = inbound
-            user = next(
-                (
-                    item
-                    for item in inbound.get("users", [])
-                    if item.get("name") in _legacy_auth_names(user_id)
-                ),
-                None,
-            )
+            user = snapshot.find(inbound, _legacy_auth_names(user_id))
             if user:
                 # Trojan 用 password 认证；回退到 user_uuid 保持单凭据体验
                 trojan_password = str(user.get("password") or user_uuid or "")
@@ -2934,14 +2915,7 @@ def get_user_connection(user_id: str) -> dict[str, Any]:
                 response["trojan"] = _trojan_connection(user_id, trojan_password, inbound)
         elif tag == config.singbox.socks_tag and socks_username:
             socks_inbound = inbound
-            user = next(
-                (
-                    item
-                    for item in inbound.get("users", [])
-                    if item.get("username") in _user_auth_names(registry, user_id)
-                ),
-                None,
-            )
+            user = snapshot.find(inbound, _user_auth_names(registry, user_id), "username")
             if user:
                 protocols.append("socks")
                 response["socks"] = _socks_connection(
@@ -2953,14 +2927,7 @@ def get_user_connection(user_id: str) -> dict[str, Any]:
     if not protocols:
         raise SingboxConfigError(f"user not found: {user_id}")
 
-    outbound = next(
-        (
-            item
-            for item in data.get("outbounds", [])
-            if item.get("tag") == f"{USER_OUTBOUND_PREFIX}{user_id}"
-        ),
-        None,
-    )
+    outbound = snapshot.outbounds.get(f"{USER_OUTBOUND_PREFIX}{user_id}")
     response["uuid"] = user_uuid or ""
     response["proxyBound"] = bool(outbound and outbound.get("type") == "socks")
     proxy = None
