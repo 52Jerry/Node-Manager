@@ -1,6 +1,7 @@
 import json
 import shutil
 import sqlite3
+import threading
 import tempfile
 import unittest
 from concurrent.futures import ThreadPoolExecutor
@@ -119,6 +120,25 @@ class CollectionFailureTest(unittest.TestCase):
         self.assertEqual(totals["nodeCumulativeCounters"], {"upload": 23, "download": 45})
         self.assertEqual(traffic.get_user_traffic("fake", refresh=False)["total"], 0)
         self.assertIsNone(traffic.singbox_api.cumulative_counters({"uploadTotal": True, "downloadTotal": 0}))
+
+    def test_cached_heartbeat_totals_do_not_wait_for_collector_lock(self):
+        self.path.write_text(json.dumps({"version": 1, "users": {"fake": {"upload": 2,
+            "download": 3}}, "connections": {},
+            "collectedAt": datetime.now(timezone.utc).isoformat()}), encoding="utf-8")
+        done = threading.Event()
+        result = {}
+        def read_totals():
+            result.update(traffic.get_traffic_totals(refresh=False))
+            done.set()
+        traffic.traffic_lock.acquire()
+        try:
+            reader = threading.Thread(target=read_totals, daemon=True)
+            reader.start()
+            self.assertTrue(done.wait(0.5), "cached heartbeat blocked behind collector")
+        finally:
+            traffic.traffic_lock.release()
+        reader.join(timeout=1)
+        self.assertEqual(result["total"], 5)
 
     def test_duplicate_invalid_and_reset_snapshots_never_enforce(self):
         connection = {"id": "fake", "chains": ["node-manager-out:fake"], "upload": 9, "download": 3}

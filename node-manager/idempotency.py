@@ -7,6 +7,7 @@ import tempfile
 import threading
 import time
 import base64
+from contextvars import ContextVar
 from pathlib import Path
 from typing import Any, Callable
 
@@ -22,6 +23,8 @@ RETENTION_SECONDS = 24 * 60 * 60
 MAX_ENTRIES = 1000
 store_lock = threading.Lock()
 _request_locks = [threading.Lock() for _ in range(64)]
+execution_identity = ContextVar("node_idempotent_execution", default=None)
+execution_ordinal = ContextVar("node_idempotent_mutation_ordinal", default=0)
 
 
 def _request_lock(key: str) -> threading.Lock:
@@ -144,7 +147,20 @@ def execute_idempotent(
                     "the stored idempotent response cannot be decrypted; use a new key"
                 )
 
+        # Different keys must not hold the receipt-store lock while waiting
+        # for the single node writer. Re-read before merging the new receipt.
+        identity = execution_identity.set({"key": key, "operation": operation, "fingerprint": fingerprint})
+        ordinal = execution_ordinal.set(0)
+        try:
             result = callback()
+        finally:
+            execution_identity.reset(identity)
+            execution_ordinal.reset(ordinal)
+        with store_lock:
+            store = _read_store()
+            entries = store["entries"]
+            now = time.time()
+            _prune(entries, now)
             entries[key] = {
                 "fingerprint": fingerprint,
                 "createdAt": now,
@@ -152,6 +168,7 @@ def execute_idempotent(
             }
             _write_store(store)
             return result, False
+
 
 
 def execute_reconciling_idempotent(

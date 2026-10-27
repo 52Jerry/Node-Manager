@@ -2114,6 +2114,8 @@ class ApiTestCase(unittest.TestCase):
             ),
             patch.object(main, "_singbox_version", return_value="1.13.14"),
             patch.object(main, "is_api_available", return_value=True),
+            patch.object(main, "read_registry", return_value={"users": {"a": {}, "b": {}}}),
+            patch.object(main, "list_users", side_effect=AssertionError("heartbeat must not mutate users")),
             patch.object(
                 main,
                 "get_traffic_totals",
@@ -2131,6 +2133,7 @@ class ApiTestCase(unittest.TestCase):
         self.assertEqual(heartbeat.status_code, 200, heartbeat.text)
         self.assertEqual(heartbeat.json()["status"], "online")
         self.assertEqual(heartbeat.json()["connections"], 3)
+        self.assertEqual(heartbeat.json()["userCount"], 2)
         self.assertEqual(heartbeat.json()["systemConnections"], 8)
         self.assertEqual(heartbeat.json()["socksPort"], 5001)
         self.assertEqual(heartbeat.json()["traffic"]["total"], 30)
@@ -2172,6 +2175,15 @@ class StatusTestCase(unittest.TestCase):
             "get_connections",
             return_value={"connections": [{"id": "a"}, {"id": "b"}]},
         ):
+            self.assertEqual(status_monitor.get_proxy_connections(), 2)
+
+    def test_proxy_connections_use_collector_snapshot_for_heartbeat(self):
+        with (patch.object(
+            traffic, "_read_store",
+            return_value={"collectedAt": "2026-10-27T09:00:00Z", "connections": {
+                "a": {"online": True}, "b": {"online": False}, "c": {"online": True}}},
+        ), patch.object(status_monitor.singbox_api, "get_connections",
+                        side_effect=AssertionError("live merge must not run"))):
             self.assertEqual(status_monitor.get_proxy_connections(), 2)
 
 

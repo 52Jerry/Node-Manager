@@ -36,6 +36,7 @@ from protocols import (
 )
 from .api import SingboxAPI
 from .connection_snapshot import ConnectionSnapshotCache
+from .errors import SingboxConfigError
 
 try:
     import fcntl
@@ -45,6 +46,28 @@ except ImportError:  # Windows development fallback; production deployment uses 
 
 logger = logging.getLogger(__name__)
 _restart_allowed = ContextVar("singbox_restart_allowed", default=True)
+_config_lock_depth = ContextVar("singbox_config_lock_depth", default=0)
+_mutation_workspace = ContextVar("singbox_mutation_workspace", default=None)
+_mutation_baseline = ContextVar("singbox_mutation_baseline", default=None)
+_mutation_registry_baseline = ContextVar("singbox_registry_baseline",default=None)
+_mutation_capture = ContextVar("singbox_mutation_capture", default=False)
+
+
+class CapturedMutation(Exception):
+    def __init__(self, callback):
+        self.callback = callback
+
+
+def capture_mutation(call):
+    """Compile an existing operation before any publication/post-commit work."""
+    token = _mutation_capture.set(True)
+    try:
+        call()
+    except CapturedMutation as captured:
+        return captured.callback
+    finally:
+        _mutation_capture.reset(token)
+    raise SingboxConfigError("operation has no supported configuration mutation")
 
 
 @contextmanager
@@ -95,12 +118,8 @@ def _audit(action: str, user_id: str, **fields: Any) -> None:
     logger.info("audit %s modules=%s", action, json.dumps(safe, ensure_ascii=False))
 
 
-class SingboxConfigError(RuntimeError):
-    pass
-
-
-def _run(command: list[str]) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(command, capture_output=True, text=True, timeout=30)
+def _run(command: list[str], *, timeout: int = 30) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(command, capture_output=True, text=True, timeout=timeout)
 
 
 def read_config() -> dict[str, Any]:
@@ -397,7 +416,7 @@ def _positive_policy_value(value: Any) -> int | None:
 
 def check_config(config_path: str | Path) -> tuple[bool, str]:
     try:
-        result = _run(["sing-box", "check", "-c", str(config_path)])
+        result = _run([getattr(config.singbox, "binary", "sing-box"), "check", "-c", str(config_path)])
     except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
         return False, str(exc)
     return result.returncode == 0, (result.stderr or result.stdout).strip()
@@ -419,6 +438,30 @@ def reload_singbox(restart_if_reload_fails: bool = False) -> bool:
     restart fallback; ordinary user, route, credential and rollback writes must
     never restart the shared proxy.
     """
+    from .runtime_client import enabled as runtime_enabled
+    if runtime_enabled():
+        import runtime_publication
+        try:
+            runtime_publication.apply_disk()
+            return True
+        except SingboxConfigError:
+            logger.warning("runtime publication failed; no reload or restart fallback")
+            return False
+    # Optional VLESS publisher owns its separate process generations. The
+    # original instance still serves the legacy non-VLESS protocols.
+    publication_path = os.environ.get("NODE_MANAGER_VLESS_PUBLICATION_SPEC")
+    if publication_path:
+        try:
+            import sys
+            import vless_publication
+            if vless_publication.configured_spec() is not None:
+                result = _run([sys.executable, str(Path(vless_publication.__file__)),
+                               "--spec", publication_path, "apply"], timeout=180)
+                receipt = json.loads(result.stdout) if result.returncode == 0 else {}
+                return result.returncode == 0 and receipt.get("ok") is True
+        except (OSError, ValueError, RuntimeError, subprocess.TimeoutExpired):
+            logger.warning("VLESS publication failed; preserving existing generations")
+            return False
     commands = [["systemctl", "reload", "sing-box"]]
     if restart_if_reload_fails and _restart_allowed.get():
         commands.append(["systemctl", "restart", "sing-box"])
@@ -450,18 +493,32 @@ def get_socks_inbound_port() -> int | None:
 
 @contextmanager
 def _config_lock():
-    if fcntl is None:
-        with thread_lock:
+    depth = _config_lock_depth.get()
+    token = _config_lock_depth.set(depth + 1)
+    try:
+        if depth:
             yield
-        return
-
-    LOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
-    with LOCK_PATH.open("w", encoding="ascii") as handle:
-        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
-        yield
+        elif fcntl is None:
+            with thread_lock:
+                yield
+        else:
+            LOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
+            with LOCK_PATH.open("w", encoding="ascii") as handle:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+                yield
+    finally:
+        _config_lock_depth.reset(token)
 
 
 def _write_and_reload(updated: dict[str, Any]) -> None:
+    from .runtime_client import enabled as runtime_enabled
+    if runtime_enabled():
+        import runtime_publication
+        runtime_publication.commit(updated, read_registry(), read_config())
+        return
+    import runtime_write_queue
+    if runtime_write_queue.current() is not None:
+        raise SingboxConfigError("active native writer refuses reload/restart fallback")
     original = CONFIG_PATH.read_bytes()
     original_stat = CONFIG_PATH.stat()
     try:
@@ -524,15 +581,72 @@ def _restore_registry(original: bytes | None) -> None:
 
 
 def mutate_config(mutator: Callable[[dict[str, Any], dict[str, Any]], Any]) -> Any:
+    if _mutation_capture.get():
+        raise CapturedMutation(mutator)
+    workspace = _mutation_workspace.get()
+    if workspace is not None:
+        return mutator(*workspace)
+    import runtime_write_queue
+    writer = runtime_write_queue.current()
+    if writer is not None and not _config_lock_depth.get():
+        import runtime_publication
+        from idempotency import execution_identity, execution_ordinal
+        identity = execution_identity.get()
+        ordinal = execution_ordinal.get()
+        execution_ordinal.set(ordinal + 1)
+        captured = dict(zip(mutator.__code__.co_freevars, (cell.cell_contents for cell in (mutator.__closure__ or ()))))
+        user_id = captured.get("user_id")
+        keys = {user_id} if isinstance(user_id, str) else set()
+        def versioned(data, registry):
+            result = mutator(data, registry)
+            for user in keys:
+                versions = registry.setdefault("runtimeUserVersions", {})
+                from runtime_history import user_version
+                versions[user] = user_version(user,registry) + 1
+            return result
+        task_id, _ = writer.submit(versioned, key=f"legacy:{identity['key']}:{ordinal}" if identity else None,
+                                   payload={"request": identity, "mutation": mutator.__qualname__, "scope": sorted(keys)},
+                                   size=runtime_write_queue.submission_size.get(), keys=keys,
+                                   isolated=not keys or runtime_publication.related_targets.get() is not None)
+        return writer.wait(task_id)
+    return _mutate_config_direct(mutator)
+
+
+def _mutate_config_direct(mutator: Callable[[dict[str, Any], dict[str, Any]], Any]) -> Any:
     with _config_lock():
+        import runtime_write_queue
+        from .runtime_client import enabled as runtime_enabled
+        if runtime_write_queue.current() is not None and not runtime_enabled():
+            raise SingboxConfigError("active native writer refuses publication mode changes")
+        from revision_transaction import assert_no_pending_transaction
+        assert_no_pending_transaction()
         current = read_config()
         registry = read_registry()
         updated = copy.deepcopy(current)
         updated_registry = copy.deepcopy(registry)
-        result = mutator(updated, updated_registry)
+        baseline_token = _mutation_baseline.set(current)
+        registry_token = _mutation_registry_baseline.set(registry)
+        try:
+            result = mutator(updated, updated_registry)
+        finally:
+            _mutation_baseline.reset(baseline_token)
+            _mutation_registry_baseline.reset(registry_token)
         config_changed = current != updated
         registry_changed = registry != updated_registry
+        from .runtime_client import enabled as runtime_enabled
         if not config_changed and not registry_changed:
+            if runtime_enabled():
+                import runtime_publication
+                if runtime_publication.related_targets.get():
+                    runtime_publication.commit(updated, updated_registry, current)
+            return result
+        if runtime_enabled():
+            import runtime_publication
+            # Keep empty SOCKS tables authenticated after the next process boot.
+            for inbound in updated.get("inbounds", []):
+                if inbound.get("type") == "socks" and inbound.get("tag") == config.singbox.socks_tag:
+                    inbound["require_auth"] = True
+            runtime_publication.commit(updated, updated_registry, current)
             return result
         original_registry = REGISTRY_PATH.read_bytes() if REGISTRY_PATH.exists() else None
         if registry_changed:
@@ -1076,6 +1190,7 @@ def create_user(
     traffic_limit_bytes: int | None = None,
     max_source_ips: int | None = None,
     expires_at: datetime | None = None,
+    require_readiness: bool = False,
 ) -> dict[str, Any]:
     # B1: 优先使用 Control Plane 指定的 UUID，确保多节点共享同一凭据。
     # 传入时严格校验格式，未传时回退到随机生成（保持向后兼容）。
@@ -1100,6 +1215,12 @@ def create_user(
         raise SingboxConfigError("expiresAt must be in the future")
 
     def apply(data: dict[str, Any], registry: dict[str, Any]) -> dict[str, Any]:
+        if require_readiness:
+            from provisioning_readiness import assert_user_provisioning_allowed
+            # A coalesced batch may already contain earlier users in its work
+            # copy. Compare disk against the locked transaction baseline.
+            baseline = _mutation_baseline.get()
+            assert_user_provisioning_allowed(baseline if baseline is not None else data, protocols)
         if proxy is not None:
             _assert_proxy_available(data, "", proxy)
         if _user_exists(data, registry, user_id):
@@ -2650,6 +2771,8 @@ def bind_multiple_proxies(
 def update_proxy_metadata(user_id: str, metadata: dict[str, Any]) -> dict[str, Any]:
     """Update persisted residential metadata without changing the active route."""
     with _config_lock():
+        from revision_transaction import assert_no_pending_transaction
+        assert_no_pending_transaction()
         data = read_config()
         registry = read_registry()
         if not _user_exists(data, registry, user_id):
@@ -2852,7 +2975,7 @@ def list_users() -> list[dict[str, Any]]:
     return sorted(result, key=lambda item: item["userId"].lower())
 
 
-def get_user_connection(user_id: str) -> dict[str, Any]:
+def get_user_connection(user_id: str, inspect_suspended: bool = False) -> dict[str, Any]:
     with _config_lock():
         snapshot = _connection_snapshot_cache.get(CONFIG_PATH, REGISTRY_PATH, read_config, read_registry)
         data, registry = snapshot.data, snapshot.registry
@@ -2861,7 +2984,7 @@ def get_user_connection(user_id: str) -> dict[str, Any]:
     expiration_status = _expiration_status(metadata)
     if expiration_status == "EXPIRED":
         raise SingboxConfigError(f"user connection expired: {user_id}")
-    if metadata.get("accessEnabled") is False:
+    if metadata.get("accessEnabled") is False and not inspect_suspended:
         raise SingboxConfigError(f"user access suspended: {user_id}")
     auth_name = _auth_name(user_id)
     socks_username = _public_socks_username(registry, user_id)

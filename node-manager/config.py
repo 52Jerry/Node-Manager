@@ -93,6 +93,8 @@ class SecurityConfig:
 
 @dataclass
 class SingboxConfig:
+    runtime_socket: str = ""
+    binary: str = "sing-box"
     config: str = "/etc/sing-box/config.json"
     api_port: int = 9090
     api_secret: str = ""
@@ -268,7 +270,7 @@ def load_config() -> Config:
     )
 
     singbox = data.get("singbox", {})
-    for name in ("config", "api_secret", "vless_tag", "vmess_tag", "socks_tag", "trojan_tag"):
+    for name in ("config", "api_secret", "vless_tag", "vmess_tag", "socks_tag", "trojan_tag", "runtime_socket", "binary"):
         if name in singbox:
             setattr(result.singbox, name, str(singbox[name]))
     result.singbox.api_port = int(singbox.get("api_port", result.singbox.api_port))

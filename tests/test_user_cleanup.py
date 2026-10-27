@@ -66,6 +66,49 @@ class UserCleanupTests(unittest.TestCase):
         self.assertEqual(result["outcome"], "VALID"); self.assertIsNone(result["proof"])
         self.assertIn("expired", json.loads(self.registry.read_text())["users"])
 
+    def test_read_snapshot_does_not_wait_for_wireguard_mutation_lock(self):
+        with patch.object(cleanup, "_wireguard_state", side_effect=AssertionError("must not lock WG for reads")), \
+                patch.object(manager, "_config_lock", side_effect=AssertionError("must not wait for publication")), \
+                patch.object(cleanup, "_read_wireguard_peers", return_value={}):
+            snapshot = self.prepare()
+        self.assertEqual(snapshot["snapshot"]["userId"], "expired")
+
+    def test_wireguard_changes_during_snapshot_fail_closed_without_mutation(self):
+        before_config, before_registry = self.config.read_bytes(), self.registry.read_bytes()
+        with patch.object(cleanup, "_read_wireguard_peers", side_effect=[{}, {"unrelated": {"nodeUserId": "other"}}] * 3):
+            with self.assertRaises(cleanup.HTTPException) as raised:
+                self.prepare()
+        self.assertEqual(raised.exception.detail, "WIREGUARD_STATE_CHANGED_RECHECK_REQUIRED")
+        self.assertEqual(self.config.read_bytes(), before_config)
+        self.assertEqual(self.registry.read_bytes(), before_registry)
+
+    def test_configuration_replaced_during_snapshot_is_not_accepted(self):
+        with patch.object(cleanup, "_snapshot_version", side_effect=[(1,), (2,)] * 3):
+            with self.assertRaises(cleanup.HTTPException) as raised:
+                self.prepare()
+        self.assertEqual(raised.exception.detail, "CONFIGURATION_CHANGED_RECHECK_REQUIRED")
+        self.assertIn("expired", json.loads(self.registry.read_text())["users"])
+
+    def test_unchanged_snapshot_reuses_reads_but_returns_independent_owned_fields(self):
+        with patch.object(manager, "read_config", wraps=manager.read_config) as config_reads, \
+                patch.object(manager, "read_registry", wraps=manager.read_registry) as registry_reads:
+            first = self.prepare()
+            first["snapshot"]["outbounds"][0]["server"] = "198.51.100.99"
+            second = self.prepare()
+        self.assertEqual(config_reads.call_count, 1)
+        self.assertEqual(registry_reads.call_count, 1)
+        self.assertEqual(second["snapshot"]["outbounds"][0]["server"], "198.51.100.1")
+
+    def test_cached_snapshot_is_invalidated_by_atomic_renewal(self):
+        self.prepare()
+        data = json.loads(self.registry.read_text())
+        data["users"]["expired"]["expiresAt"] = (datetime.now(timezone.utc) + timedelta(days=30)).isoformat()
+        replacement = self.registry.with_suffix(".replacement.json")
+        replacement.write_text(json.dumps(data), encoding="utf-8")
+        replacement.replace(self.registry)
+        with self.assertRaises(cleanup.HTTPException):
+            self.prepare()
+
     def test_timeout_and_disagreeing_failures_are_not_deletable(self):
         snapshot = self.prepare()
         for observations in [[("UNKNOWN", "TIMEOUT")] * 2, [("INVALID", "PROXY_AUTH_REJECTED"), ("UNKNOWN", "TIMEOUT")]]:
@@ -156,6 +199,50 @@ class UserCleanupTests(unittest.TestCase):
         data["users"]["other"]["socksUsername"] = data["users"]["expired"]["socksUsername"]
         self.registry.write_text(json.dumps(data))
         with self.assertRaises(cleanup.HTTPException): cleanup.snapshot("expired")
+
+    def test_detach_batch_cap_matches_the_bounded_website_worker(self):
+        from pydantic import ValidationError
+        items = [cleanup.DetachItem(userId="user-" + str(i), fingerprint="a" * 64, archiveId=i + 1, proof="dummy-proof") for i in range(200)]
+        self.assertEqual(len(cleanup.DetachRequest(items=items).items), 200)
+        with self.assertRaises(ValidationError):
+            cleanup.DetachRequest(items=items + [items[0]])
+
+    def test_peer_validation_cache_tracks_atomic_registry_version_and_protects_renewed_peers(self):
+        import base64
+        import wireguard
+        from config import config
+        peer_path = self.registry.with_name("peers.json")
+        expiry = (datetime.now(timezone.utc) - timedelta(hours=25)).isoformat()
+        peer = {"peerId": "peer-expired", "nodeUserId": "expired", "publicKey": base64.b64encode(b"a" * 32).decode(),
+                "address": "10.7.0.2/32", "allowedIps": ["10.7.0.2/32"], "exitFingerprint": "existing-exit",
+                "expiresAt": expiry, "status": "EXPIRED"}
+        body = {"version": 1, "interface": config.wireguard.interface, "peers": {"peer-expired": peer}}
+        peer_path.write_text(json.dumps(body), encoding="utf-8")
+        with patch.object(config.wireguard, "enabled", True), patch.object(wireguard, "REGISTRY_PATH", peer_path), \
+                patch.object(wireguard, "_read", wraps=wireguard._read) as reads:
+            self.prepare(); self.prepare()
+            self.assertEqual(reads.call_count, 1)
+            body["peers"]["peer-expired"]["expiresAt"] = (datetime.now(timezone.utc) + timedelta(days=30)).isoformat()
+            replacement = peer_path.with_suffix(".new.json")
+            replacement.write_text(json.dumps(body), encoding="utf-8"); replacement.replace(peer_path)
+            with self.assertRaises(cleanup.HTTPException) as raised:
+                self.prepare()
+            self.assertEqual(raised.exception.detail, "WIREGUARD_EXPIRY_REQUIRES_REVIEW")
+            self.assertEqual(reads.call_count, 2)
+
+    def test_disabled_wireguard_is_not_read_reconciled_or_revoked_during_cleanup(self):
+        import wireguard
+        from config import config
+        with patch.object(config.wireguard, "enabled", False), \
+                patch.object(wireguard, "_read", side_effect=AssertionError("WG remains untouched")), \
+                patch.object(wireguard, "_locked", side_effect=AssertionError("WG remains untouched")), \
+                patch.object(wireguard, "_sync_routes", side_effect=AssertionError("WG remains untouched")), \
+                patch.object(wireguard, "_remove", side_effect=AssertionError("WG remains untouched")):
+            snapshot = self.prepare()
+            self.assertEqual(snapshot["snapshot"]["wireguardPeers"], [])
+            result = cleanup.detach([self.command(snapshot, self.invalid(snapshot))])
+        self.assertEqual(result["removed"], ["expired"])
+        self.assertIn("other", json.loads(self.registry.read_text())["users"])
 
 
 if __name__ == "__main__": unittest.main()

@@ -1,5 +1,7 @@
 # Python Node Manager
 
+本地维护入口：[文档导航](docs/README.md)。官网代码位于同级 `niusuip-project/`，工作区总览见 [NiuSu 导航](../README.md)。
+
 ![Python](https://img.shields.io/badge/python-3.11+-blue.svg)
 ![FastAPI](https://img.shields.io/badge/fastapi-0.100+-green.svg)
 ![License](https://img.shields.io/badge/license-MIT-yellow.svg)
@@ -346,6 +348,8 @@ Clash API 仅监听 `127.0.0.1`，用于连接和流量指标采集：
 ```
 
 ## 可视化界面
+
+使用定制 sing-box 时，可启用单进程用户更新，创建、删除和轮换 VLESS/VMess/SOCKS 用户时保留未变更用户的连接。启用条件、运行时事务恢复及累计流量口径见 [运行时接入说明](docs/singbox-runtime-integration.md)。该模式默认关闭，需要配套核心和私有 Unix socket。
 
 访问 `http://localhost:8088` 即可打开管理界面：
 

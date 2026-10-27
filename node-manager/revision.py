@@ -1,24 +1,24 @@
 """节点配置 revision 管理（B2/B3/B4）。
 
 职责：
-  B2: desired revision 拉取/应用接口 + HMAC-SHA256 签名校验 + 配置 SHA-256 哈希。
-  B3: sing-box check → 临时文件 → 原子 rename → reload → 失败回滚。
-  B4: 保留 last_known_good_revision；apply 失败或显式 rollback 时自动回滚并告警。
+  B2: desired revision 接口、HMAC-SHA256 签名与完整发布包 SHA-256 摘要。
+  B3/B4: revision_transaction 在统一配置锁内写入完整包、回读、reload，
+  以持久化 undo journal 支持失败回滚与启动恢复。无法证实恢复时保留日志并拒绝修改。
 
 存储布局（/var/lib/node-manager/revisions/）：
   state.json      - revision 元数据（当前/上次可用 ID、哈希、状态、时间戳）
-  current.json    - 当前生效配置快照（仅当通过本模块 apply 时存在）
-  last_good.json  - 上一个已知良好配置快照
+  current.json / last_good.json - 兼容旧工具的配置快照，不单独用于回滚
+  current.bundle.json / last_good.bundle.json - config + registry + nodeId + revisionId
+  transaction.json - 发布事务日志，包含敏感配置，禁止上传到日志或工单
   rejected/       - 校验或 reload 失败的配置归档（便于事后排查）
 
 签名约定：
-  Control Plane 对 config JSON 做 HMAC-SHA256(key=revision_secret, msg=canonical_json)，
-  将 hex digest 放入请求头 X-Revision-Signature，revision_id 放入 X-Revision-Id。
+  兼容原协议：对 {config, registry} 做 HMAC-SHA256，放入 X-Revision-Signature；
+  revisionId 放入 JSON 请求体。完整回执摘要还绑定本机 nodeId 和 revisionId。
   canonical_json = json.dumps(payload, sort_keys=True, separators=(',', ':'))。
 """
 from __future__ import annotations
 
-import copy
 import hashlib
 import hmac
 import json
@@ -50,6 +50,9 @@ CURRENT_PATH = REVISIONS_DIR / "current.json"
 LAST_GOOD_PATH = REVISIONS_DIR / "last_good.json"
 REJECTED_DIR = REVISIONS_DIR / "rejected"
 MAX_REJECTED = 10
+CURRENT_BUNDLE_PATH = REVISIONS_DIR / "current.bundle.json"
+LAST_GOOD_BUNDLE_PATH = REVISIONS_DIR / "last_good.bundle.json"
+JOURNAL_PATH = REVISIONS_DIR / "transaction.json"
 
 
 def _revision_secret() -> bytes:
@@ -312,250 +315,24 @@ def _archive_rejected(payload: dict[str, Any], reason: str) -> None:
         logger.warning("could not archive rejected revision: %s", exc)
 
 
-def get_revision_state() -> dict[str, Any]:
-    """B2: 返回当前节点 revision 状态，供 Control Plane 拉取。"""
-    state = _read_state()
-    state["nodeId"] = config.node.id
-    state["configPath"] = str(CONFIG_PATH)
-    state["singboxRunning"] = is_singbox_running()
-    return state
+def get_revision_state():
+    from revision_transaction import get_revision_state as implementation
+    return implementation()
 
 
-def apply_desired_revision(
-    desired_config: dict[str, Any],
-    desired_registry: dict[str, Any],
-    signature: str,
-    revision_id: str,
-    allow_user_deletion: bool = False,
-) -> dict[str, Any]:
-    """B2+B3+B4+B5: 应用 Control Plane 推送的期望配置。
-
-    流程：
-      1. 签名校验（HMAC-SHA256，签名覆盖 config+registry 组合载荷）
-      2. B2 预检：节点目标一致 / 监听端口不冲突 / registry 结构合法，
-         任一不过即归档 rejected/ 并以 409 失败返回（不写盘）
-      3. 配置 SHA-256 哈希记录
-      4. B5: 用户集合缩减保护——desired 不得意外删除现有用户，
-         除非显式声明 allow_user_deletion=True（对照删除审计）
-      5. 备份当前配置为 last_known_good
-      6. 临时文件写入 → sing-box check → 原子 rename → reload
-      7. 失败回滚到 last_known_good 并告警
-    """
-    if not revision_id:
-        raise SingboxConfigError("revision_id is required")
-
-    # B2: 签名校验。签名覆盖 config+registry 组合载荷，防止单独篡改。
-    combined_payload = {"config": desired_config, "registry": desired_registry}
-    if not verify_signature(combined_payload, signature):
-        _archive_rejected(combined_payload, "signature-mismatch")
-        raise SingboxConfigError("revision signature verification failed")
-
-    # B2: 节点目标校验（载荷显式声明目标节点时必须一致）
-    target_error = _find_node_target_mismatch(desired_config, desired_registry)
-    if target_error:
-        _archive_rejected(combined_payload, f"node-target-mismatch: {target_error}")
-        raise SingboxConfigError(f"revision node target mismatch: {target_error}")
-
-    # B2: 端口冲突预检（sing-box check 不覆盖此项，必须显式拦截）
-    port_conflicts = _find_port_conflicts(desired_config)
-    if port_conflicts:
-        _archive_rejected(combined_payload, "port-conflict: " + "; ".join(port_conflicts))
-        raise SingboxConfigError(
-            "revision config has port conflicts: " + "; ".join(port_conflicts)
-        )
-
-    # B2: desired registry 结构校验（防止非法 registry 落盘后污染节点）
-    registry_payload, registry_error = _validate_registry_payload(desired_registry)
-    if registry_error:
-        _archive_rejected(combined_payload, f"registry-invalid: {registry_error}")
-        raise SingboxConfigError(f"revision registry is invalid: {registry_error}")
-
-    config_hash = _sha256(_canonical_json(desired_config))
-
-    # B5: 用户集合缩减保护。对比当前生效配置与 desired 的用户集合，
-    # 若 desired 删除了现有用户且未显式声明，则拒绝应用以防误操作。
-    try:
-        current_config = read_config()
-        from singbox.manager import _discover_user_ids, read_registry, _config_lock
-        with _config_lock():
-            current_registry = read_registry()
-        current_users = _discover_user_ids(current_config, current_registry)
-        desired_users = _discover_user_ids(desired_config, registry_payload)
-        removed = current_users - desired_users
-        if removed and not allow_user_deletion:
-            _archive_rejected(
-                combined_payload,
-                f"user-shrink-blocked: removed={sorted(removed)}",
-            )
-            raise SingboxConfigError(
-                f"revision would remove {len(removed)} existing user(s): "
-                f"{sorted(removed)}; set allowUserDeletion=true to override"
-            )
-    except SingboxConfigError:
-        raise
-    except Exception as exc:
-        # B5 校验失败不应阻塞首次部署（无现有配置/registry 时跳过）
-        logger.warning("B5 user-shrink check skipped: %s", exc)
-
-    # 幂等：相同 revision + 哈希已生效则跳过
-    state = _read_state()
-    if (
-        state.get("currentRevisionId") == revision_id
-        and state.get("currentHash") == config_hash
-        and state.get("status") == "applied"
-    ):
-        return {"success": True, "revisionId": revision_id, "replayed": True, **state}
-
-    # B3: 原子发布。先读当前生效配置作为回滚源。
-    original_bytes = b""
-    original_stat = None
-    try:
-        original_bytes = CONFIG_PATH.read_bytes()
-        original_stat = CONFIG_PATH.stat()
-    except OSError:
-        # 无现有配置（首次部署），跳过回滚备份。
-        pass
-
-    CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
-    fd, temp_name = tempfile.mkstemp(prefix="revision.", suffix=".json", dir=CONFIG_PATH.parent)
-    temp_path = Path(temp_name)
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            json.dump(desired_config, handle, indent=2, ensure_ascii=False)
-            handle.write("\n")
-            handle.flush()
-            os.fsync(handle.fileno())
-
-        # B3: sing-box check 在写入生效路径之前执行
-        valid, error = check_config(temp_path)
-        if not valid:
-            _archive_rejected(combined_payload, f"check-failed: {error}")
-            raise SingboxConfigError(f"sing-box config validation failed: {error}")
-
-        if original_stat is not None:
-            os.chmod(temp_path, original_stat.st_mode)
-            if hasattr(os, "chown"):
-                try:
-                    os.chown(temp_path, original_stat.st_uid, original_stat.st_gid)
-                except OSError:
-                    pass
-        os.replace(temp_path, CONFIG_PATH)
-
-        # 同步 registry（与 config 原子性分离，失败时 config 已生效）
-        from singbox.manager import _write_registry, REGISTRY_PATH
-        original_registry_bytes = b""
-        if REGISTRY_PATH.exists():
-            original_registry_bytes = REGISTRY_PATH.read_bytes()
-        try:
-            _write_registry(registry_payload)
-        except Exception as exc:
-            logger.warning("could not persist desired registry: %s", exc)
-            if original_registry_bytes:
-                REGISTRY_PATH.write_bytes(original_registry_bytes)
-
-        if reload_singbox():
-            # B4: 成功则把上一个生效配置提升为 last_known_good
-            if original_bytes:
-                try:
-                    previous = json.loads(original_bytes.decode("utf-8"))
-                    _write_config_snapshot(LAST_GOOD_PATH, previous)
-                    state["lastGoodRevisionId"] = state.get("currentRevisionId")
-                    state["lastGoodHash"] = state.get("currentHash")
-                except (UnicodeDecodeError, json.JSONDecodeError):
-                    pass
-            _write_config_snapshot(CURRENT_PATH, desired_config)
-            state.update(
-                {
-                    "currentRevisionId": revision_id,
-                    "currentHash": config_hash,
-                    "status": "applied",
-                    "appliedAt": datetime.now(timezone.utc).isoformat(),
-                    "lastError": None,
-                }
-            )
-            _append_history(state, revision_id, config_hash, "applied", None)
-            _write_state(state)
-            logger.info("revision %s applied successfully", revision_id)
-            return {"success": True, "revisionId": revision_id, "replayed": False, **state}
-
-        # B4: reload 失败 → 回滚到 original + 告警
-        if original_bytes:
-            CONFIG_PATH.write_bytes(original_bytes)
-            if original_stat is not None:
-                os.chmod(CONFIG_PATH, original_stat.st_mode)
-            reload_singbox()
-        if original_registry_bytes:
-            REGISTRY_PATH.write_bytes(original_registry_bytes)
-        _archive_rejected(combined_payload, "reload-failed")
-        state.update(
-            {
-                "status": "rolled-back",
-                "lastError": "sing-box reload failed; previous config restored",
-                "appliedAt": datetime.now(timezone.utc).isoformat(),
-            }
-        )
-        _append_history(state, revision_id, config_hash, "reload-failed", "reload failed")
-        _write_state(state)
-        logger.error(
-            "revision %s reload failed; rolled back to previous config", revision_id
-        )
-        raise SingboxConfigError(
-            "sing-box reload failed after applying revision; the previous config was restored"
-        )
-    finally:
-        temp_path.unlink(missing_ok=True)
+def apply_desired_revision(desired_config, desired_registry, signature, revision_id, allow_user_deletion=False):
+    from revision_transaction import apply_desired_revision as implementation
+    return implementation(desired_config, desired_registry, signature, revision_id, allow_user_deletion)
 
 
-def rollback_to_last_known_good() -> dict[str, Any]:
-    """B4: 显式回滚到上一个已知良好配置。"""
-    state = _read_state()
-    if not LAST_GOOD_PATH.exists():
-        raise SingboxConfigError("no last_known_good revision available")
-    try:
-        last_good = json.loads(LAST_GOOD_PATH.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
-        raise SingboxConfigError(f"could not read last_known_good: {exc}") from exc
+def rollback_to_last_known_good():
+    from revision_transaction import rollback_to_last_known_good as implementation
+    return implementation()
 
-    original_bytes = CONFIG_PATH.read_bytes() if CONFIG_PATH.exists() else b""
-    original_stat = CONFIG_PATH.stat() if CONFIG_PATH.exists() else None
 
-    valid, error = check_config(LAST_GOOD_PATH)
-    if not valid:
-        raise SingboxConfigError(f"last_known_good config is invalid: {error}")
-
-    if original_stat is not None:
-        os.chmod(LAST_GOOD_PATH, original_stat.st_mode)
-        if hasattr(os, "chown"):
-            try:
-                os.chown(LAST_GOOD_PATH, original_stat.st_uid, original_stat.st_gid)
-            except OSError:
-                pass
-    os.replace(LAST_GOOD_PATH, CONFIG_PATH)
-    if not reload_singbox():
-        # 回滚也失败：尽量恢复原状
-        if original_bytes:
-            CONFIG_PATH.write_bytes(original_bytes)
-            reload_singbox()
-        raise SingboxConfigError("rollback reload failed; original config restored")
-
-    last_hash = _sha256(_canonical_json(last_good))
-    state.update(
-        {
-            "currentRevisionId": state.get("lastGoodRevisionId"),
-            "currentHash": last_hash,
-            "status": "rolled-back",
-            "appliedAt": datetime.now(timezone.utc).isoformat(),
-            "lastError": "manual rollback to last_known_good",
-        }
-    )
-    _append_history(state, state.get("currentRevisionId"), last_hash, "manual-rollback", None)
-    _write_state(state)
-    _write_config_snapshot(CURRENT_PATH, last_good)
-    logger.warning(
-        "rolled back to last_known_good revision %s",
-        state.get("currentRevisionId"),
-    )
-    return {"success": True, **state}
+def recover_pending_revision():
+    from revision_transaction import recover_pending_revision as implementation
+    return implementation()
 
 
 def _append_history(

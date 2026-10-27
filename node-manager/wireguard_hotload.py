@@ -32,6 +32,42 @@ MIN_DRAIN_SECONDS = 60
 _SYNC_LOCK = threading.RLock()
 
 
+def _drain_window():
+    # Lazy import keeps standalone/legacy loader integrations compatible.
+    global _orphan_udp_window
+    if "_orphan_udp_window" not in globals():
+        from wireguard_drain import OrphanUdpWindow
+        _orphan_udp_window = OrphanUdpWindow(MIN_DRAIN_SECONDS)
+    return _orphan_udp_window
+
+
+def _forget_drain(port: int) -> None:
+    try:
+        _drain_window().forget(port)
+    except Exception:
+        pass
+
+
+def _orphan_udp_drained(port: int, pid: int) -> bool:
+    try:
+        from wireguard_drain import process_identity, socks_hosts, tproxy_reply_inodes
+        state = read_state(required=True)
+        if port in {BASE_PORT, state["activePort"]}:
+            raise ValueError("base and active generations are protected")
+        generation = _generation(state, port)
+        config = _verify_generation_file(Path(_routes().CONFIG_PATH), generation)
+        hosts = socks_hosts(config)
+        start_ticks, inodes = process_identity(pid)
+        sockets = _run(["ss", "-H", "-a", "-ntupe"], timeout=5)
+        transparent = tproxy_reply_inodes(pid, sockets)
+        if process_identity(pid) != (start_ticks, inodes):
+            raise ValueError("process socket identity changed during observation")
+        return _drain_window().observe(port, pid, start_ticks, generation["sha256"], sockets, hosts, inodes, transparent)
+    except Exception:
+        _forget_drain(port)
+        return False
+
+
 class HotloadPendingError(RuntimeError):
     """The current proxy stays available, but this update needs a later retry."""
 
@@ -522,14 +558,18 @@ def _process_drained(port: int) -> bool:
         raw_pid = properties["MainPID"].strip()
         pid = int(raw_pid)
     except (Exception, ValueError):
+        _forget_drain(port)
         return False
     if active_state in {"inactive", "failed"}:
+        _forget_drain(port)
         return pid == 0
     if active_state != "active" or pid <= 0:
+        _forget_drain(port)
         return False
     try:
         sockets = _run(["ss", "-H", "-ntup"], timeout=5)
     except Exception:
+        _forget_drain(port)
         return False
 
     for line in sockets.splitlines():
@@ -540,6 +580,7 @@ def _process_drained(port: int) -> bool:
         local_port = _endpoint_port(fields[4])
         if pid not in pids:
             if local_port == port:
+                _forget_drain(port)
                 return False
             continue
         protocol, socket_state, peer = fields[0].lower(), fields[1].upper(), fields[5]
@@ -547,11 +588,12 @@ def _process_drained(port: int) -> bool:
         if not (local_port == port and wildcard_peer
                 and ((protocol == "tcp" and socket_state == "LISTEN")
                      or (protocol == "udp" and socket_state == "UNCONN"))):
-            return False
+            return _orphan_udp_drained(port, pid)
+    _forget_drain(port)
     return True
 
 
-def _retire_inactive(state: dict[str, Any], config_path: Path) -> dict[str, Any]:
+def _retire_inactive(state: dict[str, Any], config_path: Path, *, only_ports: set[int] | None = None) -> dict[str, Any]:
     path = Path(STATE_PATH)
     try:
         persisted_at = path.stat().st_mtime
@@ -562,8 +604,19 @@ def _retire_inactive(state: dict[str, Any], config_path: Path) -> dict[str, Any]
 
     for generation in list(state["generations"]):
         port = generation["port"]
-        if (port in {BASE_PORT, state["activePort"]} or not _conntrack_empty(port)
-                or not _process_drained(port)):
+        if only_ports is not None and port not in only_ports:
+            continue
+        if port in {BASE_PORT, state["activePort"]}:
+            _forget_drain(port)
+            continue
+        if not _conntrack_empty(port):
+            _forget_drain(port)
+            continue
+        if not _process_drained(port):
+            continue
+        # Re-read both proofs immediately before stopping an inactive unit.
+        if not _conntrack_empty(port) or not _process_drained(port):
+            _forget_drain(port)
             continue
         try:
             _run(["systemctl", "stop", _service(port)], timeout=30)
@@ -582,6 +635,7 @@ def _retire_inactive(state: dict[str, Any], config_path: Path) -> dict[str, Any]
             continue
         _generation_path(config_path, port).unlink(missing_ok=True)
         state = reduced
+        _forget_drain(port)
     return state
 
 

@@ -11,6 +11,7 @@ import json
 import secrets
 import socket
 import ssl
+import threading
 import time
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
@@ -25,6 +26,10 @@ from singbox import manager
 router = APIRouter(prefix="/api/users/cleanup", tags=["user-cleanup"], dependencies=[Depends(verify_token)])
 _proof_key = secrets.token_bytes(32)  # Restart invalidates outstanding removal proofs.
 _targets = (("www.cloudflare.com", "/cdn-cgi/trace"), ("www.gstatic.com", "/generate_204"))
+_snapshot_read_lock = threading.Lock()
+_snapshot_read_cache = None
+_peer_read_lock = threading.Lock()
+_peer_read_cache = None
 
 
 @router.get("/inventory")
@@ -51,7 +56,7 @@ class DetachItem(ProbeRequest):
 
 
 class DetachRequest(StrictModel):
-    items: list[DetachItem] = Field(min_length=1, max_length=20)
+    items: list[DetachItem] = Field(min_length=1, max_length=200)
 
 
 def _id(user_id):
@@ -129,13 +134,82 @@ def _fingerprint(snapshot):
     return hashlib.sha256(_canonical(snapshot).encode()).hexdigest()
 
 
+def _read_wireguard_peers():
+    global _peer_read_cache
+    from config import config
+    if not config.wireguard.enabled:
+        return {}
+    import wireguard
+    # The registry is replaced atomically. Reads need not join the long-running
+    # WG reconciliation lock; detach still takes that lock and checks the proof.
+    try:
+        stat = wireguard.REGISTRY_PATH.stat()
+        version = (stat.st_ino, stat.st_size, stat.st_mtime_ns)
+    except FileNotFoundError:
+        version = None
+    key = (str(wireguard.REGISTRY_PATH), config.wireguard.interface, version)
+    with _peer_read_lock:
+        if _peer_read_cache is not None and _peer_read_cache[0] == key:
+            return _peer_read_cache[1]
+        # Full peer validation is CPU-bound. Reuse it only for this exact atomic
+        # file version; the snapshot still verifies versions after reading and
+        # detach independently reads fresh peers under the native WG lock.
+        peers = wireguard._read()["peers"]
+        _peer_read_cache = (key, peers)
+        return peers
+
+
+def _snapshot_version():
+    from config import config
+    paths = [manager.CONFIG_PATH, manager.REGISTRY_PATH]
+    if config.wireguard.enabled:
+        import wireguard
+        paths.append(wireguard.REGISTRY_PATH)
+    versions = []
+    for path in paths:
+        try:
+            stat = path.stat()
+            versions.append((stat.st_ino, stat.st_size, stat.st_mtime_ns))
+        except FileNotFoundError:
+            versions.append(None)
+    return tuple(versions)
+
+
+def _read_snapshot_configuration(version):
+    global _snapshot_read_cache
+    key = (str(manager.CONFIG_PATH), str(manager.REGISTRY_PATH), version[:2])
+    with _snapshot_read_lock:
+        if _snapshot_read_cache is not None and _snapshot_read_cache[0] == key:
+            return _snapshot_read_cache[1]
+        # _configuration only reads these inputs and copies owned output fields.
+        # Cache one version in memory; any atomic config/registry replacement
+        # invalidates it. The caller still checks all versions after reading.
+        value = (manager.read_config(), manager.read_registry())
+        _snapshot_read_cache = (key, value)
+        return value
+
+
 def snapshot(user_id):
-    with _wireguard_state() as (_wireguard, state):
-        with manager._config_lock():
-            configuration = _configuration(manager.read_config(), manager.read_registry(), user_id, state["peers"])
-    return {"snapshot": configuration, "fingerprint": _fingerprint(configuration),
-            "expiresAt": configuration["metadata"]["expiresAt"],
-            "sourceIp": configuration["metadata"].get("sourceIp") or configuration["outbounds"][0].get("server")}
+    reason = "CONFIGURATION_CHANGED_RECHECK_REQUIRED"
+    for _ in range(3):
+        # All three files are atomically replaced. Optimistic readers must not
+        # queue behind network publication while holding up the management API.
+        # A snapshot is not a removal decision: probe and detach revalidate its
+        # full fingerprint, and detach retains the native WG/config locks.
+        before = _snapshot_version()
+        data, registry = _read_snapshot_configuration(before)
+        peers = _read_wireguard_peers()
+        configuration = _configuration(data, registry, user_id, peers)
+        if peers != _read_wireguard_peers():
+            reason = "WIREGUARD_STATE_CHANGED_RECHECK_REQUIRED"
+            continue
+        if before != _snapshot_version():
+            reason = "CONFIGURATION_CHANGED_RECHECK_REQUIRED"
+            continue
+        return {"snapshot": configuration, "fingerprint": _fingerprint(configuration),
+                "expiresAt": configuration["metadata"]["expiresAt"],
+                "sourceIp": configuration["metadata"].get("sourceIp") or configuration["outbounds"][0].get("server")}
+    raise HTTPException(409, reason)
 
 
 def _read_exact(sock, count):

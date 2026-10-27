@@ -88,6 +88,7 @@ from monitor.health_check import (
     get_dead_outbounds,
 )
 from singbox.manager import (
+    read_config,
     SingboxConfigError,
     bind_proxy,
     bind_multiple_proxies,
@@ -109,6 +110,7 @@ from singbox.manager import (
     get_socks_inbound_port,
     is_api_available,
     list_users,
+    read_registry,
     list_expired_users,
     migrate_user_expirations,
     process_user_expirations,
@@ -135,6 +137,9 @@ app = FastAPI(
     description="Single-node sing-box agent API for a Spring Boot multi-node control plane.",
 )
 
+from runtime_request_limits import RuntimeRequestLimits
+app.add_middleware(RuntimeRequestLimits)
+
 from wireguard_migration_recovery import router as wireguard_migration_recovery_router
 app.include_router(wireguard_migration_recovery_router)
 
@@ -149,6 +154,28 @@ app.include_router(user_cleanup_router)
 
 from shared_quota_routes import router as shared_quota_router
 app.include_router(shared_quota_router)
+
+from provisioning_readiness import router as provisioning_router
+app.include_router(provisioning_router)
+
+from runtime_task_api import router as runtime_task_router
+app.include_router(runtime_task_router)
+
+from runtime_write_queue import QueueBusy, TaskPending
+
+
+@app.exception_handler(QueueBusy)
+async def runtime_queue_busy(_request: Request, exc: QueueBusy):
+    return JSONResponse(status_code=429, headers={"Retry-After": "1", "Cache-Control": "no-store"},
+                        content={"code": "RUNTIME_QUEUE_UNAVAILABLE", "detail": str(exc)})
+
+
+@app.exception_handler(TaskPending)
+async def runtime_task_pending(_request: Request, exc: TaskPending):
+    location = "/api/singbox/tasks/" + exc.task_id
+    return JSONResponse(status_code=503, headers={"Location": location, "Retry-After": "1", "Cache-Control": "no-store"},
+                        content={"code": "RUNTIME_TASK_PENDING", "taskId": exc.task_id,
+                                 "detail": "操作仍在排队或处理中，请查询任务结果，不要重复提交"})
 
 static_dir = os.path.join(os.path.dirname(__file__), "static")
 app.mount("/static", StaticFiles(directory=static_dir), name="static")
@@ -190,6 +217,18 @@ async def validation_error_handler(request: Request, exc: RequestValidationError
 
 @app.on_event("startup")
 def startup_tasks():
+    # Recover before migrations or collectors can observe/mutate a partial bundle.
+    # An unprovable recovery aborts startup instead of serving mixed state.
+    from revision import recover_pending_revision
+    recover_pending_revision()
+    from singbox.manager import _config_lock
+    import runtime_publication
+    with _config_lock():
+        runtime_publication.initialize_locked()
+    from singbox.runtime_client import enabled as runtime_enabled
+    if runtime_enabled():
+        import runtime_write_queue
+        runtime_write_queue.start()
     try:
         migrated_expirations = migrate_user_expirations()
         if migrated_expirations:
@@ -214,6 +253,8 @@ def shutdown_tasks():
     stop_expiration_scheduler()
     stop_health_checker()
     stop_traffic_collector()
+    import runtime_write_queue
+    runtime_write_queue.stop()
 
 
 @app.get("/", include_in_schema=False)
@@ -229,8 +270,16 @@ def health():
 @app.get("/api/node/status", response_model=NodeStatusResponse, tags=["node"])
 def get_status(_token: str = Depends(verify_token)):
     status = get_node_status(config.node.id)
+    from singbox.runtime_client import enabled as runtime_enabled, RuntimeClient
+    runtime = None
+    if runtime_enabled():
+        try:
+            runtime = {"enabled": True, "available": True, **RuntimeClient().status()}
+        except SingboxConfigError:
+            runtime = {"enabled": True, "available": False}
     return {
         **status,
+        "userRuntime": runtime,
         "name": config.node.name,
         "host": config.node.host,
         "api_available": is_api_available(),
@@ -390,6 +439,12 @@ def create_user_endpoint(
     _token: str = Depends(verify_token),
 ):
     payload = request.model_dump(mode="json")
+    # Readiness is a transport precondition, not part of the user's identity.
+    # Check it even on replay; preserve existing idempotency payloads/keys.
+    payload.pop("requireReadiness", None)
+    if request.requireReadiness:
+        from provisioning_readiness import assert_user_provisioning_allowed
+        assert_user_provisioning_allowed(read_config(), list(request.protocols))
     result, replayed = execute_idempotent(
         idempotency_key,
         "create-user",
@@ -404,6 +459,7 @@ def create_user_endpoint(
             traffic_limit_bytes=request.trafficLimitBytes,
             max_source_ips=request.maxSourceIps,
             expires_at=request.expiresAt,
+            require_readiness=request.requireReadiness,
         ),
     )
     response.headers["Idempotency-Replayed"] = str(replayed).lower()
@@ -601,12 +657,13 @@ def _sort_users(items: list[dict], sort: str) -> list[dict]:
 def get_user_connections(
     userId: str,
     response: Response,
+    inspectionOnly: bool = False,
     _token: str = Depends(verify_token),
 ):
     if not userId or len(userId) > 64:
         raise HTTPException(status_code=422, detail="invalid userId")
     response.headers["Cache-Control"] = "no-store"
-    return get_user_connection(userId)
+    return get_user_connection(userId, inspect_suspended=inspectionOnly)
 
 
 @app.patch("/api/user/{userId}/access", tags=["users"])
@@ -927,9 +984,43 @@ def sync_user_expirations_endpoint(request: BatchExpirationSyncRequest, _token: 
     return sync_user_expirations([item.model_dump() for item in request.items])
 
 
+@app.get("/api/singbox/runtime/status", tags=["sing-box"])
+def singbox_runtime_status(_token: str = Depends(verify_token)):
+    from singbox.runtime_client import enabled as runtime_enabled, RuntimeClient
+    import runtime_publication
+    if not runtime_enabled():
+        return {"enabled": False}
+    return {"enabled": True, "recoveryRequired": runtime_publication.paths()[0].exists(),
+            "runtime": RuntimeClient().status()}
+
+
+@app.post("/api/singbox/runtime/reconcile", tags=["sing-box"])
+def singbox_runtime_reconcile(_token: str = Depends(verify_token)):
+    from singbox.runtime_client import enabled as runtime_enabled
+    from singbox.manager import _config_lock
+    import runtime_publication
+    if not runtime_enabled():
+        raise SingboxConfigError("sing-box runtime mode is disabled")
+    with _config_lock():
+        # Avoid acquiring the same file lock recursively.
+        import revision_transaction
+        recovered = revision_transaction._recover_locked()
+        runtime_publication.initialize_locked()
+        result = {"success": True, "recovered": recovered,
+                  "runtime": runtime_publication.verify_current()}
+    import runtime_write_queue
+    if runtime_write_queue.current():
+        runtime_write_queue.current().recover_receipts()
+    return result
+
+
 @app.post("/api/singbox/reload", response_model=ReloadResponse, tags=["sing-box"])
 def singbox_reload(_token: str = Depends(verify_token)):
-    return ReloadResponse(success=reload_singbox())
+    from singbox.manager import _config_lock
+    from revision_transaction import assert_no_pending_transaction
+    with _config_lock():
+        assert_no_pending_transaction()
+        return ReloadResponse(success=reload_singbox())
 
 
 class DesiredRevisionRequest(BaseModel):
@@ -973,6 +1064,12 @@ def apply_revision_endpoint(
         ),
     )
     response.headers["Idempotency-Replayed"] = str(replayed).lower()
+    if replayed:
+        # Cached receipts are historical evidence, not proof that these files
+        # still match. Recheck signature, immutable revision and disk readback.
+        result = apply_desired_revision(request.config, request.registry,
+                                       x_revision_signature, request.revisionId,
+                                       allow_user_deletion=request.allowUserDeletion)
     return result
 
 
@@ -989,6 +1086,7 @@ def api_status(_token: str = Depends(verify_token)):
 
 @app.get("/api/agent/info", response_model=AgentInfoResponse, tags=["agent"])
 def get_agent_info(_token: str = Depends(verify_token)):
+    from singbox.runtime_client import enabled as runtime_enabled
     return {
         "apiVersion": "v1",
         "managerVersion": _manager_version(),
@@ -1024,7 +1122,8 @@ def get_agent_info(_token: str = Depends(verify_token)):
             "revision.apply",
             "revision.rollback",
             "network.check",
-        ],
+        ] + (["singbox.runtime.users.v1", "singbox.runtime.reconcile.v1", "traffic.runtime.cumulative"]
+             if runtime_enabled() else []),
         "controlPlaneResponsibilities": [
             "node-registry",
             "heartbeat-scheduling",
@@ -1057,7 +1156,7 @@ def get_agent_heartbeat(_token: str = Depends(verify_token)):
         "memory": current["memory"],
         "connections": current["connections"],
         "systemConnections": current["systemConnections"],
-        "userCount": len(list_users()),
+        "userCount": len(read_registry().get("users", {})),
         "socksPort": get_socks_inbound_port(),
         # The collector samples traffic in the background. Avoid an extra
         # synchronous sing-box request on every control-plane heartbeat.
@@ -1075,7 +1174,7 @@ def _manager_version() -> str:
 def _singbox_version() -> str:
     try:
         result = subprocess.run(
-            ["sing-box", "version"], capture_output=True, text=True, timeout=5, check=False
+            [getattr(config.singbox, "binary", "sing-box"), "version"], capture_output=True, text=True, timeout=5, check=False
         )
     except (FileNotFoundError, subprocess.TimeoutExpired):
         return "unknown"

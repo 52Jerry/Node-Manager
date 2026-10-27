@@ -12,6 +12,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from config import config
 from monitor import traffic
+from monitor.shared_quota import export_origins, import_origins, peer_used_bytes, epoch, validate_origins, QuotaEvidenceRejected
 from singbox import manager
 from ha_template import export_template, apply_template
 from replication_snapshot import capture, ReplicationConflict
@@ -51,6 +52,8 @@ class PortableUser(StrictModel):
     maxConnections: int | None = Field(default=None, gt=0, le=100000)
     upload: int = Field(default=0, ge=0)
     download: int = Field(default=0, ge=0)
+    trafficOrigins: dict | None = None
+    trafficEpoch: dict | None = None
     trafficCycleStart: int | None = Field(default=None, ge=0)
     manualTrafficResetAt: int = Field(default=0, ge=0)
     accessEnabled: bool | None = None
@@ -137,9 +140,15 @@ def export_users(shared_config=False):
         if manager._as_utc(row.get("expiresAt")) is None:
             raise ReplicationConflict("MISSING_EXPIRATION")
         usage = store["users"].get(user_id, {})
+        try:
+            origins = export_origins(usage, str(config.node.id))
+        except QuotaEvidenceRejected as error:
+            raise ReplicationConflict(str(error)) from None
         portable = {key: value for key, value in row.items()
                     if key not in {"serializationIssues", "directConfirmed"}}
-        portable.update(upload=int(usage.get("upload") or 0), download=int(usage.get("download") or 0),
+        portable.update(upload=sum(v["upload"] for v in origins.values()),
+            download=sum(v["download"] for v in origins.values()), trafficOrigins=origins,
+            trafficEpoch=epoch(usage),
             trafficCycleStart=usage.get("lastTrafficCycleStart"),
             manualTrafficResetAt=int(usage.get("lastManualTrafficResetAt") or 0))
         try:
@@ -282,25 +291,24 @@ def apply_users(request: ReplicationRequest):
                 else:
                     manager._set_direct_binding(data, registry, user_id)
                 usage = store["users"].setdefault(user_id, {})
-                cycle = metadata["expiresAt"]
-                previous_cycle = previous_metadata.get(user_id, {}).get("expiresAt")
-                same_cycle = usage.get("replicationCycle") == cycle or previous_cycle == cycle
-                local_start = usage.get("lastTrafficCycleStart")
-                source_start = user.trafficCycleStart
-                local_epoch = (local_start if local_start is not None else -1, int(usage.get("lastManualTrafficResetAt") or 0))
-                source_epoch = (source_start if source_start is not None else -1, user.manualTrafficResetAt)
-                has_reset_epoch = local_epoch != (-1, 0) or source_epoch != (-1, 0)
-                stale_traffic = has_reset_epoch and source_epoch < local_epoch
-                if has_reset_epoch:
-                    same_cycle = source_epoch == local_epoch
-                if not stale_traffic:
-                    usage["upload"] = max(int(usage.get("upload") or 0), user.upload) if same_cycle else user.upload
-                    usage["download"] = max(int(usage.get("download") or 0), user.download) if same_cycle else user.download
-                    if source_start is not None:
-                        usage["lastTrafficCycleStart"] = source_start
-                    usage["lastManualTrafficResetAt"] = user.manualTrafficResetAt
-                usage["replicationCycle"] = cycle
-                limited = bool(user.trafficLimitBytes and usage["upload"] + usage["download"] >= user.trafficLimitBytes)
+                if user.trafficOrigins is None and (user.upload or user.download):
+                    raise ReplicationConflict("TRAFFIC_ORIGIN_REQUIRED")
+                try:
+                    if user.trafficOrigins is not None:
+                        origins = validate_origins(user.trafficOrigins)
+                        if user.upload + user.download != sum(v["upload"] + v["download"] for v in origins.values()):
+                            raise QuotaEvidenceRejected("TRAFFIC_ORIGIN_TOTAL_MISMATCH")
+                    if user.trafficEpoch is not None and (
+                            user.trafficEpoch.get("cycleStart") != user.trafficCycleStart
+                            or (user.trafficEpoch.get("manualResetAt") or 0) != user.manualTrafficResetAt):
+                        raise QuotaEvidenceRejected("TRAFFIC_EPOCH_MISMATCH")
+                    import_origins(usage, user.trafficOrigins or {}, str(config.node.id),
+                                   user.trafficCycleStart, user.manualTrafficResetAt, user.trafficEpoch)
+                except QuotaEvidenceRejected as error:
+                    raise ReplicationConflict(str(error)) from None
+                usage["replicationCycle"] = metadata["expiresAt"]
+                limited = bool(user.trafficLimitBytes and usage["upload"] + usage["download"]
+                               + peer_used_bytes(usage, user.trafficLimitBytes) >= user.trafficLimitBytes)
                 auth_names = sorted(manager._user_auth_names(registry, user_id))
                 if metadata["accessEnabled"] is False:
                     metadata[manager.ACCESS_AUTH_USERS_KEY] = auth_names
@@ -319,13 +327,22 @@ def apply_users(request: ReplicationRequest):
             # Persist counters before enabling credentials. Failed config reloads
             # restore the prior counters while collection remains locked.
             if store != original_store:
-                with traffic.traffic_lock:
-                    traffic._write_store(store)
+                from singbox.runtime_client import enabled as runtime_enabled
+                if runtime_enabled():
+                    import runtime_publication
+                    runtime_publication.stage_related(traffic.TRAFFIC_PATH, store)
+                else:
+                    with traffic.traffic_lock:
+                        traffic._write_store(store)
             return len(desired)
 
         try:
-            with manager.without_restart():
+            import runtime_publication
+            with runtime_publication.related_transaction(), manager.without_restart():
                 count = manager.mutate_config(apply)
+        except runtime_publication.RuntimeRecoveryRequired:
+            # The durable journal owns both config and counters until reconciliation.
+            raise
         except Exception:
             with traffic.traffic_lock:
                 if store_existed:

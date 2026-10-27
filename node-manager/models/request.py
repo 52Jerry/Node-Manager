@@ -67,6 +67,7 @@ class ResidentialProtocolsResponse(BaseModel):
 
 
 class CreateUserRequest(BaseModel):
+    requireReadiness: bool = False
     userId: str = Field(min_length=1, max_length=64, pattern=r"^[A-Za-z0-9._-]+$")
     # B1: Control Plane 可指定 UUID，确保多节点共享同一 UUID（主备/负载均衡场景）。
     # 留空时 Node Manager 仍随机生成，保持向后兼容。
@@ -307,6 +308,7 @@ class OperationResponse(BaseModel):
 
 
 class NodeStatusResponse(BaseModel):
+    userRuntime: dict | None = None
     node: str
     name: str
     host: str

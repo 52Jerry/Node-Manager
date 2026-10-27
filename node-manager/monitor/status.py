@@ -42,6 +42,21 @@ def get_system_connections() -> int:
 
 
 def get_proxy_connections() -> int:
+    # The background collector already samples the merged baseline/VLESS
+    # connection set. Reading its snapshot keeps heartbeats responsive when
+    # many rolling generations would make a fresh API merge expensive.
+    try:
+        from monitor.traffic import _read_store
+
+        # The collector writes the file atomically. Avoid its in-process lock:
+        # a large persistence pass can hold that lock longer than the control
+        # plane's heartbeat timeout.
+        store = _read_store()
+        if store.get("collectedAt") is not None:
+            return sum(1 for item in store.get("connections", {}).values()
+                       if item.get("online", True))
+    except (OSError, ValueError):
+        pass
     snapshot = singbox_api.get_connections()
     connections = snapshot.get("connections") if isinstance(snapshot, dict) else None
     return len(connections) if isinstance(connections, list) else 0

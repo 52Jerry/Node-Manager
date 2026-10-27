@@ -199,9 +199,11 @@ class UserReplicationTest(unittest.TestCase):
         traffic._write_store(store)
         snapshot = export_users()
         target = self.reset_target()
-        result = apply_users(self.request(snapshot))
-        self.assertEqual(result["userCount"], 1)
-        self.assertEqual(export_users(), snapshot)
+        with patch.object(manager.config.node, "id", "standby-node"):
+            result = apply_users(self.request(snapshot))
+            self.assertEqual(result["userCount"], 1)
+            self.assertEqual(export_users(), snapshot)
+        self.assertEqual(traffic._read_store()["users"]["primary-7"]["upload"], 0)
         data = manager.read_config()
         self.assertEqual(data["inbounds"][0]["tls"], target["inbounds"][0]["tls"])
         self.assertEqual(data["inbounds"][0]["listen_port"], 443)
@@ -222,38 +224,33 @@ class UserReplicationTest(unittest.TestCase):
         self.assertEqual(export_users(), snapshot)
         self.assertEqual(manager.read_config()["inbounds"][-1]["listen_port"], 2443)
 
-    def test_fixed_cycle_reset_propagates_and_stale_snapshots_cannot_restore_old_usage(self):
+    def test_remote_cycle_reset_requires_reconciliation_and_cannot_restore_old_usage(self):
         self.create()
         store = traffic._empty_store()
         store["users"]["primary-7"] = {"upload": 100, "download": 200, "lastTrafficCycleStart": 1000}
         traffic._write_store(store)
         old = export_users()
         fresh = copy.deepcopy(old)
-        fresh["users"][0].update(upload=0, download=0, trafficCycleStart=2000)
+        fresh["users"][0].update(upload=0, download=0, trafficCycleStart=2000,
+                                 trafficOrigins={}, trafficEpoch={"cycleStart": 2000})
         self.reset_target()
-        apply_users(self.request(old))
-        apply_users(self.request(fresh))
-        self.assertEqual(export_users()["users"][0]["download"], 0)
-        current = traffic._read_store()
-        current["users"]["primary-7"]["download"] = 25
-        traffic._write_store(current)
-        apply_users(self.request(fresh))
-        self.assertEqual(export_users()["users"][0]["download"], 25)
-        apply_users(self.request(old))
-        self.assertEqual(export_users()["users"][0]["download"], 25)
-        self.assertEqual(export_users()["users"][0]["trafficCycleStart"], 2000)
-        manual = copy.deepcopy(fresh)
-        manual["users"][0]["manualTrafficResetAt"] = 999999
-        apply_users(self.request(manual))
-        self.assertEqual(export_users()["users"][0]["download"], 0)
-        current = traffic._read_store()
-        current["users"]["primary-7"]["download"] = 25
-        traffic._write_store(current)
-        # Extending expiry within the same traffic period is not another clear.
-        renewed = copy.deepcopy(manual)
-        renewed["users"][0]["expiresAt"] = (datetime.now(timezone.utc) + timedelta(days=60)).isoformat()
-        apply_users(self.request(renewed))
-        self.assertEqual(export_users()["users"][0]["download"], 25)
+        with patch.object(manager.config.node, "id", "standby-node"):
+            apply_users(self.request(old))
+            before = self.traffic_path.read_bytes()
+            with self.assertRaisesRegex(manager.SingboxConfigError, "RESET_RECONCILIATION"):
+                apply_users(self.request(fresh))
+            self.assertEqual(self.traffic_path.read_bytes(), before)
+            # Only an explicit local reset may advance the accounting epoch.
+            from monitor.shared_quota import clear_for_reset
+            current = traffic._read_store()
+            clear_for_reset(current["users"]["primary-7"])
+            current["users"]["primary-7"]["lastTrafficCycleStart"] = 2000
+            current["users"]["primary-7"]["download"] = 25
+            traffic._write_store(current)
+            apply_users(self.request(fresh))
+            with self.assertRaisesRegex(manager.SingboxConfigError, "RESET_RECONCILIATION"):
+                apply_users(self.request(old))
+            self.assertEqual(traffic._read_store()["users"]["primary-7"]["download"], 25)
 
     def test_repeated_sync_does_not_reload_or_reset_target_usage(self):
         self.create()
@@ -295,7 +292,7 @@ class UserReplicationTest(unittest.TestCase):
         self.assertEqual(manager.read_config(), before)
         self.assertFalse(any("source_ip_cidr" in rule for rule in before["route"]["rules"]))
 
-    def test_renewed_copy_removes_old_expiration_rule_and_starts_new_cycle(self):
+    def test_renewed_copy_removes_expiration_but_never_resets_native_traffic(self):
         self.create()
         snapshot = export_users()
         self.reset_target()
@@ -309,8 +306,8 @@ class UserReplicationTest(unittest.TestCase):
         traffic._write_store(store)
         self.assertTrue(any(r.get("action") == "reject" for r in manager.read_config()["route"]["rules"]))
         apply_users(self.request(snapshot))
-        self.assertFalse(any(r.get("action") == "reject" for r in manager.read_config()["route"]["rules"]))
-        self.assertEqual(traffic._read_store()["users"]["primary-7"]["upload"], 0)
+        self.assertTrue(any(r.get("action") == "reject" for r in manager.read_config()["route"]["rules"]))
+        self.assertEqual(traffic._read_store()["users"]["primary-7"]["upload"], 9999)
 
     def test_traffic_write_failure_never_enables_users(self):
         self.create()

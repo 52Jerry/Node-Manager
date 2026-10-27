@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import requests
+import os
 import json
 import logging
 from config import config
@@ -14,7 +15,25 @@ class SingboxAPI:
         if config.singbox.api_secret:
             self.headers["Authorization"] = f"Bearer {config.singbox.api_secret}"
 
+    @staticmethod
+    def _vless_publication():
+        from .runtime_client import enabled, check_mode
+        if enabled():
+            check_mode()
+            return None
+        if not os.environ.get("NODE_MANAGER_VLESS_PUBLICATION_SPEC"):
+            return None
+        import vless_publication
+        return vless_publication if vless_publication.configured_spec() is not None else None
+
     def get_proxies(self):
+        try:
+            publication = self._vless_publication()
+            if publication is not None:
+                return publication.proxies()
+        except Exception as exc:
+            logger.warning("VLESS generation API unavailable: %s", type(exc).__name__)
+            return None
         try:
             response = requests.get(f"{self.base_url}/proxies", headers=self.headers, timeout=3)
             if response.status_code == 200:
@@ -26,6 +45,13 @@ class SingboxAPI:
             return None
 
     def get_connections(self):
+        try:
+            publication = self._vless_publication()
+            if publication is not None:
+                return publication.snapshot()
+        except Exception as exc:
+            logger.warning("VLESS generation API unavailable: %s", type(exc).__name__)
+            return None
         try:
             response = requests.get(
                 f"{self.base_url}/connections", headers=self.headers, timeout=3
@@ -49,6 +75,13 @@ class SingboxAPI:
         return {"upload": values[0], "download": values[1]}
 
     def close_connection(self, connection_id: str) -> bool:
+        try:
+            publication = self._vless_publication()
+            if publication is not None:
+                return publication.close(connection_id)
+        except Exception as exc:
+            logger.warning("VLESS generation API unavailable: %s", type(exc).__name__)
+            return False
         try:
             response = requests.delete(
                 f"{self.base_url}/connections/{connection_id}",
@@ -146,6 +179,13 @@ class SingboxAPI:
             return False
 
     def is_available(self):
+        try:
+            publication = self._vless_publication()
+            if publication is not None:
+                return publication.proxies() is not None
+        except Exception as exc:
+            logger.warning("VLESS generation API unavailable: %s", type(exc).__name__)
+            return False
         try:
             response = requests.get(f"{self.base_url}/proxies", headers=self.headers, timeout=2)
             return response.status_code == 200

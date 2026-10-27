@@ -195,14 +195,14 @@ class ApplySuccessTest(RevisionApplyTestBase):
 
     def test_same_revision_id_with_different_payload_is_not_replay(self):
         self.apply({"inbounds": [{"tag": "v1"}]}, revision_id="rev-dup")
-        second = self.apply({"inbounds": [{"tag": "v2"}]}, revision_id="rev-dup")
-        self.assertFalse(second["replayed"])
-        self.assertEqual(self.reload_singbox.call_count, 2)
+        with self.assertRaisesRegex(SingboxConfigError, "content conflict"):
+            self.apply({"inbounds": [{"tag": "v2"}]}, revision_id="rev-dup")
+        self.assertEqual(self.reload_singbox.call_count, 1)
 
     def test_reload_failure_rolls_back_previous_config(self):
         original = {"inbounds": [{"tag": "orig", "listen_port": 20168}]}
         self.config_path.write_text(json.dumps(original), encoding="utf-8")
-        self.reload_singbox.return_value = False
+        self.reload_singbox.side_effect = [False, True]
         with self.assertRaises(SingboxConfigError) as ctx:
             self.apply({"inbounds": [{"tag": "broken"}]}, revision_id="rev-fail")
         self.assertIn("reload failed", str(ctx.exception))
@@ -211,14 +211,17 @@ class ApplySuccessTest(RevisionApplyTestBase):
             original,
             "reload 失败后必须恢复上一份可用配置",
         )
-        self.assertEqual(self.state()["status"], "rolled-back")
+        self.assertEqual(self.state()["status"], "unknown")
+        self.assertFalse(revision_module.JOURNAL_PATH.exists())
         self.assertIn("reload-failed", self.rejected_reasons())
 
     def test_reload_failure_without_previous_config_still_signals(self):
         self.reload_singbox.return_value = False
         with self.assertRaises(SingboxConfigError):
             self.apply({"inbounds": [{"tag": "broken"}]}, revision_id="rev-f1")
-        self.assertEqual(self.state()["status"], "rolled-back")
+        self.assertEqual(revision_module.get_revision_state()["status"], "recovery-required")
+        self.assertFalse(self.config_path.exists())
+        self.assertFalse(self.registry_path.exists())
 
     def test_second_apply_promotes_last_good(self):
         first = {"inbounds": [{"tag": "one", "listen_port": 1}]}

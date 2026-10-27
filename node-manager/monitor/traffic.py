@@ -19,7 +19,7 @@ from singbox.manager import (
     sync_user_enforcements,
 )
 from config import config
-from monitor.shared_quota import peer_used_bytes, clear_for_reset
+from monitor.shared_quota import peer_used_bytes, clear_for_reset, native_accounting_proven
 from monitor.source_identity import normalize_ip, source_ip_diagnostics
 from monitor.telemetry import connection_summary, sample_state
 
@@ -81,6 +81,9 @@ def _write_store(data: dict[str, Any]) -> None:
             os.fsync(handle.fileno())
         os.chmod(temp_path, 0o600)
         os.replace(temp_path, TRAFFIC_PATH)
+        if os.name != "nt":
+            from runtime_publication import sync_dir
+            sync_dir(TRAFFIC_PATH.parent)
     finally:
         temp_path.unlink(missing_ok=True)
 
@@ -164,6 +167,11 @@ def _enforce_policies(
         user["trafficLimitBytes"] = traffic_limit
         user["maxSourceIps"] = max_source_ips
         user["maxConnections"] = max_connections
+        if not native_accounting_proven(user):
+            # Preserve the existing routing decision until historical provenance
+            # is reconciled; don't add/subtract mixed counters or clear a block.
+            user["quotaDecision"] = "legacy_mixed_traffic_review_required"
+            continue
         user["status"] = "active"
 
         last_seen = user.get("sourceIpLastSeen")
@@ -263,9 +271,45 @@ def _enforce_policies(
     return enforcements, connections_to_close
 
 
+def _apply_native_counters(store, snapshot, auth_map, active_ids=()):
+    import runtime_history as history
+    import runtime_publication
+    from singbox.runtime_client import RuntimeClient
+    from .runtime_counters import apply_counters, finalize_retirements
+    snapshot = finalize_retirements(store, snapshot, RuntimeClient(), _write_store)
+    aliases = runtime_publication.read_aliases()
+    aliases.update(history.owners(row["user"] for row in snapshot["users"] if row["user"] not in auth_map))
+    user_ids = {auth_map.get(row["user"]) or aliases.get(row["user"]) for row in snapshot["users"]}
+    user_ids.update(auth_map.values())
+    user_ids.update(active_ids)
+    store["users"].update(history.usage(user_ids - set(store["users"]) - {None}))
+    apply_counters(store, snapshot, auth_map, aliases)
+
+
+def _archive_inactive_usage(store, active_ids):
+    import runtime_history as history
+    retained = {row.get("userId") for row in store.get("runtimeCounters", {}).get("rows", {}).values()}
+    retained.update(row.get("userId") for row in store.get("connections", {}).values())
+    cold = {uid: row for uid, row in store["users"].items() if uid not in active_ids and uid not in retained}
+    history.archive_usage(cold)
+    for uid in cold:
+        del store["users"][uid]
+
+
 def _collect_traffic() -> bool:
+    from singbox.runtime_client import enabled as runtime_enabled, RuntimeClient
+    runtime_mode = runtime_enabled()
+    native_snapshot = RuntimeClient().counters() if runtime_mode else None
     snapshot = singbox_api.get_connections()
     if not isinstance(snapshot, dict) or not isinstance(snapshot.get("connections"), list):
+        if native_snapshot is not None:
+            auth_map = get_user_auth_map()
+            with traffic_lock:
+                store = _read_store()
+                _apply_native_counters(store, native_snapshot, auth_map)
+                _archive_inactive_usage(store, set(auth_map.values()))
+                store["collectedAt"] = _now()
+                _write_store(store)
         collection_health[str(TRAFFIC_PATH)] = {"reason": "api_unavailable"}
         connection_details.pop(str(TRAFFIC_PATH), None)
         logger.warning("traffic telemetry unavailable; retaining prior enforcement, review required")
@@ -276,6 +320,10 @@ def _collect_traffic() -> bool:
     sampled_at = time.time()
     with traffic_lock:
         store = _read_store()
+        if runtime_mode:
+            _apply_native_counters(store, native_snapshot, auth_map, policies)
+        elif store.get("runtimeCounters"):
+            raise ValueError("runtime_counter_mode_requires_explicit_migration")
         previous_connections = store.get("connections", {})
         active_connections: dict[str, Any] = {}
         transient_details: dict[str, dict[str, Any]] = {}
@@ -310,10 +358,9 @@ def _collect_traffic() -> bool:
             user = store["users"].setdefault(
                 user_id, {"upload": 0, "download": 0, "updatedAt": collected_at}
             )
-            user["upload"] = int(user.get("upload") or 0) + max(0, upload - previous_upload)
-            user["download"] = int(user.get("download") or 0) + max(
-                0, download - previous_download
-            )
+            if not runtime_mode:
+                user["upload"] = int(user.get("upload") or 0) + max(0, upload - previous_upload)
+                user["download"] = int(user.get("download") or 0) + max(0, download - previous_download)
             user["updatedAt"] = collected_at
             transient_details[connection_id] = {
                 "destinationIp": _connection_ip(connection, "destinationIP", "destination_ip"),
@@ -344,6 +391,8 @@ def _collect_traffic() -> bool:
         store["connections"] = active_connections
         store["collectedAt"] = collected_at
         store["nodeCumulativeCounters"] = singbox_api.cumulative_counters(snapshot)
+        if runtime_mode:
+            _archive_inactive_usage(store, set(auth_map.values()) | set(policies))
         _write_store(store)
         connection_details[str(TRAFFIC_PATH)] = transient_details
 
@@ -382,7 +431,7 @@ def collect_traffic() -> bool:
     with collection_lock:
         try:
             return _collect_traffic()
-        except (OSError, ValueError, TypeError, KeyError):
+        except (OSError, ValueError, TypeError, KeyError, RuntimeError):
             collection_health[str(TRAFFIC_PATH)] = {"reason": "collection_or_persistence_failed"}
             connection_details.pop(str(TRAFFIC_PATH), None)
             logger.exception("traffic collection failed; no new enforcement applied")
@@ -421,7 +470,13 @@ def get_user_traffic(
                              collection_health.get(str(TRAFFIC_PATH), {}).get("reason"))
     if not freshness["telemetryAvailable"]:
         connection_details.pop(str(TRAFFIC_PATH), None)
-    user = store["users"].get(user_id, {})
+    user = store["users"].get(user_id)
+    if user is None:
+        from singbox.runtime_client import enabled
+        if enabled() or store.get("runtimeCounters"):
+            import runtime_history
+            user = runtime_history.usage([user_id]).get(user_id)
+        user = user or {}
     policy = get_user_policies().get(user_id, {}) if policy is None else policy
     upload = int(user.get("upload") or 0)
     download = int(user.get("download") or 0)
@@ -430,9 +485,10 @@ def get_user_traffic(
     max_source_ips = policy.get("maxSourceIps", user.get("maxSourceIps"))
     max_connections = policy.get("maxConnections", user.get("maxConnections"))
     status = user.get("status", "active")
-    if traffic_limit and upload + download + peer_used_bytes(user, traffic_limit) >= int(traffic_limit):
+    accounting_proven = native_accounting_proven(user)
+    if accounting_proven and traffic_limit and upload + download + peer_used_bytes(user, traffic_limit) >= int(traffic_limit):
         status = "traffic_limited"
-    elif status == "traffic_limited":
+    elif accounting_proven and status == "traffic_limited":
         status = "active"
     online_connections = [
         {"id": connection_id, **{
@@ -451,8 +507,11 @@ def get_user_traffic(
         "upload": upload,
         "download": download,
         "total": upload + download,
+        "peerObservedBytes": peer_used_bytes(user, traffic_limit),
+        "quotaUsedBytes": upload + download + peer_used_bytes(user, traffic_limit) if accounting_proven else None,
+        "nativeAccountingProven": accounting_proven,
         "available": freshness["telemetryAvailable"],
-        "source": "clash-api-sampled",
+        "source": "singbox-runtime-cumulative" if store.get("runtimeCounters") else "clash-api-sampled",
         "collectedAt": store.get("collectedAt"),
         "trafficLimitBytes": traffic_limit,
         "maxSourceIps": max_source_ips,
@@ -465,13 +524,13 @@ def get_user_traffic(
         **source_ip_diagnostics(online_connections),
         **connection_summary(online_connections),
         **freshness,
-        "measurementQuality": "sampled_lower_bound",
-        "measuredTotal": upload + download if freshness["telemetryAvailable"] else None,
+        "measurementQuality": ("runtime_cumulative_since_baseline" if store.get("runtimeCounters") else "sampled_lower_bound") if accounting_proven else "legacy_mixed_review_required",
+        "measuredTotal": upload + download if freshness["telemetryAvailable"] and accounting_proven else None,
         "lastKnownTotal": upload + download if store.get("collectedAt") else None,
-        "quotaDecision": "legacy_sampled_enforcement" if freshness["telemetryAvailable"]
+        "quotaDecision": "legacy_mixed_traffic_review_required" if not accounting_proven else ("runtime_cumulative_enforcement" if store.get("runtimeCounters") else "legacy_sampled_enforcement") if freshness["telemetryAvailable"]
                          else "retain_prior_enforcement_review_required",
         "sourceLimitDecision": user.get("sourceLimitDecision", "not_evaluated"),
-        "alertRequired": (not freshness["telemetryAvailable"] or
+        "alertRequired": (not accounting_proven or not freshness["telemetryAvailable"] or
                           user.get("sourceLimitDecision") == "suspended_unreliable_source_review_required"),
         "policyStatus": "source_limited" if status == "device_limited" else status,
         "status": status,
@@ -480,13 +539,19 @@ def get_user_traffic(
 
 def get_traffic_totals(refresh: bool = True) -> dict[str, Any]:
     available = collect_traffic() if refresh else None
-    with traffic_lock:
-        try:
+    try:
+        if refresh:
+            with traffic_lock:
+                store = _read_store()
+        else:
+            # The collector writes a complete temporary file and atomically
+            # replaces the store. A cached heartbeat read can use either
+            # complete snapshot without waiting for a large collection pass.
             store = _read_store()
-        except OSError:
-            store = _empty_store()
-            available = False
-            collection_health[str(TRAFFIC_PATH)] = {"reason": "traffic_store_unreadable"}
+    except OSError:
+        store = _empty_store()
+        available = False
+        collection_health[str(TRAFFIC_PATH)] = {"reason": "traffic_store_unreadable"}
     if available is None:
         available = (store.get("collectedAt") is not None
                      and not collection_health.get(str(TRAFFIC_PATH), {}).get("reason"))
@@ -495,15 +560,20 @@ def get_traffic_totals(refresh: bool = True) -> dict[str, Any]:
                              collection_health.get(str(TRAFFIC_PATH), {}).get("reason"))
     upload = sum(int(item.get("upload") or 0) for item in store["users"].values())
     download = sum(int(item.get("download") or 0) for item in store["users"].values())
+    if store.get("runtimeCounters"):
+        import runtime_history
+        cold_upload, cold_download = runtime_history.archived_totals(store["users"])
+        upload += cold_upload
+        download += cold_download
     return {
         "upload": upload,
         "download": download,
         "total": upload + download,
         "available": freshness["telemetryAvailable"],
-        "source": "clash-api-sampled",
+        "source": "singbox-runtime-cumulative" if store.get("runtimeCounters") else "clash-api-sampled",
         "collectedAt": store.get("collectedAt"),
         **freshness,
-        "measurementQuality": "sampled_lower_bound",
+        "measurementQuality": "runtime_cumulative_since_baseline" if store.get("runtimeCounters") else "sampled_lower_bound",
         "measuredTotal": upload + download if freshness["telemetryAvailable"] else None,
         "lastKnownTotal": upload + download if store.get("collectedAt") else None,
         "nodeCumulativeCounters": store.get("nodeCumulativeCounters")
@@ -516,6 +586,10 @@ def delete_user_traffic(user_id: str) -> None:
     with collection_lock:
         with traffic_lock:
             store = _read_store()
+            from singbox.runtime_client import enabled
+            if (enabled() or store.get("runtimeCounters")) and user_id in store["users"]:
+                import runtime_history
+                runtime_history.archive_usage({user_id: store["users"][user_id]})
             store["users"].pop(user_id, None)
             store["connections"] = {
                 connection_id: item
@@ -535,6 +609,10 @@ def reset_user_traffic(user_id: str, renewal_key: str | None = None) -> dict[str
     with collection_lock:
         with traffic_lock:
             store = _read_store()
+            from singbox.runtime_client import enabled
+            if (enabled() or store.get("runtimeCounters")) and user_id not in store["users"]:
+                import runtime_history
+                store["users"].update(runtime_history.usage([user_id]))
             user = store["users"].setdefault(user_id, {})
             if renewal_key is not None and user.get("lastRenewalResetKey") == renewal_key:
                 return {"success": True, "userId": user_id, "trafficReset": False}
