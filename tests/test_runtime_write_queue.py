@@ -9,10 +9,12 @@ from pathlib import Path
 from unittest.mock import patch
 
 from fastapi.testclient import TestClient
+from fastapi import HTTPException, Response
 import test_runtime_publication as fixtures
 from test_runtime_publication import manager, main, publication
 from test_next_stage import idempotency
 import runtime_write_queue as queue
+import runtime_task_api
 
 
 class RuntimeQueueTests(unittest.TestCase):
@@ -26,6 +28,15 @@ class RuntimeQueueTests(unittest.TestCase):
 
     def mutation(self, name):
         return manager.capture_mutation(lambda: self.create(name))
+
+    def test_legacy_mode_advertises_task_route_as_unavailable_without_mutation(self):
+        request = runtime_task_api.Submission(commands=[runtime_task_api.Delete(action="delete", userId="u1")])
+        with patch("singbox.runtime_client.enabled", return_value=False), \
+             patch.object(queue, "start") as writer:
+            with self.assertRaises(HTTPException) as raised:
+                runtime_task_api.submit(request, Response(), "stable-key")
+            self.assertEqual(raised.exception.status_code, 404)
+            writer.assert_not_called()
 
     def test_32_mutations_coalesce_into_one_durable_publication(self):
         writer = self.writer()

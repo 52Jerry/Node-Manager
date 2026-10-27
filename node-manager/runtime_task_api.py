@@ -118,6 +118,12 @@ router = APIRouter(prefix="/api/singbox/tasks", tags=["runtime-tasks"], dependen
 @router.post("", status_code=202)
 def submit(request: Submission, response: Response,
            idempotency_key: str = Header(alias="Idempotency-Key", min_length=1, max_length=128)):
+    from singbox.runtime_client import enabled as runtime_enabled
+    # The route exists on mixed-version nodes, but the durable writer is only
+    # available with the matching single-process core. 404 lets older control
+    # planes keep their established legacy mutation path during migration.
+    if not runtime_enabled():
+        raise HTTPException(404, "runtime task mode is disabled")
     import json
     payload = request.model_dump(mode="json")
     size = len(json.dumps(payload, separators=(",", ":")).encode())
