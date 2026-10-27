@@ -47,6 +47,7 @@ except ImportError:  # Windows development fallback; production deployment uses 
 logger = logging.getLogger(__name__)
 _restart_allowed = ContextVar("singbox_restart_allowed", default=True)
 _config_lock_depth = ContextVar("singbox_config_lock_depth", default=0)
+_config_read_lock_depth = ContextVar("singbox_config_read_lock_depth", default=0)
 _mutation_workspace = ContextVar("singbox_mutation_workspace", default=None)
 _mutation_baseline = ContextVar("singbox_mutation_baseline", default=None)
 _mutation_registry_baseline = ContextVar("singbox_registry_baseline",default=None)
@@ -100,7 +101,9 @@ expiration_stop = threading.Event()
 expiration_thread: threading.Thread | None = None
 singbox_api = SingboxAPI()
 _connection_snapshot_cache = ConnectionSnapshotCache()
+_connection_snapshot_cache_lock = threading.Lock()
 thread_lock = threading.Lock()
+_enforcement_noop_cache: tuple | None = None
 
 
 def _audit(action: str, user_id: str, **fields: Any) -> None:
@@ -364,7 +367,7 @@ def get_user_policy(user_id: str) -> dict[str, int | None]:
 
 
 def get_user_policies() -> dict[str, dict[str, int | None]]:
-    with _config_lock():
+    with _config_read_lock():
         registry = read_registry()
     return {
         user_id: {
@@ -379,7 +382,7 @@ def get_user_policies() -> dict[str, dict[str, int | None]]:
 
 def get_user_auth_map() -> dict[str, str]:
     """Map sing-box authentication names back to control-plane user IDs."""
-    with _config_lock():
+    with _config_read_lock():
         data = read_config()
         registry = read_registry()
 
@@ -493,6 +496,8 @@ def get_socks_inbound_port() -> int | None:
 
 @contextmanager
 def _config_lock():
+    if _config_read_lock_depth.get() and not _config_lock_depth.get():
+        raise SingboxConfigError("cannot mutate sing-box configuration while holding a read lock")
     depth = _config_lock_depth.get()
     token = _config_lock_depth.set(depth + 1)
     try:
@@ -508,6 +513,26 @@ def _config_lock():
                 yield
     finally:
         _config_lock_depth.reset(token)
+
+
+@contextmanager
+def _config_read_lock():
+    """Share consistent file reads while excluding multi-file configuration writes."""
+    depth = _config_read_lock_depth.get()
+    token = _config_read_lock_depth.set(depth + 1)
+    try:
+        if depth or _config_lock_depth.get():
+            yield
+        elif fcntl is None:
+            with thread_lock:
+                yield
+        else:
+            LOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
+            with LOCK_PATH.open("a", encoding="ascii") as handle:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_SH)
+                yield
+    finally:
+        _config_read_lock_depth.reset(token)
 
 
 def _write_and_reload(updated: dict[str, Any]) -> None:
@@ -1877,7 +1902,7 @@ def process_user_expirations(now: datetime | None = None) -> int:
     if not EXPIRATION_ENABLED:
         return 0
     current_time = _as_utc(now) or datetime.now(timezone.utc)
-    with _config_lock():
+    with _config_read_lock():
         current_registry = read_registry()
     expired_user_ids = {
         user_id
@@ -1886,8 +1911,25 @@ def process_user_expirations(now: datetime | None = None) -> int:
         and (expires_at := _as_utc(metadata.get("expiresAt"))) is not None
         and expires_at <= current_time
     }
+    if not expired_user_ids:
+        return 0
     connections_to_close = _connections_to_close_for_expired_users(
         current_registry, expired_user_ids
+    )
+
+    # The scheduler runs every five seconds. Only enter the durable writer when
+    # an expired user still needs a reject rule; already blocked users still
+    # have their live connections inspected and closed above.
+    with _config_read_lock():
+        current_config = read_config()
+        current_registry = read_registry()
+    rules = current_config.get("route", {}).get("rules", [])
+    pending = any(
+        not isinstance((metadata := current_registry.get("users", {}).get(user_id)), dict)
+        or metadata.get(EXPIRATION_BLOCKED_KEY) is not True
+        or metadata.get(EXPIRATION_AUTH_USERS_KEY) != (names := sorted(_user_auth_names(current_registry, user_id)))
+        or {"auth_user": names, "action": "reject"} not in rules
+        for user_id in expired_user_ids
     )
 
     def apply(data: dict[str, Any], registry: dict[str, Any]) -> int:
@@ -1907,7 +1949,7 @@ def process_user_expirations(now: datetime | None = None) -> int:
                 changed += 1
         return changed
 
-    changed = mutate_config(apply)
+    changed = mutate_config(apply) if pending else 0
     for connection_id in connections_to_close:
         if not singbox_api.close_connection(connection_id):
             logger.warning("could not close expired user connection %s", connection_id)
@@ -2180,6 +2222,26 @@ def sync_user_enforcements(
     CIDRs to the static config would repeatedly reload sing-box.
     """
 
+    # The collector submits the same 4k+ decisions on every sample. A verified
+    # no-op needs no durable write task until the desired state or either file
+    # changes. Keep the file versions in the key so external edits invalidate it.
+    global _enforcement_noop_cache
+    desired = hashlib.sha256(json.dumps([
+        (user_id, bool(value.get("trafficBlocked")),
+         sorted(value.get("blockedSourceIps") or []) if persist_source_blocks else [])
+        for user_id, value in sorted(enforcements.items())
+    ], ensure_ascii=False, separators=(",", ":")).encode()).digest()
+    def versions() -> tuple | None:
+        try:
+            return tuple((str(path), stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns)
+                         for path in (CONFIG_PATH, REGISTRY_PATH) for stat in (path.stat(),))
+        except FileNotFoundError:
+            return None
+    before = versions()
+    cache_key = (persist_source_blocks, desired, before)
+    if before is not None and _enforcement_noop_cache == cache_key:
+        return False
+
     def apply(data: dict[str, Any], registry: dict[str, Any]) -> bool:
         changed = False
         rules = data.setdefault("route", {}).setdefault("rules", [])
@@ -2298,7 +2360,10 @@ def sync_user_enforcements(
                 )
         return changed
 
-    return mutate_config(apply)
+    changed = mutate_config(apply)
+    after = versions()
+    _enforcement_noop_cache = cache_key if not changed and before is not None and before == after else None
+    return changed
 
 
 def _set_proxy_binding(
@@ -2904,8 +2969,7 @@ def ensure_user_outbounds() -> int:
 
 
 def list_users() -> list[dict[str, Any]]:
-    process_user_expirations()
-    with _config_lock():
+    with _config_read_lock():
         data = read_config()
         registry = read_registry()
 
@@ -2976,7 +3040,7 @@ def list_users() -> list[dict[str, Any]]:
 
 
 def get_user_connection(user_id: str, inspect_suspended: bool = False) -> dict[str, Any]:
-    with _config_lock():
+    with _config_read_lock(), _connection_snapshot_cache_lock:
         snapshot = _connection_snapshot_cache.get(CONFIG_PATH, REGISTRY_PATH, read_config, read_registry)
         data, registry = snapshot.data, snapshot.registry
 

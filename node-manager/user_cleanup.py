@@ -37,8 +37,14 @@ def inventory(response: Response):
     # One native collection rather than repeating the full registry/traffic scan per 100-row page.
     # The normal public pagination limit remains unchanged.
     from main import get_users
-    response.headers["Cache-Control"] = "no-store, private"
-    return get_users(page=1, pageSize=100000, keyword=None, sort="userIdAsc", _token="internal-authorized")
+    items = get_users(page=1, pageSize=100000, keyword=None, sort="userIdAsc", _token="internal-authorized")
+    # Returning the large dict makes FastAPI recursively convert every field
+    # before JSON encoding. It is already JSON-native; serialize it once.
+    return Response(
+        content=json.dumps(items, ensure_ascii=False, separators=(",", ":"), allow_nan=False),
+        media_type="application/json",
+        headers={"Cache-Control": "no-store, private"},
+    )
 
 
 class StrictModel(BaseModel):
