@@ -1,8 +1,9 @@
 """One file-versioned, read-only snapshot for connection detail queries.
 
-Mutation paths keep using fresh dictionaries. This cache is used only while
-holding the existing configuration lock, and never caches endpoint responses,
-expiration decisions, or authorization results.
+Mutation paths keep using fresh dictionaries. A matching file version can be
+read without the configuration lock; changed versions reload under the lock.
+The cache never stores endpoint responses, expiration decisions, or
+authorization results.
 """
 from __future__ import annotations
 
@@ -60,4 +61,27 @@ class ConnectionSnapshotCache:
             # credential snapshot if a changed file is invalid/unreadable.
             snapshot = ConnectionSnapshot(load_config(), load_registry())
             self._snapshot, self._key = snapshot, key
+        return self._snapshot
+
+    def current(self, config_path: Path, registry_path: Path,
+                load_config: Callable[[], dict], load_registry: Callable[[], dict]) -> ConnectionSnapshot | None:
+        """Return the last coherent snapshot while the same file versions remain live.
+
+        This path never reads file contents or waits for a configuration writer.
+        A changed or missing file forces the locked reader to load and validate
+        the new pair before returning any credentials.
+        """
+        if self._snapshot is None:
+            return None
+        try:
+            key = (self._version(config_path), self._version(registry_path, optional=True),
+                   load_config, load_registry)
+            if key != self._key:
+                return None
+            # A concurrent atomic replacement between stats must not make a
+            # stale credential snapshot appear current.
+            if key[:2] != (self._version(config_path), self._version(registry_path, optional=True)):
+                return None
+        except FileNotFoundError:
+            return None
         return self._snapshot

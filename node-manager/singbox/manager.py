@@ -3040,9 +3040,12 @@ def list_users() -> list[dict[str, Any]]:
 
 
 def get_user_connection(user_id: str, inspect_suspended: bool = False) -> dict[str, Any]:
-    with _config_read_lock(), _connection_snapshot_cache_lock:
-        snapshot = _connection_snapshot_cache.get(CONFIG_PATH, REGISTRY_PATH, read_config, read_registry)
-        data, registry = snapshot.data, snapshot.registry
+    with _connection_snapshot_cache_lock:
+        snapshot = _connection_snapshot_cache.current(CONFIG_PATH, REGISTRY_PATH, read_config, read_registry)
+    if snapshot is None:
+        with _config_read_lock(), _connection_snapshot_cache_lock:
+            snapshot = _connection_snapshot_cache.get(CONFIG_PATH, REGISTRY_PATH, read_config, read_registry)
+    data, registry = snapshot.data, snapshot.registry
 
     metadata = _registry_user(registry, user_id)
     expiration_status = _expiration_status(metadata)

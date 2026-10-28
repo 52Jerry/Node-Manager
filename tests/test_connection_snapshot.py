@@ -41,6 +41,21 @@ class ConnectionSnapshotTests(unittest.TestCase):
             self.assertFalse(cache.get(config,registry,loader,read_registry).registry['access'])
             self.assertEqual(loader.call_count, 2)
 
+    def test_current_snapshot_avoids_locked_reload_but_rejects_changed_files(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config, registry = Path(directory)/'config.json', Path(directory)/'users.json'
+            config.write_text('{}'); registry.write_text('{"access":true }')
+            read_config = lambda: json.loads(config.read_text())
+            read_registry = lambda: json.loads(registry.read_text())
+            cache = module.ConnectionSnapshotCache()
+            first = cache.get(config, registry, read_config, read_registry)
+            self.assertIs(cache.current(config, registry, read_config, read_registry), first)
+            replacement = registry.with_suffix('.tmp')
+            replacement.write_text('{"access":false}')
+            replacement.replace(registry)
+            self.assertIsNone(cache.current(config, registry, read_config, read_registry))
+            self.assertFalse(cache.get(config, registry, read_config, read_registry).registry['access'])
+
     def test_changed_invalid_file_fails_closed_without_old_credentials(self):
         with tempfile.TemporaryDirectory() as directory:
             config, registry = Path(directory)/'config.json', Path(directory)/'users.json'
