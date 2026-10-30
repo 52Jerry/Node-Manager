@@ -1,4 +1,6 @@
 """Authenticated async user AND route mutations over the runtime writer."""
+from __future__ import annotations
+
 from datetime import datetime, timedelta, timezone
 from typing import Annotated, Literal, Union
 
@@ -86,7 +88,8 @@ def compile_command(command):
         def direct(data, registry):
             if not manager._user_exists(data, registry, command.userId):
                 raise manager.SingboxConfigError("user not found")
-            manager._set_direct_binding(data, registry, command.userId)
+            manager._set_direct_binding(data, registry, command.userId, replace_existing=True)
+            manager._audit("user.proxy.unbind", command.userId)
             return {"success": True, "userId": command.userId, "route": "direct"}
         return direct
     if isinstance(command, Credentials):

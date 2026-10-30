@@ -17,6 +17,9 @@ security:
   token: CHANGE_ME
 
 singbox:
+  # Enable only after installing the NiuSu runtime binary and its private socket.
+  runtime_socket: ""
+  binary: "sing-box"
   config: ./singbox/config.json
   api_port: 9090
   api_secret: ""

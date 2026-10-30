@@ -308,7 +308,7 @@ class WireguardRouteConfigTests(unittest.TestCase):
         self.assertIn('--on-port 61038', batch)
 
     def test_generation_firewall_rejects_unknown_or_duplicate_ports(self):
-        for ports in ([61037, 61037], [61037, 5001], [61037, 61045]):
+        for ports in ([61037, 61037], [61037, 5001], [61037, hotload.PORT_LIMIT]):
             with self.subTest(ports=ports), self.assertRaises(RuntimeError):
                 routes._hotload_prerouting_rules([], {
                     'activePort': ports[-1], 'generations': [{'port': port} for port in ports]})

@@ -1,4 +1,6 @@
 """Bound request buffering before FastAPI/Pydantic decode on mutation routes."""
+from __future__ import annotations
+
 import asyncio
 from fastapi.responses import JSONResponse
 

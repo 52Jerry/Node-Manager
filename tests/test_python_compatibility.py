@@ -11,6 +11,8 @@ class PythonCompatibilityTests(unittest.TestCase):
     def test_runtime_modules_postpone_annotation_evaluation(self):
         missing = []
         for source_path in APP_ROOT.rglob("*.py"):
+            if "tests" in source_path.relative_to(APP_ROOT).parts:
+                continue
             module = ast.parse(source_path.read_text(encoding="utf-8"))
             has_future_annotations = any(
                 isinstance(statement, ast.ImportFrom)

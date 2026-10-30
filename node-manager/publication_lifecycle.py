@@ -1,4 +1,6 @@
 """Serialize publication maintenance with the existing Node Manager config lock."""
+from __future__ import annotations
+
 import fcntl
 import json
 import pathlib

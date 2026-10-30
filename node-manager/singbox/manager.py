@@ -2569,14 +2569,26 @@ def _validate_proxy_does_not_loop_to_local_socks(
         )
 
 
-def _set_direct_binding(data: dict[str, Any], registry: dict[str, Any], user_id: str) -> None:
+def _set_direct_binding(
+    data: dict[str, Any], registry: dict[str, Any], user_id: str, *, replace_existing: bool = False
+) -> None:
     outbound_tag = f"{USER_OUTBOUND_PREFIX}{user_id}"
     data.setdefault("outbounds", [])
+    # Repairing a missing route must preserve an existing residential proxy.
+    # An explicit direct task must replace it, otherwise a successful task
+    # leaves both the effective route and its residential metadata unchanged.
+    if replace_existing:
+        data["outbounds"] = [item for item in data["outbounds"] if item.get("tag") != outbound_tag]
+        item = _registry_user(registry, user_id)
+        for field in ("sourceIp", "sourceAddress", "sourcePort", "countryCode", "countryName", "provinceName", "cityName"):
+            item.pop(field, None)
     if not any(item.get("tag") == outbound_tag for item in data["outbounds"]):
         data["outbounds"].append({"type": "direct", "tag": outbound_tag})
 
     route = data.setdefault("route", {})
     rules = route.setdefault("rules", [])
+    if replace_existing:
+        rules[:] = [rule for rule in rules if rule.get("outbound") != outbound_tag]
     if not any(rule.get("outbound") == outbound_tag for rule in rules):
         insert_at = _after_managed_enforcement_rules(
             rules, _registry_user(registry, user_id)

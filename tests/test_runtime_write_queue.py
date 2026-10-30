@@ -240,6 +240,47 @@ class RuntimeQueueTests(unittest.TestCase):
         socks = manager.read_config()["inbounds"][2]["users"]
         self.assertEqual(socks, [{"username": "rotated-name", "password": "rotated-password"}])
 
+    def test_direct_task_replaces_existing_proxy_and_keeps_other_user_and_access_policy(self):
+        writer = self.writer()
+        client = TestClient(main.app)
+        headers = {"Authorization": "Bearer test-token"}
+        commands = [
+            {"action": "create", "user": {"userId": "direct-target", "protocols": ["socks"], "proxy": {
+                "server": "198.51.100.10", "port": 1080, "username": "upstream", "password": "fixture",
+                "sourceIp": "198.51.100.20", "countryCode": "US"}}},
+            {"action": "create", "user": {"userId": "keep-proxy", "protocols": ["socks"], "proxy": {
+                "server": "198.51.100.11", "port": 1080, "username": "other", "password": "other"}}},
+            {"action": "access", "userId": "direct-target", "enabled": False},
+            {"action": "direct", "userId": "direct-target"},
+        ]
+        with patch.object(queue, "start", return_value=writer):
+            for index, command in enumerate(commands):
+                response = client.post("/api/singbox/tasks", json={"commands": [command]},
+                                       headers={**headers, "Idempotency-Key": "proxy-direct-" + str(index)})
+                self.assertEqual(response.status_code, 202, response.text)
+                task = response.json()["taskId"]
+                writer.wait(task, 10)
+                self.assertEqual(writer.status(task)["state"], "SUCCEEDED")
+        data = manager.read_config()
+        target_tag = manager.USER_OUTBOUND_PREFIX + "direct-target"
+        self.assertEqual([o for o in data["outbounds"] if o.get("tag") == target_tag],
+                         [{"type": "direct", "tag": target_tag}])
+        self.assertEqual(next(o for o in data["outbounds"] if o.get("tag") == manager.USER_OUTBOUND_PREFIX + "keep-proxy")["type"], "socks")
+        self.assertEqual(len([r for r in data["route"]["rules"] if r.get("outbound") == target_tag]), 1)
+        metadata = manager.read_registry()["users"]["direct-target"]
+        self.assertIs(metadata["accessEnabled"], False)
+        self.assertNotIn("sourceIp", metadata)
+        self.assertNotIn("sourceAddress", metadata)
+        self.assertTrue(any(r.get("action") == "reject" for r in data["route"]["rules"]))
+
+    def test_missing_route_repair_preserves_existing_proxy(self):
+        data = {"inbounds": [], "outbounds": [{"type": "socks", "tag": manager.USER_OUTBOUND_PREFIX + "repair", "server": "198.51.100.1", "server_port": 1080}], "route": {"rules": []}}
+        registry = {"users": {"repair": {"socksUsername": "repair", "sourceIp": "198.51.100.2"}}}
+        manager._set_direct_binding(data, registry, "repair")
+        self.assertEqual(data["outbounds"][0]["type"], "socks")
+        self.assertEqual(registry["users"]["repair"]["sourceIp"], "198.51.100.2")
+        self.assertEqual(data["route"]["rules"][0]["outbound"], manager.USER_OUTBOUND_PREFIX + "repair")
+
     def test_http_async_create_route_delete_and_version_tombstone(self):
         writer = self.writer()
         client = TestClient(main.app)
