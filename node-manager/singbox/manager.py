@@ -15,9 +15,11 @@ import threading
 import uuid
 from contextlib import contextmanager
 from contextvars import ContextVar
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Callable
+from types import MappingProxyType
+from typing import Any, Callable, Mapping
 
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey
@@ -35,7 +37,7 @@ from protocols import (
     trojan,
 )
 from .api import SingboxAPI
-from .connection_snapshot import ConnectionSnapshotCache
+from .connection_snapshot import ConnectionSnapshot, ConnectionSnapshotCache
 from .errors import SingboxConfigError
 
 try:
@@ -81,7 +83,7 @@ def without_restart():
 
 
 CONFIG_PATH = Path(config.singbox.config)
-LOCK_PATH = Path("/run/lock/node-manager-singbox.lock")
+LOCK_PATH = Path(os.environ.get("NODE_MANAGER_CONFIG_LOCK", "/run/lock/node-manager-singbox.lock"))
 REGISTRY_PATH = Path(os.environ.get("NODE_MANAGER_USER_REGISTRY", "/var/lib/node-manager/users.json"))
 USER_PREFIX = "node-manager:"
 USER_OUTBOUND_PREFIX = "node-manager-out:"
@@ -104,6 +106,8 @@ _connection_snapshot_cache = ConnectionSnapshotCache()
 _connection_snapshot_cache_lock = threading.Lock()
 thread_lock = threading.Lock()
 _enforcement_noop_cache: tuple | None = None
+_monitoring_snapshot_lock = threading.Lock()
+_monitoring_snapshot: MonitoringSnapshot | None = None
 
 
 def _audit(action: str, user_id: str, **fields: Any) -> None:
@@ -369,6 +373,10 @@ def get_user_policy(user_id: str) -> dict[str, int | None]:
 def get_user_policies() -> dict[str, dict[str, int | None]]:
     with _config_read_lock():
         registry = read_registry()
+    return _user_policies_from_registry(registry)
+
+
+def _user_policies_from_registry(registry: dict[str, Any]) -> dict[str, dict[str, int | None]]:
     return {
         user_id: {
             "trafficLimitBytes": _positive_policy_value(item.get("trafficLimitBytes")),
@@ -385,18 +393,16 @@ def get_user_auth_map() -> dict[str, str]:
     with _config_read_lock():
         data = read_config()
         registry = read_registry()
+    return _user_auth_map_from_pair(data, registry)
 
-    configured_auth_names = {
-        str(value)
-        for inbound in data.get("inbounds", [])
-        if isinstance(inbound, dict)
-        for user in inbound.get("users", [])
-        if isinstance(user, dict)
-        for value in (user.get("name"), user.get("username"))
-        if value
-    }
+
+def _user_auth_map_from_pair(data: dict[str, Any], registry: dict[str, Any],
+                             user_ids: set[str] | None = None,
+                             configured_auth_names: set[str] | None = None) -> dict[str, str]:
+    if configured_auth_names is None:
+        configured_auth_names = _configured_auth_names(data)
     result: dict[str, str] = {}
-    for user_id in _discover_user_ids(data, registry):
+    for user_id in _discover_user_ids(data, registry) if user_ids is None else user_ids:
         auth_names = {
             _auth_name(user_id),
             _public_socks_username(registry, user_id),
@@ -407,6 +413,161 @@ def get_user_auth_map() -> dict[str, str]:
             if auth_name:
                 result[str(auth_name)] = user_id
     return result
+
+
+@dataclass(frozen=True)
+class _EnforcementState:
+    traffic_blocked: bool
+    source_cidrs: tuple[str, ...]
+    auth_users: tuple[str, ...]
+    desired_auth_users: tuple[str, ...]
+    configured: bool
+
+
+@dataclass(frozen=True)
+class MonitoringSnapshot:
+    """Small immutable identity/policy projection of one coherent file pair.
+
+    This is not an authorization result or a mutable accounting baseline. The
+    version identifies disk files, not an independently queried core revision.
+    Staged transaction readers receive an uncached projection with version=None.
+    """
+
+    policies: Mapping[str, Mapping[str, int | None]]
+    auth_map: Mapping[str, str]
+    version: tuple | None
+    registry_user_count: int
+    discovered_user_count: int
+    listed_user_count: int
+    socks_port: int | None
+    enforcement_states: Mapping[str, _EnforcementState]
+
+
+def _monitoring_file_versions() -> tuple:
+    return (ConnectionSnapshotCache._version(CONFIG_PATH),
+            ConnectionSnapshotCache._version(REGISTRY_PATH, optional=True))
+
+
+def _monitoring_transaction_pending() -> bool:
+    import revision
+    from runtime_publication import paths
+    return paths()[0].exists() or revision.JOURNAL_PATH.exists()
+
+
+def _make_monitoring_snapshot(data: dict, registry: dict, version: tuple | None) -> MonitoringSnapshot:
+    policies = _user_policies_from_registry(registry)
+    user_ids = _discover_user_ids(data, registry)
+    auth_names = _configured_auth_names(data)
+    enforcement_states = {
+        user_id: _enforcement_state(user_id, metadata, registry, auth_names)
+        for user_id, metadata in registry.get("users", {}).items() if isinstance(metadata, dict)}
+    return MonitoringSnapshot(
+        MappingProxyType({user_id: MappingProxyType(policy) for user_id, policy in policies.items()}),
+        MappingProxyType(_user_auth_map_from_pair(data, registry, user_ids, auth_names)), version,
+        len(registry.get("users", {})), len(user_ids), _listed_user_count(data, registry),
+        _socks_inbound_port_from_config(data), MappingProxyType(enforcement_states))
+
+
+def _listed_user_count(data: dict, registry: dict) -> int:
+    # Match list_users' managed-protocol identities without enriching every
+    # user with outbounds, expiration, credentials, and display fields.
+    socks_to_user = {str(item.get("socksUsername")): user_id
+                     for user_id, item in registry.get("users", {}).items()
+                     if isinstance(item, dict) and item.get("socksUsername")}
+    fields = {config.singbox.vless_tag: "name", config.singbox.vmess_tag: "name",
+              config.singbox.trojan_tag: "name", config.singbox.socks_tag: "username"}
+    result = set()
+    for inbound in data.get("inbounds", []):
+        field = fields.get(inbound.get("tag"))
+        if field is None:
+            continue
+        for user in inbound.get("users", []):
+            value = user.get(field)
+            user_id = _extract_user_id(value)
+            if field == "username" and value in socks_to_user:
+                user_id = socks_to_user[value]
+            if user_id:
+                result.add(user_id)
+    return len(result)
+
+
+def _invalidate_monitoring_snapshot() -> None:
+    global _monitoring_snapshot
+    with _monitoring_snapshot_lock:
+        _monitoring_snapshot = None
+
+
+def _current_monitoring_snapshot() -> MonitoringSnapshot | None:
+    # Never hold this small cache lock while waiting for the config lock. A
+    # writer may invalidate the projection while it owns that config lock.
+    with _monitoring_snapshot_lock:
+        snapshot = _monitoring_snapshot
+        if snapshot is None or _monitoring_transaction_pending():
+            return None
+        version = _monitoring_file_versions()
+        if (snapshot.version == version and version == _monitoring_file_versions()
+                and not _monitoring_transaction_pending()):
+            return snapshot
+    return None
+
+
+def _prime_monitoring_snapshot(data: dict, registry: dict, expected_version: tuple) -> None:
+    """Reuse a writer's already decoded, unchanged committed input pair.
+
+    Called before mutating the copies. No desired or partially published state
+    enters the global cache. Cache bookkeeping cannot fail a valid publication.
+    """
+    global _monitoring_snapshot
+    try:
+        with _monitoring_snapshot_lock:
+            if _monitoring_transaction_pending() or expected_version != _monitoring_file_versions():
+                return
+            if _monitoring_snapshot is not None and _monitoring_snapshot.version == expected_version:
+                return
+            snapshot = _make_monitoring_snapshot(data, registry, expected_version)
+            if expected_version == _monitoring_file_versions() and not _monitoring_transaction_pending():
+                _monitoring_snapshot = snapshot
+    except (OSError, ValueError, TypeError, KeyError):
+        _invalidate_monitoring_snapshot()
+
+
+def get_user_monitoring_snapshot() -> MonitoringSnapshot:
+    """Return paired policies/auth identities without re-decoding unchanged files.
+
+    Unchanged committed files remain readable during native target preview.
+    Changed files, a pending WAL, or a cold cache require the existing shared
+    config lock; recovery uncertainty is never bypassed with a stale identity.
+    """
+    global _monitoring_snapshot
+    workspace = _mutation_workspace.get()
+    if workspace is not None:
+        return _make_monitoring_snapshot(*workspace, None)
+    if _config_lock_depth.get():
+        # Reentrant readers may have staged read_* overrides. Do not publish
+        # their dictionaries into a process-wide committed-state cache.
+        return _make_monitoring_snapshot(read_config(), read_registry(), None)
+    try:
+        snapshot = _current_monitoring_snapshot()
+        if snapshot is not None:
+            return snapshot
+        with _config_read_lock(), _monitoring_snapshot_lock:
+            from revision_transaction import assert_no_pending_transaction
+            assert_no_pending_transaction()
+            for _ in range(3):
+                version = _monitoring_file_versions()
+                if (_monitoring_snapshot is not None and _monitoring_snapshot.version == version
+                        and version == _monitoring_file_versions()):
+                    return _monitoring_snapshot
+                data, registry = read_config(), read_registry()
+                snapshot = _make_monitoring_snapshot(data, registry, version)
+                if version == _monitoring_file_versions():
+                    assert_no_pending_transaction()
+                    _monitoring_snapshot = snapshot
+                    return snapshot
+            raise SingboxConfigError("configuration changed during monitoring snapshot read")
+    except Exception:
+        _invalidate_monitoring_snapshot()
+        raise
 
 
 def _positive_policy_value(value: Any) -> int | None:
@@ -427,7 +588,7 @@ def check_config(config_path: str | Path) -> tuple[bool, str]:
 
 def is_singbox_running() -> bool:
     try:
-        result = _run(["systemctl", "is-active", "sing-box"])
+        result = _run(["systemctl", "is-active", config.singbox.service])
         return result.stdout.strip() == "active"
     except (FileNotFoundError, subprocess.TimeoutExpired):
         return False
@@ -465,9 +626,9 @@ def reload_singbox(restart_if_reload_fails: bool = False) -> bool:
         except (OSError, ValueError, RuntimeError, subprocess.TimeoutExpired):
             logger.warning("VLESS publication failed; preserving existing generations")
             return False
-    commands = [["systemctl", "reload", "sing-box"]]
+    commands = [["systemctl", "reload", config.singbox.service]]
     if restart_if_reload_fails and _restart_allowed.get():
-        commands.append(["systemctl", "restart", "sing-box"])
+        commands.append(["systemctl", "restart", config.singbox.service])
     for command in commands:
         try:
             result = _run(command)
@@ -486,11 +647,17 @@ def is_api_available() -> bool:
 def get_socks_inbound_port() -> int | None:
     """Return the public SOCKS inbound port from the active sing-box config."""
     try:
-        data = read_config()
+        return _socks_inbound_port_from_config(read_config())
+    except (OSError, TypeError, ValueError, SingboxConfigError):
+        return None
+
+
+def _socks_inbound_port_from_config(data: dict) -> int | None:
+    try:
         inbound = _find_inbound(data, config.singbox.socks_tag)
         port = int(inbound.get("listen_port"))
         return port if 1 <= port <= 65535 else None
-    except (OSError, TypeError, ValueError, SingboxConfigError):
+    except (TypeError, ValueError, SingboxConfigError):
         return None
 
 
@@ -645,8 +812,14 @@ def _mutate_config_direct(mutator: Callable[[dict[str, Any], dict[str, Any]], An
             raise SingboxConfigError("active native writer refuses publication mode changes")
         from revision_transaction import assert_no_pending_transaction
         assert_no_pending_transaction()
+        try:
+            monitoring_version = _monitoring_file_versions()
+        except OSError:
+            monitoring_version = None
         current = read_config()
         registry = read_registry()
+        if monitoring_version is not None:
+            _prime_monitoring_snapshot(current, registry, monitoring_version)
         updated = copy.deepcopy(current)
         updated_registry = copy.deepcopy(registry)
         baseline_token = _mutation_baseline.set(current)
@@ -2208,6 +2381,48 @@ def _remove_managed_enforcement_rules(
     rules[:] = remaining
 
 
+def _configured_auth_names(data: dict[str, Any]) -> set[str]:
+    return {str(value) for inbound in data.get("inbounds", []) if isinstance(inbound, dict)
+            for user in inbound.get("users", []) if isinstance(user, dict)
+            for value in (user.get("name"), user.get("username")) if value}
+
+
+def _enforcement_state(user_id: str, metadata: dict, registry: dict,
+                       existing_auth_names: set[str]) -> _EnforcementState:
+    raw_auth = metadata.get(ENFORCEMENT_AUTH_USERS_KEY)
+    auth_users = tuple(sorted(str(value) for value in raw_auth if value)) if isinstance(raw_auth, list) else ()
+    raw_sources = metadata.get(ENFORCEMENT_SOURCE_CIDRS_KEY)
+    source_cidrs = tuple(sorted(str(value) for value in raw_sources if value)) if isinstance(raw_sources, list) else ()
+    desired_auth = {_auth_name(user_id), _public_socks_username(registry, user_id)}
+    if user_id in existing_auth_names:
+        desired_auth.add(user_id)
+    return _EnforcementState(metadata.get(ENFORCEMENT_TRAFFIC_KEY) is True,
+        source_cidrs, auth_users, tuple(sorted(value for value in desired_auth if value)),
+        bool(existing_auth_names.intersection(_user_auth_names(registry, user_id))))
+
+
+def _desired_enforcement(value: dict, persist_source_blocks: bool) -> tuple[bool, list[str]]:
+    source_cidrs = sorted({cidr for source in value.get("blockedSourceIps") or []
+                          if (cidr := _source_ip_cidr(str(source))) is not None})
+    return bool(value.get("trafficBlocked")), source_cidrs if persist_source_blocks else []
+
+
+def _enforcement_satisfied(state: _EnforcementState | None, traffic_blocked: bool,
+                           source_cidrs: list[str]) -> bool:
+    # These are the same skip conditions used by the authoritative mutator.
+    # Inactive/missing configured identities are ignored, rather than acquiring
+    # new credentials or changing ownership from a telemetry request.
+    if state is None:
+        return True
+    has_enforcement = traffic_blocked or bool(source_cidrs) or state.traffic_blocked or bool(state.source_cidrs)
+    if not has_enforcement and not state.auth_users:
+        return True
+    if not state.configured:
+        return True
+    return (state.traffic_blocked == traffic_blocked and state.source_cidrs == tuple(source_cidrs)
+            and state.auth_users == (state.desired_auth_users if traffic_blocked or source_cidrs else ()))
+
+
 def sync_user_enforcements(
     enforcements: dict[str, dict[str, Any]],
     *,
@@ -2222,6 +2437,23 @@ def sync_user_enforcements(
     CIDRs to the static config would repeatedly reload sing-box.
     """
 
+    committed_reader = (_mutation_workspace.get() is None and not _mutation_capture.get()
+                        and not _config_lock_depth.get())
+    if committed_reader and not persist_source_blocks:
+        if not enforcements:
+            return False
+        # Nonblocking submission does not execute the tail below after
+        # TaskPending. Check the actual committed outcome instead of waiting
+        # for that tail to populate a cache, or enqueueing another no-op task
+        # every time PendingEnforcement observes its previous task succeed.
+        snapshot = get_user_monitoring_snapshot()
+        if (all(_enforcement_satisfied(snapshot.enforcement_states.get(user_id),
+                                       *_desired_enforcement(value, False))
+                for user_id, value in enforcements.items())
+                and snapshot.version == _monitoring_file_versions()
+                and not _monitoring_transaction_pending()):
+            return False
+
     # The collector submits the same 4k+ decisions on every sample. A verified
     # no-op needs no durable write task until the desired state or either file
     # changes. Keep the file versions in the key so external edits invalidate it.
@@ -2233,80 +2465,34 @@ def sync_user_enforcements(
     ], ensure_ascii=False, separators=(",", ":")).encode()).digest()
     def versions() -> tuple | None:
         try:
-            return tuple((str(path), stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns)
-                         for path in (CONFIG_PATH, REGISTRY_PATH) for stat in (path.stat(),))
-        except FileNotFoundError:
+            return _monitoring_file_versions()
+        except OSError:
             return None
     before = versions()
     cache_key = (persist_source_blocks, desired, before)
-    if before is not None and _enforcement_noop_cache == cache_key:
+    if (committed_reader and before is not None and _enforcement_noop_cache == cache_key
+            and before == versions() and not _monitoring_transaction_pending()):
         return False
 
     def apply(data: dict[str, Any], registry: dict[str, Any]) -> bool:
         changed = False
         rules = data.setdefault("route", {}).setdefault("rules", [])
         registry_users = registry.setdefault("users", {})
-        existing_auth_names = {
-            str(value)
-            for inbound in data.get("inbounds", [])
-            if isinstance(inbound, dict)
-            for user in inbound.get("users", [])
-            if isinstance(user, dict)
-            for value in (user.get("name"), user.get("username"))
-            if value
-        }
-        legacy_user_ids = {
-            str(value)
-            for value in existing_auth_names
-            if value in registry_users
-        }
+        existing_auth_names = _configured_auth_names(data)
 
         for user_id, desired in enforcements.items():
             metadata = registry_users.get(user_id)
             if not isinstance(metadata, dict):
                 continue
 
-            traffic_blocked = bool(desired.get("trafficBlocked"))
-            source_cidrs = sorted(
-                {
-                    cidr
-                    for source_ip in desired.get("blockedSourceIps") or []
-                    if (cidr := _source_ip_cidr(str(source_ip))) is not None
-                }
-            )
-            if not persist_source_blocks:
-                source_cidrs = []
-            raw_current_auth_users = metadata.get(ENFORCEMENT_AUTH_USERS_KEY)
-            current_auth_users = sorted(
-                str(value) for value in raw_current_auth_users if value
-            ) if isinstance(raw_current_auth_users, list) else []
-            raw_current_source_cidrs = metadata.get(ENFORCEMENT_SOURCE_CIDRS_KEY)
-            current_source_cidrs = sorted(
-                str(value) for value in raw_current_source_cidrs if value
-            ) if isinstance(raw_current_source_cidrs, list) else []
-            current_traffic_blocked = metadata.get(ENFORCEMENT_TRAFFIC_KEY) is True
-            has_enforcement = traffic_blocked or bool(source_cidrs) or current_traffic_blocked or bool(current_source_cidrs)
-            if not has_enforcement and not current_auth_users:
-                continue
-
-            desired_auth_users = {
-                _auth_name(user_id),
-                _public_socks_username(registry, user_id),
-            }
-            if user_id in legacy_user_ids:
-                desired_auth_users.add(user_id)
-            desired_auth_users = sorted(value for value in desired_auth_users if value)
-            if not existing_auth_names.intersection(_user_auth_names(registry, user_id)):
-                continue
-            if (
-                current_traffic_blocked == traffic_blocked
-                and current_source_cidrs == source_cidrs
-                and current_auth_users == (desired_auth_users if traffic_blocked or source_cidrs else [])
-            ):
+            traffic_blocked, source_cidrs = _desired_enforcement(desired, persist_source_blocks)
+            state = _enforcement_state(user_id, metadata, registry, existing_auth_names)
+            if _enforcement_satisfied(state, traffic_blocked, source_cidrs):
                 # The collector evaluates every registered user on every pass.
                 # Avoid copying and rescanning the full sing-box route list when
                 # this user's persisted enforcement state is already current.
                 continue
+            desired_auth_users = list(state.desired_auth_users)
 
             before_rules = copy.deepcopy(rules)
             before_metadata = copy.deepcopy(metadata)
@@ -2362,7 +2548,8 @@ def sync_user_enforcements(
 
     changed = mutate_config(apply)
     after = versions()
-    _enforcement_noop_cache = cache_key if not changed and before is not None and before == after else None
+    _enforcement_noop_cache = cache_key if (committed_reader and not changed
+        and before is not None and before == after) else None
     return changed
 
 
@@ -3051,12 +3238,25 @@ def list_users() -> list[dict[str, Any]]:
     return sorted(result, key=lambda item: item["userId"].lower())
 
 
-def get_user_connection(user_id: str, inspect_suspended: bool = False) -> dict[str, Any]:
+def _read_user_snapshot():
+    """Reuse unchanged file versions; reload a changed pair under the read lock."""
+    workspace = _mutation_workspace.get()
+    if workspace is not None:
+        return ConnectionSnapshot(*workspace)
+    if _config_lock_depth.get():
+        # Reentrant transaction readers may use staged read_* overrides. Never
+        # return or publish a process-wide disk snapshot from that context.
+        return ConnectionSnapshot(read_config(), read_registry())
     with _connection_snapshot_cache_lock:
         snapshot = _connection_snapshot_cache.current(CONFIG_PATH, REGISTRY_PATH, read_config, read_registry)
     if snapshot is None:
         with _config_read_lock(), _connection_snapshot_cache_lock:
             snapshot = _connection_snapshot_cache.get(CONFIG_PATH, REGISTRY_PATH, read_config, read_registry)
+    return snapshot
+
+
+def get_user_connection(user_id: str, inspect_suspended: bool = False) -> dict[str, Any]:
+    snapshot = _read_user_snapshot()
     data, registry = snapshot.data, snapshot.registry
 
     metadata = _registry_user(registry, user_id)
@@ -3189,9 +3389,8 @@ def get_user_connection(user_id: str, inspect_suspended: bool = False) -> dict[s
 
 
 def get_user_proxy(user_id: str) -> dict[str, Any]:
-    with _config_lock():
-        data = read_config()
-        registry = read_registry()
+    snapshot = _read_user_snapshot()
+    data, registry = snapshot.data, snapshot.registry
 
     if not _user_exists(data, registry, user_id):
         raise SingboxConfigError(f"user not found: {user_id}")

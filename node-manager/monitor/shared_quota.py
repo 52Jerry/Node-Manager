@@ -8,6 +8,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import threading
 from datetime import datetime, timezone
 from typing import Any
 
@@ -16,6 +17,10 @@ RESET_VERSION_KEY = "sharedQuotaResetVersion"
 MAX_BYTES = 2**63 - 1
 ORIGINS_KEY = "replicatedTrafficOrigins"
 ACCOUNTING_VERSION_KEY = "nativeAccountingVersion"
+
+# Inspection was previously serialized by collection_lock. Preserve that
+# memory bound without retaining any lock required by collectors or writers.
+_inspection_lock = threading.Lock()
 
 
 class QuotaEvidenceRejected(ValueError):
@@ -219,37 +224,80 @@ def _rows() -> dict[str, Any]:
     return {row["userId"]: row for row in snapshot["users"]}
 
 
-def inspect_users(user_ids: list[str] | None = None) -> dict[str, Any]:
-    from config import config
+def _identity_versions() -> tuple:
+    """Fence fresh config/registry reads, including external atomic replacements."""
+    from pathlib import Path
+    from singbox import manager
+    versions = []
+    for source, required in ((manager.CONFIG_PATH, True), (manager.REGISTRY_PATH, False)):
+        path = Path(source)
+        try:
+            stat = path.stat()
+        except FileNotFoundError:
+            if required:
+                raise QuotaEvidenceRejected("NODE_IDENTITY_UNAVAILABLE") from None
+            versions.append((str(path.resolve()), None))
+            continue
+        except OSError:
+            raise QuotaEvidenceRejected("NODE_IDENTITY_UNAVAILABLE") from None
+        versions.append((str(path.resolve()), stat.st_dev, stat.st_ino, stat.st_size,
+                         stat.st_mtime_ns, stat.st_ctime_ns))
+    return tuple(versions)
+
+
+def _inspection_snapshot():
     from monitor import traffic
-    now = datetime.now(timezone.utc).isoformat()
+    # Identity reads may wait behind a runtime publication. Never retain the
+    # collector/traffic locks during that wait or the pure identity projection.
+    for _ in range(3):
+        before = _identity_versions()
+        rows = _rows()
+        version = _identity_versions()
+        if before != version:
+            continue
+        with traffic.collection_lock:
+            with traffic.traffic_lock:
+                if _identity_versions() != version:
+                    continue
+                store = traffic._read_store()
+                if _identity_versions() != version:
+                    continue
+                observed_at = datetime.now(timezone.utc).isoformat()
+        return rows, store, observed_at
+    raise QuotaEvidenceRejected("NODE_IDENTITY_CHANGED")
+
+
+def inspect_users(user_ids: list[str] | None = None) -> dict[str, Any]:
+    with _inspection_lock:
+        return _inspect_users(user_ids)
+
+
+def _inspect_users(user_ids: list[str] | None) -> dict[str, Any]:
+    from config import config
     # Read one stable counter and configuration projection without collecting or writing.
-    with traffic.collection_lock:
-        with traffic.traffic_lock:
-            store = traffic._read_store()
-            rows = _rows()
-            result = []; issues = []
-            for uid in (user_ids if user_ids is not None else sorted(rows)):
-                row = rows.get(uid)
-                if row is None:
-                    raise QuotaEvidenceRejected("USER_NOT_FOUND")
-                user = store["users"].get(uid, {})
-                if not native_accounting_proven(user):
-                    issues.append({"userId": uid, "reason": "LEGACY_REPLICATED_TRAFFIC_REVIEW_REQUIRED"})
-                    continue
-                count = int(user.get("upload") or 0) + int(user.get("download") or 0)
-                try:
-                    digest = identity_digest(row)
-                except QuotaEvidenceRejected as error:
-                    issues.append({"userId": uid, "reason": str(error)})
-                    continue
-                result.append({"userId": uid, "identityDigest": digest,
-                               "limitBytes": row.get("trafficLimitBytes"),
-                               "nativeTotalBytes": count, "epoch": epoch(user),
-                               "epochToken": epoch_token(epoch(user)),
-                               "peerObservedBytes": peer_used_bytes(user, row.get("trafficLimitBytes")),
-                               "peerEvidenceCount": len(user.get(EVIDENCE_KEY, {}))})
-    return {"nodeId": str(config.node.id), "observedAt": now, "users": result, "issues": issues}
+    rows, store, observed_at = _inspection_snapshot()
+    result = []; issues = []
+    for uid in (user_ids if user_ids is not None else sorted(rows)):
+        row = rows.get(uid)
+        if row is None:
+            raise QuotaEvidenceRejected("USER_NOT_FOUND")
+        user = store["users"].get(uid, {})
+        if not native_accounting_proven(user):
+            issues.append({"userId": uid, "reason": "LEGACY_REPLICATED_TRAFFIC_REVIEW_REQUIRED"})
+            continue
+        count = int(user.get("upload") or 0) + int(user.get("download") or 0)
+        try:
+            digest = identity_digest(row)
+        except QuotaEvidenceRejected as error:
+            issues.append({"userId": uid, "reason": str(error)})
+            continue
+        result.append({"userId": uid, "identityDigest": digest,
+                       "limitBytes": row.get("trafficLimitBytes"),
+                       "nativeTotalBytes": count, "epoch": epoch(user),
+                       "epochToken": epoch_token(epoch(user)),
+                       "peerObservedBytes": peer_used_bytes(user, row.get("trafficLimitBytes")),
+                       "peerEvidenceCount": len(user.get(EVIDENCE_KEY, {}))})
+    return {"nodeId": str(config.node.id), "observedAt": observed_at, "users": result, "issues": issues}
 
 
 def apply_observation(store: dict[str, Any], rows: dict[str, Any], local_node: str,

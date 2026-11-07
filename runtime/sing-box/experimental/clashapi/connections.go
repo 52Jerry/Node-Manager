@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/sagernet/sing-box/adapter"
+	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/experimental/clashapi/trafficontrol"
 	"github.com/sagernet/sing/common/json"
 	"github.com/sagernet/ws"
@@ -85,12 +86,8 @@ func getConnections(ctx context.Context, trafficManager *trafficontrol.Manager) 
 func closeConnection(trafficManager *trafficontrol.Manager) func(w http.ResponseWriter, r *http.Request) {
 	return func(w http.ResponseWriter, r *http.Request) {
 		id := uuid.FromStringOrNil(chi.URLParam(r, "id"))
-		snapshot := trafficManager.Snapshot()
-		for _, c := range snapshot.Connections {
-			if id == c.Metadata().ID {
-				c.Close()
-				break
-			}
+		if c := trafficManager.Connection(id); c != nil && c.Metadata().OutboundType != C.TypeDNS {
+			c.Close()
 		}
 		render.NoContent(w, r)
 	}

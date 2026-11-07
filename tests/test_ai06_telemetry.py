@@ -8,6 +8,7 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from test_next_stage import traffic
@@ -61,6 +62,9 @@ class CollectionFailureTest(unittest.TestCase):
         self.patches = [patch.object(traffic, "TRAFFIC_PATH", self.path),
                         patch.object(traffic, "get_user_policies", return_value={}),
                         patch.object(traffic, "get_user_auth_map", return_value={}),
+                        patch.object(traffic, "get_user_monitoring_snapshot",
+                            side_effect=lambda: SimpleNamespace(policies=traffic.get_user_policies(),
+                                                                auth_map=traffic.get_user_auth_map())),
                         patch.object(traffic, "sync_user_enforcements")]
         for item in self.patches:
             item.start()

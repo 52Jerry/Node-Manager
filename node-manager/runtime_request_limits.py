@@ -14,7 +14,7 @@ class RuntimeRequestLimits:
     async def __call__(self, scope, receive, send):
         path = scope.get("path", "")
         mutation = scope.get("method") in {"POST", "PUT", "PATCH", "DELETE"}
-        guarded = path.startswith(("/api/singbox/tasks", "/api/user/", "/api/users/replication"))
+        guarded = path.startswith(("/api/singbox/tasks", "/api/user/", "/api/users/replication", "/api/agent/operation-receipt"))
         if scope["type"] != "http" or not mutation or not guarded:
             return await self.app(scope, receive, send)
         # ASGI execution increments this before the first await, on one loop.

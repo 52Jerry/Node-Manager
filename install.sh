@@ -174,6 +174,12 @@ fi
 # 页面一键安装会传入 Control Plane 地址和短时一次性安装码。
 # 只传地址时仍可隐藏输入长期注册令牌，环境变量方式也继续兼容。
 [ "$#" -le 2 ] || fail "usage: bash install.sh [CONTROL_PLANE_URL] [ONE_TIME_INSTALL_TOKEN]"
+NODE_MANAGER_BIND_ADDRESS="${NODE_MANAGER_BIND_ADDRESS:-127.0.0.1}"
+NODE_MANAGER_ALLOWED_CIDRS="${NODE_MANAGER_ALLOWED_CIDRS:-}"
+if [ "$#" -ge 1 ] && [ -z "${NODE_MANAGER_PUBLIC_URL:-}" ]; then
+  fail "set NODE_MANAGER_PUBLIC_URL to an HTTPS endpoint or private tunnel IP before registering; public HTTP is not permitted"
+fi
+NODE_MANAGER_PUBLIC_URL="${NODE_MANAGER_PUBLIC_URL:-http://127.0.0.1:8088}"
 if [ "$#" -ge 1 ]; then
   CONTROL_PLANE_URL="${1%/}"
   case "$CONTROL_PLANE_URL" in
@@ -192,6 +198,44 @@ if [ "$#" -ge 1 ]; then
     [ -n "$CONTROL_PLANE_REGISTRATION_TOKEN" ] || fail "registration token cannot be empty"
   fi
 fi
+
+export NODE_MANAGER_PUBLIC_URL NODE_MANAGER_BIND_ADDRESS NODE_MANAGER_ALLOWED_CIDRS
+export CONTROL_PLANE_URL="${CONTROL_PLANE_URL:-}"
+# Validate management transport before source download or host changes.
+command -v python3 >/dev/null 2>&1 || fail "python3 is required for management transport preflight"
+python3 - <<'PY' || fail "management transport configuration is not safe"
+import ipaddress, os
+import sys
+if sys.version_info < (3,10): raise SystemExit('Python 3.10 or newer is required')
+from urllib.parse import urlsplit
+private = [ipaddress.ip_network(x) for x in ('127.0.0.0/8','10.0.0.0/8','172.16.0.0/12','192.168.0.0/16','100.64.0.0/10','::1/128','fc00::/7')]
+def trusted(host):
+    if host == 'localhost': return True
+    try:
+        value=ipaddress.ip_address(host)
+        return any(value.version==network.version and value in network for network in private)
+    except ValueError: return False
+for name in ('NODE_MANAGER_PUBLIC_URL','CONTROL_PLANE_URL'):
+    raw=os.environ.get(name,'')
+    if not raw: continue
+    url=urlsplit(raw)
+    if not url.hostname or url.username or url.password or url.query or url.fragment or url.path not in ('','/') or url.scheme not in ('https','http'):
+        raise SystemExit(name+' must be an HTTP(S) origin without credentials or paths')
+    if url.scheme=='http' and not trusted(url.hostname): raise SystemExit(name+' must use HTTPS outside a private management network')
+bind=ipaddress.ip_address(os.environ['NODE_MANAGER_BIND_ADDRESS'])
+cidrs=[x.strip() for x in os.environ['NODE_MANAGER_ALLOWED_CIDRS'].split(',') if x.strip()]
+for cidr in cidrs: ipaddress.ip_network(cidr,strict=False)
+if not bind.is_loopback and not cidrs: raise SystemExit('a non-loopback API listener requires NODE_MANAGER_ALLOWED_CIDRS')
+PY
+
+NM_API_BASE="$(python3 - <<'PY'
+import ipaddress, os
+value=ipaddress.ip_address(os.environ['NODE_MANAGER_BIND_ADDRESS'])
+if value.is_unspecified: value=ipaddress.ip_address('127.0.0.1' if value.version==4 else '::1')
+host='['+str(value)+']' if value.version==6 else str(value)
+print('http://'+host+':8088')
+PY
+)"
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 if [ -f "$SCRIPT_DIR/main.py" ]; then
@@ -451,11 +495,12 @@ if [ "$UPDATE_NODE_MANAGER" -eq 1 ]; then
   install -m 0644 "$SOURCE_DIR/singbox"/*.py "$APP_DIR/singbox/"
   install -m 0644 "$SOURCE_DIR/static/index.html" "$APP_DIR/static/index.html"
   install -m 0644 "$SOURCE_DIR/requirements.txt" "$APP_DIR/requirements.txt"
+  install -m 0644 "$SOURCE_DIR/requirements.lock" "$APP_DIR/requirements.lock"
   install -m 0644 "$VERSION_FILE" "$APP_DIR/VERSION"
 
   python3 -m venv "$APP_DIR/venv"
   "$APP_DIR/venv/bin/pip" install --upgrade pip wheel
-  "$APP_DIR/venv/bin/pip" install -r "$APP_DIR/requirements.txt"
+  "$APP_DIR/venv/bin/pip" install --only-binary=:all: --require-hashes -r "$APP_DIR/requirements.lock"
 fi
 
 install -d -m 0750 "$CONFIG_DIR"
@@ -517,6 +562,7 @@ server:
   port: 8088
 security:
   token: "$NODE_TOKEN"
+  allowed_cidrs: "$NODE_MANAGER_ALLOWED_CIDRS"
 singbox:
   config: "$SINGBOX_CONFIG"
   api_port: 9090
@@ -528,7 +574,7 @@ singbox:
 EOF
 chmod 0640 "$CONFIG_DIR/config.yaml"
 
-cat > "$SERVICE_FILE" <<'EOF'
+cat > "$SERVICE_FILE" <<EOF
 [Unit]
 Description=Python Node Manager
 After=network-online.target sing-box.service
@@ -539,7 +585,7 @@ Type=simple
 User=root
 WorkingDirectory=/opt/node-manager
 Environment=PYTHONUNBUFFERED=1
-ExecStart=/opt/node-manager/venv/bin/uvicorn main:app --host 0.0.0.0 --port 8088
+ExecStart=/opt/node-manager/venv/bin/uvicorn main:app --host $NODE_MANAGER_BIND_ADDRESS --port 8088
 Restart=on-failure
 RestartSec=3
 NoNewPrivileges=true
@@ -556,7 +602,11 @@ ufw allow 20169/tcp >/dev/null
 ufw allow 20170/tcp >/dev/null
 ufw allow 5001/tcp >/dev/null
 ufw allow 5001/udp >/dev/null
-ufw allow 8088/tcp >/dev/null
+IFS=',' read -r -a management_cidrs <<< "$NODE_MANAGER_ALLOWED_CIDRS"
+for cidr in "${management_cidrs[@]}"; do
+  [ -z "$cidr" ] || ufw allow from "$cidr" to any port 8088 proto tcp >/dev/null
+done
+ufw --force delete allow 8088/tcp >/dev/null 2>&1 || true
 ufw --force delete allow 9090/tcp >/dev/null 2>&1 || true
 ufw --force enable >/dev/null
 
@@ -566,10 +616,10 @@ systemctl restart sing-box
 systemctl restart node-manager
 
 for _ in $(seq 1 20); do
-  curl -fsS http://127.0.0.1:8088/health >/dev/null 2>&1 && break
+  curl -fsS "${NM_API_BASE}/health" >/dev/null 2>&1 && break
   sleep 1
 done
-curl -fsS http://127.0.0.1:8088/health >/dev/null || {
+curl -fsS "${NM_API_BASE}/health" >/dev/null || {
   journalctl -u node-manager -n 80 --no-pager >&2
   fail "Node Manager health check failed"
 }
@@ -579,7 +629,7 @@ register_with_control_plane() {
   local install_token="${CONTROL_PLANE_INSTALL_TOKEN:-}"
   local registration_token="${CONTROL_PLANE_REGISTRATION_TOKEN:-}"
   local registration_required="${CONTROL_PLANE_REGISTRATION_REQUIRED:-0}"
-  local public_url="${NODE_MANAGER_PUBLIC_URL:-http://$SERVER_IP:8088}"
+  local public_url="$NODE_MANAGER_PUBLIC_URL"
   local response_file request_file header_file http_code delay curl_exit_code
 
   if [ -z "$control_plane_url" ] && [ -z "$install_token" ] && [ -z "$registration_token" ]; then
@@ -680,9 +730,9 @@ Node Manager deployment
 Node Manager version: $APP_VERSION
 sing-box version: $(sing-box version | awk 'NR == 1 {print $3}')
 Server: $SERVER_IP
-Web UI: http://$SERVER_IP:8088/
-OpenAPI UI: http://$SERVER_IP:8088/docs
-OpenAPI JSON: http://$SERVER_IP:8088/openapi.json
+Web UI: $NODE_MANAGER_PUBLIC_URL/
+OpenAPI UI: $NODE_MANAGER_PUBLIC_URL/docs
+OpenAPI JSON: $NODE_MANAGER_PUBLIC_URL/openapi.json
 API token: $NODE_TOKEN
 Clash API: http://127.0.0.1:9090 (local only)
 Clash API secret: $API_SECRET

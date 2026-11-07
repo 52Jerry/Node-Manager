@@ -49,6 +49,53 @@ class RuntimeQueueTests(unittest.TestCase):
         self.assertEqual(writer.snapshot()["outstandingOperations"], 0)
         self.assertNotIn(b"fixture-password", (self.root / "queue/tasks.sqlite3-wal").read_bytes())
 
+    def test_terminal_batch_has_one_commit_before_any_waiter_is_released(self):
+        writer = self.writer()
+        observed, statements = [], []
+        original = writer._finish_many
+        def traced(outcomes):
+            with writer.cv:
+                writer.db.set_trace_callback(statements.append)
+                for item, *_ in outcomes:
+                    item.future.add_done_callback(lambda future: observed.append(
+                        writer.db.execute("SELECT COUNT(*) FROM tasks WHERE state='SUCCEEDED'").fetchone()[0]))
+                try:
+                    return original(outcomes)
+                finally:
+                    writer.db.set_trace_callback(None)
+        with patch.object(writer, "_finish_many", side_effect=traced):
+            with writer.cv:
+                tasks = [writer.submit(self.mutation("batch%d" % i), keys={str(i)})[0] for i in range(32)]
+            for task in tasks:
+                writer.wait(task, 10)
+            # Waiters may return while _process is cleaning up, so also join
+            # the condition lock before reading the trace/callback evidence.
+            with writer.cv:
+                self.assertEqual(observed, [32] * 32)
+                self.assertEqual(sum(sql == "COMMIT" for sql in statements), 1)
+
+    def test_failed_terminal_batch_rolls_back_without_releasing_waiters(self):
+        import sqlite3
+        writer = self.writer()
+        with writer.cv:
+            tasks = [writer.submit(self.mutation("rollback%d" % i))[0] for i in range(2)]
+            writer.paused = True
+            items = [writer.live[task] for task in tasks]
+            # Abort the second UPDATE after the first has executed, proving
+            # transactional rollback rather than a preflight failure.
+            writer.db.execute("CREATE TRIGGER reject_terminal BEFORE UPDATE ON tasks WHEN NEW.id='" + tasks[1] +
+                              "' BEGIN SELECT RAISE(ABORT,'fixture persistence failure'); END")
+            writer.db.commit()
+            try:
+                with self.assertRaises(sqlite3.IntegrityError):
+                    writer._finish_many([(item, "SUCCEEDED", {"success": True}, None, None) for item in items])
+                self.assertEqual([writer.status(task)["state"] for task in tasks], ["QUEUED", "QUEUED"])
+                self.assertTrue(all(not item.future.done() for item in items))
+                self.assertEqual(writer.units, 2)
+            finally:
+                writer.db.execute("DROP TRIGGER reject_terminal")
+                writer.db.commit()
+
     def test_delete_recreate_same_user_is_a_publication_barrier(self):
         self.create("same")
         writer = self.writer()
@@ -61,9 +108,11 @@ class RuntimeQueueTests(unittest.TestCase):
     def test_guarded_creates_compare_the_transaction_baseline_and_coalesce(self):
         import provisioning_readiness as readiness
         writer = self.writer()
-        listeners = [{'network':'tcp','address':'::','port':port,'pids':{42}} for port in (20168,20169,5001)]
+        listeners = [{'network':'tcp','address':'::','port':port,'inode':port} for port in (20168,20169,5001)]
         with patch.object(readiness,'_pid',return_value=42), patch.object(readiness,'_identity',return_value=123), \
                 patch.object(readiness,'_listeners',return_value=listeners), \
+                patch.object(readiness,'_owned_sockets',side_effect=lambda pid,inodes:{inode:str(inode) for inode in inodes}), \
+                patch.object(readiness,'_verify_descriptors'), \
                 patch.dict(os.environ,{'NODE_MANAGER_VLESS_PUBLICATION_SPEC':''}):
             tasks=[]
             with writer.cv:
@@ -191,12 +240,19 @@ class RuntimeQueueTests(unittest.TestCase):
 
     def test_completed_runtime_receipt_survives_worker_restart_before_db_ack(self):
         writer = self.writer()
-        task = writer.submit(self.mutation("committed"))[0]
-        writer.wait(task, 10)
-        with writer.cv:
-            writer.db.execute("UPDATE tasks SET state='RUNNING',result=NULL WHERE id=?", (task,))
-            writer.db.commit()
-        writer.close()
+        # Keep the core receipt while simulating loss of the DB acknowledgement.
+        # A fully acknowledged job normally deletes it; racing that cleanup
+        # after wait() returns does not represent a crash-before-ack.
+        with patch.object(writer, "cleanup_receipt"):
+            task = writer.submit(self.mutation("committed"))[0]
+            writer.wait(task, 10)
+            receipts = list((writer.root / "receipts").glob("*.json"))
+            self.assertTrue(receipts)
+            self.assertTrue(any(task in path.read_text(encoding="utf-8") for path in receipts))
+            with writer.cv:
+                writer.db.execute("UPDATE tasks SET state='RUNNING',result=NULL WHERE id=?", (task,))
+                writer.db.commit()
+            writer.close()
         replacement = self.writer()
         self.assertEqual(replacement.status(task)["state"], "SUCCEEDED")
         self.assertEqual(replacement.wait(task)["userId"], "committed")

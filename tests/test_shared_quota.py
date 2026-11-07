@@ -155,20 +155,21 @@ if __name__ == "__main__":
 
 
 class ProductionCollectorOverlayTests(unittest.TestCase):
-    """Run the actual minimal production candidate, not a mirrored condition."""
+    """Exercise the checked-in collector so clean checkouts need no release archive."""
     setUp = SharedQuotaTests.setUp
     update = SharedQuotaTests.update
     apply = SharedQuotaTests.apply
     def collector(self):
-        root=Path(__file__).resolve().parents[2]
-        source=root/'outputs/ha-consistency-fix-20261025/quota/production-candidate/monitor/traffic.py'
+        source=Path(__file__).resolve().parents[1]/'node-manager/monitor/traffic.py'
         cfg=types.ModuleType('config')
         cfg.config=types.SimpleNamespace(monitoring=types.SimpleNamespace(
-            traffic_sample_interval_seconds=2,device_active_window_seconds=60))
+            traffic_sample_interval_seconds=2,device_active_window_seconds=60,
+            relay_source_cidrs=''))
         manager=types.ModuleType('singbox.manager')
         for name in ['get_user_auth_map','get_user_policies','sync_user_enforcements']:
             setattr(manager,name,lambda *args,**kwargs: {})
         manager.USER_OUTBOUND_PREFIX='node-manager-out:'
+        manager.get_user_monitoring_snapshot=lambda: types.SimpleNamespace()
         manager.singbox_api=types.SimpleNamespace()
         spec=importlib.util.spec_from_file_location('production_quota_candidate',source)
         module=importlib.util.module_from_spec(spec)
@@ -201,7 +202,9 @@ class ProductionCollectorOverlayTests(unittest.TestCase):
 class CoordinatorPlanTests(unittest.TestCase):
     def setUp(self):
         root=Path(__file__).resolve().parents[2]
-        spec=importlib.util.spec_from_file_location('quota_sync_candidate',root/'outputs/ha-consistency-fix-20261025/quota/shared_quota_sync.py')
+        # Cross-repository contract: load the website's version-controlled coordinator,
+        # not a machine-local deployment artifact. Release checks clone both siblings.
+        spec=importlib.util.spec_from_file_location('quota_sync_candidate',root/'niusuip-project/ops/shared-quota/shared_quota_sync.py')
         self.sync=importlib.util.module_from_spec(spec);spec.loader.exec_module(self.sync)
         self.source={'userId':'primary-1','identityDigest':'same','limitBytes':100,'nativeTotalBytes':60,
                      'epoch':epoch({}),'epochToken':epoch_token(epoch({})),'peerEvidenceCount':0}

@@ -95,6 +95,7 @@ class SecurityConfig:
 class SingboxConfig:
     runtime_socket: str = ""
     binary: str = "sing-box"
+    service: str = "sing-box"
     config: str = "/etc/sing-box/config.json"
     api_port: int = 9090
     api_secret: str = ""
@@ -270,9 +271,11 @@ def load_config() -> Config:
     )
 
     singbox = data.get("singbox", {})
-    for name in ("config", "api_secret", "vless_tag", "vmess_tag", "socks_tag", "trojan_tag", "runtime_socket", "binary"):
+    for name in ("config", "api_secret", "vless_tag", "vmess_tag", "socks_tag", "trojan_tag", "runtime_socket", "binary", "service"):
         if name in singbox:
             setattr(result.singbox, name, str(singbox[name]))
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.@-]{0,127}", result.singbox.service):
+        raise ValueError("invalid singbox.service")
     result.singbox.api_port = int(singbox.get("api_port", result.singbox.api_port))
 
     monitoring = data.get("monitoring", {})

@@ -68,7 +68,7 @@ func memory(ctx context.Context, trafficManager *trafficontrol.Manager) func(w h
 			}
 			buf.Reset()
 
-			inuse := trafficManager.Snapshot().Memory
+			inuse := trafficManager.Memory()
 
 			// make chat.js begin with zero
 			// this is shit var,but we need output 0 for first time

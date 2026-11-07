@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import copy
 import hashlib
 import logging
 import os
@@ -10,11 +11,13 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+import runtime_metrics
 
 from singbox.manager import (
     USER_OUTBOUND_PREFIX,
     get_user_auth_map,
     get_user_policies,
+    get_user_monitoring_snapshot,
     singbox_api,
     sync_user_enforcements,
 )
@@ -22,6 +25,7 @@ from config import config
 from monitor.shared_quota import peer_used_bytes, clear_for_reset, native_accounting_proven
 from monitor.source_identity import normalize_ip, source_ip_diagnostics
 from monitor.telemetry import connection_summary, sample_state
+from monitor.enforcement_wait import PendingEnforcement
 
 
 logger = logging.getLogger(__name__)
@@ -36,6 +40,136 @@ stop_event = threading.Event()
 collector_thread: threading.Thread | None = None
 collection_health: dict[str, dict[str, Any]] = {}
 connection_details: dict[str, dict[str, dict[str, Any]]] = {}
+_enforcement_wait = PendingEnforcement()
+
+# Dashboard reads share one small projection of the last durable file version.
+# Mutable accounting transactions continue to use _read_store() under their
+# existing locks; no complete user/connection graph is retained by this cache.
+_read_summary_lock = threading.Lock()
+_read_summary_key: tuple | None = None
+_read_summary: dict[str, Any] | None = None
+
+
+def _store_version() -> tuple:
+    path = Path(TRAFFIC_PATH)
+    try:
+        stat = path.stat()
+    except FileNotFoundError:
+        return (str(path.resolve()), None)
+    return (str(path.resolve()), stat.st_dev, stat.st_ino, stat.st_size,
+            stat.st_mtime_ns, stat.st_ctime_ns)
+
+
+def _summarize_store(store: dict[str, Any]) -> dict[str, Any]:
+    users = store.get("users")
+    connections = store.get("connections", {})
+    if not isinstance(users, dict) or not isinstance(connections, dict):
+        raise OSError("traffic_store_invalid")
+    # Publications from writers must obey the same counter validation as a
+    # cold disk read; a cache must not make malformed counters look valid.
+    for section in (users, connections):
+        for item in section.values():
+            if not isinstance(item, dict) or any(
+                    type(item[field]) is not int or not 0 <= item[field] <= 2**63 - 1
+                    for field in ("upload", "download") if field in item):
+                raise OSError("traffic_store_invalid_counters")
+    return {
+        "upload": sum(int(item.get("upload") or 0) for item in users.values()),
+        "download": sum(int(item.get("download") or 0) for item in users.values()),
+        "connections": sum(1 for item in connections.values()
+                           if item.get("online", True)),
+        "collectedAt": store.get("collectedAt"),
+        "connectionsCollectedAt": store.get("connectionsCollectedAt", store.get("collectedAt")),
+        "runtime": bool(store.get("runtimeCounters")),
+        # Only IDs are needed to exclude hot users from archived totals.
+        "userIds": tuple(users) if store.get("runtimeCounters") else (),
+        "nodeCumulativeCounters": copy.deepcopy(store.get("nodeCumulativeCounters")),
+    }
+
+
+def _reset_read_summary_cache() -> None:
+    global _read_summary_key, _read_summary
+    with _read_summary_lock:
+        _read_summary_key = None
+        _read_summary = None
+
+
+def _get_read_summary() -> dict[str, Any]:
+    global _read_summary_key, _read_summary
+    # Never acquire traffic_lock here. A reader may run while a collector owns
+    # it; atomic replacement and the before/after version check provide a
+    # coherent file snapshot without blocking behind a complete collection.
+    with _read_summary_lock:
+        for _ in range(3):
+            version = _store_version()
+            if version == _read_summary_key and _read_summary is not None:
+                return copy.deepcopy(_read_summary)
+            try:
+                store = _read_store()
+                summary = _summarize_store(store)
+            except Exception:
+                _read_summary_key = None
+                _read_summary = None
+                raise
+            if version == _store_version():
+                _read_summary_key, _read_summary = version, summary
+                return copy.deepcopy(summary)
+        # Do not associate an old sample with a newer on-disk version.
+        _read_summary_key = None
+        _read_summary = None
+        raise OSError("traffic_store_changed_during_read")
+
+
+def _publish_read_summary(store: dict[str, Any], committed: os.stat_result) -> None:
+    global _read_summary_key, _read_summary
+    # Cache maintenance must never make an accounting write fail or wait for a
+    # dashboard cache miss. A skipped publication is rebuilt by the next reader.
+    if not _read_summary_lock.acquire(blocking=False):
+        return
+    try:
+        version = _store_version()
+        if (len(version) == 6 and version[1:5] ==
+                (committed.st_dev, committed.st_ino, committed.st_size,
+                 committed.st_mtime_ns)):
+            _read_summary_key, _read_summary = version, _summarize_store(store)
+    except (OSError, ValueError, TypeError, KeyError):
+        _read_summary_key = None
+        _read_summary = None
+    finally:
+        _read_summary_lock.release()
+
+
+def _observation_metadata(collected_at: str | None) -> dict[str, Any]:
+    health = collection_health.get(str(TRAFFIC_PATH), {})
+    reason = health.get("reason")
+    # Pending policy execution does not erase a successful connection sample.
+    # Other failures still make the observation unusable for current decisions.
+    observation_reason = health.get("observationReason", reason)
+    if "observationReason" not in health and reason and reason.startswith("enforcement_"):
+        observation_reason = None
+    freshness = sample_state(collected_at, not observation_reason,
+                             SAMPLE_INTERVAL_SECONDS * 3, observation_reason)
+    age = freshness["stalenessSeconds"]
+    return {**freshness,
+            "observationAvailable": age is not None and age >= 0,
+            "staleAfterSeconds": SAMPLE_INTERVAL_SECONDS * 3,
+            "enforcementAvailable": bool(collected_at) and not reason,
+            "enforcementReason": reason}
+
+
+def get_proxy_connection_count_snapshot() -> dict[str, Any]:
+    """Read sampled connection counts without fetching/decoding all sessions."""
+    try:
+        summary = _get_read_summary()
+    except (OSError, ValueError, TypeError, KeyError):
+        return {"connections": None, "collectedAt": None, "available": False,
+                **_observation_metadata(None)}
+    collected_at = summary.get("connectionsCollectedAt")
+    observation = _observation_metadata(collected_at)
+    return {"connections": summary["connections"] if collected_at else None,
+            "collectedAt": collected_at,
+            "available": observation["telemetryAvailable"] and observation["enforcementAvailable"],
+            **observation}
 
 
 def _now() -> str:
@@ -69,6 +203,7 @@ def _read_store() -> dict[str, Any]:
     return data
 
 
+@runtime_metrics.timed("traffic_persistence")
 def _write_store(data: dict[str, Any]) -> None:
     TRAFFIC_PATH.parent.mkdir(parents=True, exist_ok=True, mode=0o750)
     fd, temp_name = tempfile.mkstemp(prefix="traffic.", suffix=".json", dir=TRAFFIC_PATH.parent)
@@ -80,10 +215,12 @@ def _write_store(data: dict[str, Any]) -> None:
             handle.flush()
             os.fsync(handle.fileno())
         os.chmod(temp_path, 0o600)
+        committed = temp_path.stat()
         os.replace(temp_path, TRAFFIC_PATH)
         if os.name != "nt":
             from runtime_publication import sync_dir
             sync_dir(TRAFFIC_PATH.parent)
+        _publish_read_summary(data, committed)
     finally:
         temp_path.unlink(missing_ok=True)
 
@@ -296,27 +433,36 @@ def _archive_inactive_usage(store, active_ids):
         del store["users"][uid]
 
 
-def _collect_traffic() -> bool:
+@runtime_metrics.timed("collector_sample")
+def _sample_traffic() -> tuple[dict[str, dict[str, Any]], set[str]] | None:
     from singbox.runtime_client import enabled as runtime_enabled, RuntimeClient
     runtime_mode = runtime_enabled()
-    native_snapshot = RuntimeClient().counters() if runtime_mode else None
-    snapshot = singbox_api.get_connections()
+    with runtime_metrics.measure("collector_native"):
+        native_snapshot = RuntimeClient().counters() if runtime_mode else None
+    with runtime_metrics.measure("collector_connections"):
+        snapshot = singbox_api.get_connections()
     if not isinstance(snapshot, dict) or not isinstance(snapshot.get("connections"), list):
         if native_snapshot is not None:
-            auth_map = get_user_auth_map()
+            with runtime_metrics.measure("collector_projection"):
+                auth_map = get_user_monitoring_snapshot().auth_map
             with traffic_lock:
                 store = _read_store()
+                # Native counters can advance when connection telemetry fails;
+                # that must not give the retained connection list a new time.
+                store.setdefault("connectionsCollectedAt", store.get("collectedAt"))
                 _apply_native_counters(store, native_snapshot, auth_map)
                 _archive_inactive_usage(store, set(auth_map.values()))
                 store["collectedAt"] = _now()
                 _write_store(store)
-        collection_health[str(TRAFFIC_PATH)] = {"reason": "api_unavailable"}
+        collection_health[str(TRAFFIC_PATH)] = {"reason": "api_unavailable",
+                                                "observationReason": "api_unavailable"}
         connection_details.pop(str(TRAFFIC_PATH), None)
         logger.warning("traffic telemetry unavailable; retaining prior enforcement, review required")
-        return False
+        return None
 
-    policies = get_user_policies()
-    auth_map = get_user_auth_map()
+    with runtime_metrics.measure("collector_projection"):
+        monitoring = get_user_monitoring_snapshot()
+    policies, auth_map = monitoring.policies, monitoring.auth_map
     sampled_at = time.time()
     with traffic_lock:
         store = _read_store()
@@ -390,11 +536,42 @@ def _collect_traffic() -> bool:
             connection["online"] = connection_id not in connections_to_close
         store["connections"] = active_connections
         store["collectedAt"] = collected_at
+        store["connectionsCollectedAt"] = collected_at
         store["nodeCumulativeCounters"] = singbox_api.cumulative_counters(snapshot)
         if runtime_mode:
             _archive_inactive_usage(store, set(auth_map.values()) | set(policies))
         _write_store(store)
         connection_details[str(TRAFFIC_PATH)] = transient_details
+
+    return enforcements, connections_to_close
+
+
+@runtime_metrics.timed("collector_enforcement")
+def _synchronize_sample_enforcements(enforcements: dict[str, dict[str, Any]]) -> None:
+    from singbox.runtime_client import enabled as runtime_enabled
+    desired = {user_id: {"trafficBlocked": bool(value.get("trafficBlocked")),
+                         "blockedSourceIps": []}
+               for user_id, value in enforcements.items()}
+    if not runtime_enabled():
+        sync_user_enforcements(desired)
+        return
+    import runtime_write_queue
+    token = runtime_write_queue.wait_timeout.set(0)
+    try:
+        sync_user_enforcements(desired)
+    finally:
+        runtime_write_queue.wait_timeout.reset(token)
+
+
+def _collect_traffic() -> bool:
+    # Native configuration writes can wait behind other user updates. Finish
+    # the sampling frame first so raw core/native snapshots, the old baseline
+    # and the complete mutable store are released before waiting on the writer.
+    # Keep the existing collection transaction lock and enforcement ordering.
+    sampled = _sample_traffic()
+    if sampled is None:
+        return False
+    enforcements, connections_to_close = sampled
 
     enforcement_available = True
     try:
@@ -402,15 +579,8 @@ def _collect_traffic() -> bool:
         # offending Clash connections. Persisting those volatile CIDRs into
         # sing-box would rewrite the full config and reload the process as
         # clients move between source addresses.
-        sync_user_enforcements(
-            {
-                user_id: {
-                    "trafficBlocked": bool(desired.get("trafficBlocked")),
-                    "blockedSourceIps": [],
-                }
-                for user_id, desired in enforcements.items()
-            }
-        )
+        enforcement_available = _enforcement_wait.run(str(TRAFFIC_PATH),
+            lambda: _synchronize_sample_enforcements(enforcements))
     except Exception:
         enforcement_available = False
         logger.exception("could not synchronize sing-box user enforcement rules")
@@ -418,7 +588,8 @@ def _collect_traffic() -> bool:
         if not singbox_api.close_connection(connection_id):
             enforcement_available = False
     collection_health[str(TRAFFIC_PATH)] = {
-        "reason": None if enforcement_available else "enforcement_unavailable"}
+        "reason": None if enforcement_available else (_enforcement_wait.reason or "enforcement_unavailable"),
+        "observationReason": None}
     if not enforcement_available:
         connection_details.pop(str(TRAFFIC_PATH), None)
     return enforcement_available
@@ -540,29 +711,21 @@ def get_user_traffic(
 def get_traffic_totals(refresh: bool = True) -> dict[str, Any]:
     available = collect_traffic() if refresh else None
     try:
-        if refresh:
-            with traffic_lock:
-                store = _read_store()
-        else:
-            # The collector writes a complete temporary file and atomically
-            # replaces the store. A cached heartbeat read can use either
-            # complete snapshot without waiting for a large collection pass.
-            store = _read_store()
+        summary = _get_read_summary()
     except OSError:
-        store = _empty_store()
+        summary = _summarize_store(_empty_store())
         available = False
         collection_health[str(TRAFFIC_PATH)] = {"reason": "traffic_store_unreadable"}
     if available is None:
-        available = (store.get("collectedAt") is not None
+        available = (summary.get("collectedAt") is not None
                      and not collection_health.get(str(TRAFFIC_PATH), {}).get("reason"))
-    freshness = sample_state(store.get("collectedAt"), bool(available),
+    freshness = sample_state(summary.get("collectedAt"), bool(available),
                              SAMPLE_INTERVAL_SECONDS * 3,
                              collection_health.get(str(TRAFFIC_PATH), {}).get("reason"))
-    upload = sum(int(item.get("upload") or 0) for item in store["users"].values())
-    download = sum(int(item.get("download") or 0) for item in store["users"].values())
-    if store.get("runtimeCounters"):
+    upload, download = summary["upload"], summary["download"]
+    if summary["runtime"]:
         import runtime_history
-        cold_upload, cold_download = runtime_history.archived_totals(store["users"])
+        cold_upload, cold_download = runtime_history.archived_totals(summary["userIds"])
         upload += cold_upload
         download += cold_download
     return {
@@ -570,13 +733,15 @@ def get_traffic_totals(refresh: bool = True) -> dict[str, Any]:
         "download": download,
         "total": upload + download,
         "available": freshness["telemetryAvailable"],
-        "source": "singbox-runtime-cumulative" if store.get("runtimeCounters") else "clash-api-sampled",
-        "collectedAt": store.get("collectedAt"),
+        "source": "singbox-runtime-cumulative" if summary["runtime"] else "clash-api-sampled",
+        "collectedAt": summary.get("collectedAt"),
+        **{key: value for key, value in _observation_metadata(summary.get("collectedAt")).items()
+           if key in ("observationAvailable", "staleAfterSeconds", "enforcementAvailable", "enforcementReason")},
         **freshness,
-        "measurementQuality": "runtime_cumulative_since_baseline" if store.get("runtimeCounters") else "sampled_lower_bound",
+        "measurementQuality": "runtime_cumulative_since_baseline" if summary["runtime"] else "sampled_lower_bound",
         "measuredTotal": upload + download if freshness["telemetryAvailable"] else None,
-        "lastKnownTotal": upload + download if store.get("collectedAt") else None,
-        "nodeCumulativeCounters": store.get("nodeCumulativeCounters")
+        "lastKnownTotal": upload + download if summary.get("collectedAt") else None,
+        "nodeCumulativeCounters": summary.get("nodeCumulativeCounters")
                                   if freshness["telemetryAvailable"] else None,
         "alertRequired": not freshness["telemetryAvailable"],
     }
@@ -666,3 +831,4 @@ def stop_traffic_collector() -> None:
     if collector_thread and collector_thread.is_alive():
         collector_thread.join(timeout=SAMPLE_INTERVAL_SECONDS + 1)
     connection_details.clear()
+    _reset_read_summary_cache()

@@ -1,4 +1,6 @@
 import sys
+import copy
+import json
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -13,25 +15,90 @@ def test_identical_enforcement_noop_skips_writer_until_files_or_decision_change(
     registry.write_text('{"users":{}}')
     monkeypatch.setattr(manager, "CONFIG_PATH", config)
     monkeypatch.setattr(manager, "REGISTRY_PATH", registry)
+    monkeypatch.setattr(manager, "LOCK_PATH", tmp_path / "config.lock")
+    monkeypatch.setenv("NODE_MANAGER_RUNTIME_STATE_DIR", str(tmp_path / "runtime"))
+    import revision
+    monkeypatch.setattr(revision, "JOURNAL_PATH", tmp_path / "revision-transaction.json")
     monkeypatch.setattr(manager, "_enforcement_noop_cache", None)
+    monkeypatch.setattr(manager, "_monitoring_snapshot", None)
     writes = []
 
+    def replace_json(path, value):
+        replacement = path.with_suffix(".replacement")
+        replacement.write_text(json.dumps(value), encoding="utf-8")
+        replacement.replace(path)
+
     def fake_mutation(callback):
-        writes.append(True)
-        return callback({"inbounds": [], "route": {"rules": []}}, {"users": {}})
+        # Model a writer transaction against the real fixture files. Losing
+        # these mutations would make every round appear unconfigured again.
+        data = json.loads(config.read_text(encoding="utf-8"))
+        users = json.loads(registry.read_text(encoding="utf-8"))
+        before = copy.deepcopy((data, users))
+        changed = callback(data, users)
+        writes.append(changed)
+        if (data, users) != before:
+            replace_json(config, data)
+            replace_json(registry, users)
+        return changed
 
     monkeypatch.setattr(manager, "mutate_config", fake_mutation)
     clear = {"u1": {"trafficBlocked": False, "blockedSourceIps": []}}
-    assert manager.sync_user_enforcements(clear) is False
-    assert manager.sync_user_enforcements(clear) is False
-    assert len(writes) == 1
-
     blocked = {"u1": {"trafficBlocked": True, "blockedSourceIps": []}}
+    # No configured identity exists: both desired states are provable no-ops.
+    for desired in (clear, blocked, clear):
+        assert manager.sync_user_enforcements(desired) is False
+    assert writes == []
+
+    data = {"inbounds": [{"type": "socks", "tag": manager.config.singbox.socks_tag,
+                          "listen_port": 5080, "users": [{"username": "u1-public", "password": "synthetic"}]}],
+            "route": {"rules": []}}
+    users = {"users": {"u1": {"socksUsername": "u1-public"}}}
+    replace_json(config, data)
+    replace_json(registry, users)
+    for _ in range(3):
+        assert manager.sync_user_enforcements(clear) is False
+    assert writes == []
+
+    assert manager.sync_user_enforcements(blocked) is True
+    for _ in range(3):
+        assert manager.sync_user_enforcements(blocked) is False
+    assert writes == [True]
+    stored = json.loads(registry.read_text(encoding="utf-8"))
+    assert stored["users"]["u1"][manager.ENFORCEMENT_TRAFFIC_KEY] is True
+
+    # A new external version requires a new paired observation, but does not
+    # justify rewriting an enforcement state that is still satisfied.
+    old = manager.get_user_monitoring_snapshot()
+    stored["revision"] = 1
+    replace_json(registry, stored)
     assert manager.sync_user_enforcements(blocked) is False
-    assert len(writes) == 2
-    registry.write_text('{"users":{},"revision":1}')
+    assert manager.get_user_monitoring_snapshot().version != old.version
+    assert writes == [True]
+
+    # Real credential changes invalidate the prior no-op. The mutator must
+    # replace the old rule's auth names with the current configured identity.
+    data = json.loads(config.read_text(encoding="utf-8"))
+    data["inbounds"][0]["users"][0]["username"] = "u1-renamed"
+    stored["users"]["u1"]["socksUsername"] = "u1-renamed"
+    replace_json(config, data)
+    replace_json(registry, stored)
+    assert manager.sync_user_enforcements(blocked) is True
+    current = json.loads(registry.read_text(encoding="utf-8"))["users"]["u1"]
+    expected_auth = ["node-manager:u1", "u1-renamed"]
+    assert current[manager.ENFORCEMENT_AUTH_USERS_KEY] == expected_auth
+    assert json.loads(config.read_text(encoding="utf-8"))["route"]["rules"] == [
+        {"auth_user": expected_auth, "action": "reject"}]
     assert manager.sync_user_enforcements(blocked) is False
-    assert len(writes) == 3
+    assert writes == [True, True]
+
+    assert manager.sync_user_enforcements(clear) is True
+    for _ in range(3):
+        assert manager.sync_user_enforcements(clear) is False
+    assert writes == [True, True, True]
+    current = json.loads(registry.read_text(encoding="utf-8"))["users"]["u1"]
+    assert manager.ENFORCEMENT_TRAFFIC_KEY not in current
+    assert manager.ENFORCEMENT_AUTH_USERS_KEY not in current
+    assert json.loads(config.read_text(encoding="utf-8"))["route"]["rules"] == []
 
 
 def test_read_lock_rejects_nested_mutation(tmp_path, monkeypatch):

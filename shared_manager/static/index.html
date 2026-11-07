@@ -1,0 +1,92 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#172033">
+  <title>共享节点 · 用户面板</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='14' fill='%23172033'/%3E%3Ctext x='32' y='44' text-anchor='middle' font-size='44' fill='%23fff' font-family='Arial'%3EA%3C/text%3E%3C/svg%3E">
+  <link rel="stylesheet" href="/assets/style.css">
+  <script src="/assets/app.js" defer></script>
+</head>
+<body>
+<div class="app-shell">
+  <aside class="sidebar">
+    <a href="/" class="brand" aria-label="共享节点首页"><span class="brand-icon" aria-hidden="true">A</span><span><strong data-site-name>共享节点</strong><small>CONNECTION PANEL</small></span></a>
+    <div class="sidebar-divider"></div>
+    <nav id="panel-nav" aria-label="面板导航" hidden>
+      <span class="nav-caption">工作空间</span>
+      <button class="nav-item active" data-page="connections" type="button"><span class="nav-icon" aria-hidden="true">⇄</span>我的连接<span id="nav-connection-count" class="nav-count">0</span></button>
+      <button class="nav-item" data-page="import" type="button"><span class="nav-icon" aria-hidden="true">↓</span>批量导入</button>
+      <button class="nav-item" data-page="subscription" type="button"><span class="nav-icon" aria-hidden="true">▤</span>账号订阅</button>
+      <button id="admin-nav" class="nav-item" data-page="admin" type="button" hidden><span class="nav-icon" aria-hidden="true">▦</span>用户管理<span class="admin-nav-badge">管理</span></button>
+    </nav>
+    <div id="guest-sidebar" class="guest-sidebar"><span class="nav-caption">独立用户入口</span><h1>一个账号，<br>管理多条连接。</h1><p>专属认证信息，<br>每条连接独立配置。</p></div>
+    <div class="sidebar-footer"><span class="sidebar-status"></span>独立账号 · 多连接管理</div>
+  </aside>
+  <div class="workspace">
+    <header class="topbar"><div class="breadcrumb">用户面板 <span>/</span> <strong id="page-label">账号登录</strong></div><div id="account-menu" hidden><span id="account-avatar" class="avatar" aria-hidden="true">U</span><span id="account-name"></span><button id="logout" class="quiet-button" type="button">退出</button></div><span id="guest-label" class="topbar-label">Aliproxy</span></header>
+    <main>
+      <div id="notice" class="notice" role="status" aria-live="polite" hidden></div>
+      <section id="auth-view" class="auth-view">
+        <div class="auth-intro"><span class="eyebrow">YOUR CONNECTION SPACE</span><h2>连接，由你管理。</h2><p>登录账号，创建自己的连接并配置住宅代理。</p></div>
+        <div class="auth-card">
+          <div class="auth-tabs" role="tablist" aria-label="账号入口"><button id="login-tab" class="active" type="button" role="tab" aria-selected="true" aria-controls="auth-form">登录</button><button id="register-tab" type="button" role="tab" aria-selected="false" aria-controls="auth-form" hidden>注册账号</button></div>
+          <p id="registration-status" class="field-hint" role="status" hidden>当前暂停注册，已有账号可登录。</p>
+          <form id="auth-form" novalidate>
+            <label for="username">账号</label><input id="username" name="username" autocomplete="username" autocapitalize="none" autocorrect="off" spellcheck="false" placeholder="输入你的账号" aria-describedby="username-hint username-error" aria-invalid="false" required>
+            <p id="username-hint" class="field-hint auth-field-hint">账号格式不限；登录时使用注册的账号。</p><p id="username-error" class="auth-field-error" role="alert" hidden></p>
+            <label for="password">密码</label><div class="password-input"><input id="password" name="password" type="password" autocomplete="current-password" placeholder="输入密码" aria-describedby="password-error" aria-invalid="false" required><button id="toggle-password" type="button" aria-label="显示登录密码">显示</button></div><p id="password-error" class="auth-field-error" role="alert" hidden></p>
+            <p id="register-hint" class="field-hint" hidden>确认密码须与密码完全一致。</p>
+            <label id="confirm-label" for="confirm-password" hidden>确认密码</label><input id="confirm-password" type="password" autocomplete="new-password" placeholder="再次输入密码" aria-describedby="confirm-password-error" aria-invalid="false" hidden><p id="confirm-password-error" class="auth-field-error" role="alert" hidden></p>
+            <div id="auth-error" class="notice error auth-error" role="alert" hidden></div>
+            <button id="auth-submit" class="button primary wide" type="submit" disabled>登录用户面板 →</button>
+          </form>
+          <p id="auth-footnote" class="auth-footnote" hidden>还没有账号？<button id="switch-register" class="text-button" type="button">立即注册</button></p>
+        </div>
+        <div class="auth-features"><div><span>01</span><strong>多条专属连接</strong><small>按用途分别命名</small></div><div><span>02</span><strong>独立住宅代理</strong><small>每条连接分别配置</small></div><div><span>03</span><strong>批量快速导入</strong><small>统一订阅使用</small></div></div>
+      </section>
+      <div id="dashboard-view" hidden>
+        <section id="connections-page" class="panel-page" aria-label="我的连接">
+          <div class="page-heading"><div><h2>我的连接</h2><p>每条连接拥有独立凭据，可分别绑定住宅代理。</p></div><div class="heading-actions"><button id="refresh-profiles" class="button secondary" type="button">↻ 刷新</button><button id="create-profile" class="button primary" type="button">＋ 创建连接</button></div></div>
+          <div class="summary-strip"><div><span>连接数量</span><strong id="profile-count">0</strong></div><div><span>已生成</span><strong id="ready-count">0</strong></div><div><span>住宅代理</span><strong id="residential-count">0</strong></div><div><span>协议</span><strong class="summary-protocols">VLESS · VMess · SOCKS5</strong></div></div>
+          <section class="card profiles-card"><div class="card-heading"><div><h3>连接列表</h3><p>点击管理连接，在弹窗中查看和修改配置。</p></div><button class="text-button" data-page="import" type="button">批量导入住宅代理 →</button></div><div class="table-scroll"><table class="profile-table"><thead><tr><th>连接名称</th><th>住宅代理</th><th>状态</th><th>到期时间</th><th class="actions-heading">操作</th></tr></thead><tbody id="profiles-body"></tbody></table></div><div id="profiles-empty" class="profiles-empty"><span aria-hidden="true">⇄</span><h3>还没有连接</h3><p>创建一条连接，或批量导入住宅代理开始使用。</p><button id="empty-create-profile" class="button primary" type="button">创建第一条连接</button></div></section>
+        </section>
+        <section id="import-page" class="panel-page" aria-label="批量导入" hidden>
+          <div class="page-heading"><div><h2>批量导入</h2><p>每条住宅代理建立一条独立连接，并生成三协议。</p></div></div>
+          <section class="card import-card"><div class="card-heading"><div><h3>导入住宅代理</h3><p>每次最多 50 条，可粘贴内容或读取 TXT / CSV 文件。</p></div><label class="button secondary file-button" for="import-file">读取文件<input id="import-file" type="file" accept=".txt,.csv,text/plain,text/csv"></label></div><label for="import-text">代理列表</label><textarea id="import-text" rows="9" placeholder="代理域名:端口:用户名:密码&#10;或 socks5://用户名:密码@代理域名:端口" spellcheck="false" autocomplete="off"></textarea><div class="import-format"><span>支持格式</span><code>host:port:user:pass</code><code>socks5://user:pass@host:port</code><code>名称,host,port,user,pass</code></div><p class="field-hint">无需认证时可留空用户名和密码。预览不会展示密码。</p><div class="form-actions"><button id="preview-import" class="button secondary" type="button">预览检查</button><button id="run-import" class="button primary" type="button" disabled>开始导入</button><button id="clear-import" class="text-button" type="button">清空</button></div></section>
+          <section id="import-preview-panel" class="card import-results" hidden><div class="card-heading"><div><h3 id="import-results-title">导入预览</h3><p id="import-summary"></p></div></div><div class="table-scroll"><table class="profile-table"><thead><tr><th>行号</th><th>连接名称</th><th>代理服务器</th><th>状态</th><th>说明</th></tr></thead><tbody id="import-results-body"></tbody></table></div></section>
+        </section>
+        <section id="subscription-page" class="panel-page" aria-label="账号订阅" hidden>
+          <div class="page-heading"><div><h2>账号订阅</h2><p>一个订阅地址，管理本账号下已生成的连接。</p></div><button id="refresh-subscription" class="button secondary" type="button">刷新订阅</button></div>
+          <section class="card subscription-card"><div class="card-heading"><div><h3>客户端订阅</h3><p>包含本账号下各条连接的 VLESS、VMess 和 SOCKS5 链接。</p></div><span id="subscription-count" class="badge neutral">0 条连接</span></div><label for="subscription-url">订阅地址</label><div class="subscription-form"><input id="subscription-url" readonly aria-label="客户端订阅地址" placeholder="请先创建并生成连接"><button id="copy-subscription" class="button secondary" type="button" disabled>复制订阅</button></div><div class="subscription-bottom"><p id="subscription-note" class="field-hint">创建、删除连接后，在客户端更新订阅即可同步。</p><button id="rotate-subscription" class="text-button" type="button" disabled>重置订阅地址</button></div></section>
+        </section>
+        <section id="admin-page" class="panel-page" aria-label="用户管理" hidden>
+          <div class="page-heading"><div><h2>用户管理</h2><p>查看全站注册用户与连接生成情况。</p></div><button id="admin-refresh" class="button secondary" type="button">↻ 刷新统计</button></div>
+          <div class="admin-summary" aria-label="全站统计"><div class="card"><span>注册用户</span><strong id="admin-registered-users">—</strong><small id="admin-enabled-users">—</small></div><div class="card"><span>连接总数</span><strong id="admin-total-connections">—</strong><small>所有用户的连接</small></div><div class="card"><span>已生成连接</span><strong id="admin-ready-connections">—</strong><small>每条连接包含三种协议</small></div><div class="card"><span>待生成连接</span><strong id="admin-pending-connections">—</strong><small id="admin-deleting-connections">—</small></div></div>
+          <section class="card admin-users-card"><div class="card-heading"><div><h3>注册用户</h3><p>连接按创建的连接组计数，三种协议共计一条连接。</p></div><span id="admin-user-total" class="badge neutral">—</span></div><form id="admin-search-form" class="admin-search-form" role="search"><label for="admin-search">搜索账号</label><div><input id="admin-search" maxlength="64" placeholder="输入用户账号" autocomplete="off"><button id="admin-search-submit" class="button secondary" type="submit">搜索</button><button id="admin-search-clear" class="text-button" type="button">清空</button></div></form><p id="admin-loading" class="admin-status" role="status" aria-live="polite" hidden>正在读取用户和连接统计…</p><div id="admin-error" class="notice error admin-error" role="alert" hidden></div><div class="table-scroll"><table id="admin-users-table" class="profile-table admin-users-table" aria-label="注册用户和连接数量"><thead><tr><th>账号</th><th>注册时间</th><th>账号状态</th><th>连接总数</th><th>已生成</th><th>待生成</th><th>删除待确认</th></tr></thead><tbody id="admin-users-body"></tbody></table></div><div id="admin-empty" class="admin-empty" role="status" hidden>没有符合条件的用户。</div><div class="admin-pagination"><span id="admin-page-info" aria-live="polite">—</span><div><button id="admin-prev" class="button secondary" type="button" disabled>上一页</button><button id="admin-next" class="button secondary" type="button" disabled>下一页</button></div></div></section>
+        </section>
+      </div>
+      <footer><span data-site-name>共享节点</span><span>独立账号 · 多连接管理</span></footer>
+    </main>
+  </div>
+</div>
+<dialog id="manage-dialog" aria-labelledby="manage-title">
+  <header class="manage-dialog-heading"><div><h2 id="manage-title">管理连接</h2><p>查看连接信息，修改名称、流量额度和住宅代理。</p></div><button id="close-manage-dialog" class="icon-button" type="button" aria-label="关闭管理连接">×</button></header>
+  <div class="manage-dialog-body"><div id="manage-notice" class="notice" role="status" aria-live="polite" hidden></div><p id="manage-loading" class="field-hint" role="status" hidden>正在读取连接信息…</p>
+          <section id="selected-panel" hidden>
+            <div class="selected-heading"><div><span class="eyebrow">当前连接</span><h3 id="selected-name"></h3></div><div class="heading-actions"><button id="delete-profile" class="button danger-light" type="button">删除连接</button></div></div>
+            <form id="manage-name-form" class="manage-name-form"><div><label for="manage-name">连接名称</label><input id="manage-name" maxlength="64" autocomplete="off" required></div><button id="rename-profile" class="button secondary" type="submit">保存名称</button></form>
+            <div class="selected-stats"><div><span>当前连接已用流量</span><strong id="traffic-used">—</strong><small id="traffic-limit">—</small></div><div><span>到期时间</span><strong id="expiry">—</strong><small>仅针对当前连接</small></div><div><span>当前出口</span><strong id="current-egress">默认出口</strong><small id="egress-summary">未绑定住宅代理</small></div></div>
+            <section class="card quota-card"><div><h3>流量额度</h3><p>单独设置当前连接的额度；修改不会重置已用流量。</p></div><form id="quota-form"><fieldset id="quota-fields" disabled><div><label for="quota-limit">额度（GiB）</label><input id="quota-limit" type="number" min="0" step="any" inputmode="decimal" required></div><button id="save-quota" class="button secondary" type="submit">保存额度</button></fieldset></form></section>
+            <section id="connections-pending" class="pending-panel card" hidden><span class="badge pending">待确认</span><p>连接尚未生成完成，可以检查或继续生成。</p><button id="generate-selected" class="button primary" type="button">生成三协议连接</button></section>
+            <section id="connection-panel" class="card" hidden><div class="card-heading"><div><h3>三协议连接</h3><p>当前连接的三种协议共用有效期、流量额度和住宅代理。</p></div><span class="badge green">已生成</span></div><div class="table-scroll"><table class="connection-table"><thead><tr><th>协议</th><th>认证方式</th><th>操作</th></tr></thead><tbody><tr><td><span class="protocol-label"><i class="protocol-dot vless"></i><strong>VLESS</strong><small>Reality</small></span></td><td>专属 UUID</td><td><div class="row-actions"><button class="text-button" data-copy="vless" type="button">复制链接</button><button class="text-button" data-detail="vless" type="button">查看详情</button></div></td></tr><tr><td><span class="protocol-label"><i class="protocol-dot vmess"></i><strong>VMess</strong><small>TCP</small></span></td><td>专属 UUID</td><td><div class="row-actions"><button class="text-button" data-copy="vmess" type="button">复制链接</button><button class="text-button" data-detail="vmess" type="button">查看详情</button></div></td></tr><tr><td><span class="protocol-label"><i class="protocol-dot socks"></i><strong>SOCKS5</strong><small>TCP</small></span></td><td>账号 / 密码</td><td><div class="row-actions"><button class="text-button" data-copy="socks" type="button">复制链接</button><button class="text-button" data-detail="socks" type="button">查看详情</button></div></td></tr></tbody></table></div></section>
+            <section class="card residential-card"><div class="card-heading"><div><h3>住宅代理配置</h3><p>仅应用于当前选中的连接。</p></div><span id="upstream-state" class="badge neutral">默认出口</span></div><form id="upstream-form"><fieldset id="upstream-fields" disabled><div class="form-columns"><div><label for="upstream-server">代理服务器</label><input id="upstream-server" name="server" placeholder="代理 IP 或域名" maxlength="253" autocomplete="off" required></div><div><label for="upstream-port">端口</label><input id="upstream-port" name="port" type="number" min="1" max="65535" value="1080" required></div></div><label class="checkbox-label" for="upstream-use-auth"><input id="upstream-use-auth" type="checkbox">使用账号密码认证</label><div id="upstream-auth-fields" class="form-columns" hidden><div><label for="upstream-username">代理用户名</label><input id="upstream-username" name="proxyUsername" autocomplete="off" maxlength="255" disabled></div><div><label for="upstream-password">代理密码</label><div class="password-input"><input id="upstream-password" name="proxyPassword" type="password" autocomplete="new-password" maxlength="255" disabled><button id="toggle-upstream-password" type="button">显示</button></div></div></div><p id="upstream-password-note" class="field-hint" hidden>已保存的密码不会返回，修改配置时请重新填写。</p><div class="form-actions"><button id="save-upstream" class="button primary" type="submit">保存住宅代理</button><button id="restore-direct" class="button secondary" type="button" disabled>恢复默认出口</button></div></fieldset></form><p class="field-hint residential-footnote">未绑定住宅代理时使用默认出口。更换代理不会改变当前连接的认证信息。</p></section>
+          </section>
+  </div>
+  <footer class="manage-dialog-footer"><span>每项修改需点击对应的保存按钮。</span><button id="close-manage-footer" class="button secondary" type="button">关闭</button></footer>
+</dialog>
+<dialog id="profile-dialog" aria-labelledby="profile-dialog-title"><div class="dialog-heading"><h3 id="profile-dialog-title">创建连接</h3><button id="close-profile-dialog" class="icon-button" type="button" aria-label="关闭">×</button></div><form id="profile-form"><label for="profile-name">连接名称</label><input id="profile-name" maxlength="64" placeholder="例如：工作浏览器" autocomplete="off" required><div id="create-quota-row"><label for="create-quota">流量额度（GiB）</label><input id="create-quota" type="number" min="0" step="any" inputmode="decimal" value="300" required><p class="field-hint">默认 300 GiB，可输入其他正数或小数。</p></div><p id="profile-dialog-note" class="field-hint">创建后可为该连接单独配置住宅代理。</p><button id="save-profile" class="button primary wide" type="submit">创建并生成三协议</button></form></dialog>
+<dialog id="connection-dialog" aria-labelledby="dialog-title"><div class="dialog-heading"><div><span class="eyebrow">CONNECTION DETAILS</span><h3 id="dialog-title">连接详情</h3></div><button id="close-dialog" class="icon-button" type="button" aria-label="关闭详情">×</button></div><p id="dialog-description" class="field-hint"></p><label for="detail-link">连接链接</label><textarea id="detail-link" readonly rows="5" spellcheck="false"></textarea><dl id="socks-details" class="detail-grid" hidden><div><dt>服务器</dt><dd id="detail-socks-host">—</dd></div><div><dt>端口</dt><dd id="detail-socks-port">—</dd></div><div><dt>用户名</dt><dd id="detail-socks-user">—</dd></div><div><dt>密码</dt><dd class="password-input"><input id="detail-socks-password" type="password" readonly aria-label="SOCKS5 连接密码"><button id="toggle-socks-password" type="button">显示</button></dd></div></dl><button id="copy-detail-link" class="button primary wide" type="button">复制连接链接</button></dialog>
+</body>
+</html>

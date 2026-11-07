@@ -307,7 +307,33 @@ class OperationResponse(BaseModel):
     message: str | None = None
 
 
-class NodeStatusResponse(BaseModel):
+class StatusMetricSample(BaseModel):
+    """Timing/health only; never connection records or user identifiers."""
+
+    sampledAt: datetime | None = None
+    sampleAgeSeconds: float | None = None
+    stale: bool = True
+    available: bool = False
+    unavailableReason: str | None = None
+
+
+class StatusObservationMetadata(BaseModel):
+    # sampledAt in the legacy projection describes the newest observation;
+    # availability of each independent metric is authoritative below.
+    sampleAttemptedAt: datetime | None = None
+    lastSuccessfulSampledAt: datetime | None = None
+    metricSamples: dict[
+        Literal["singbox", "cpu", "memory", "connections", "systemConnections"], StatusMetricSample
+    ] = Field(default_factory=dict)
+    connectionsSampleAgeSeconds: float | None = None
+    connectionsStale: bool = True
+    connectionsAvailable: bool = False
+    connectionsUnavailableReason: str | None = None
+    enforcementAvailable: bool | None = None
+    enforcementReason: str | None = None
+
+
+class NodeStatusResponse(StatusObservationMetadata):
     userRuntime: dict | None = None
     node: str
     name: str
@@ -318,6 +344,17 @@ class NodeStatusResponse(BaseModel):
     connections: int
     systemConnections: int
     api_available: bool
+    sampledAt: datetime | None = None
+    sampleAgeSeconds: float | None = None
+    sampleStale: bool = True
+    sampleAvailable: bool = False
+    sampleError: str | None = None
+    metricsUnavailable: list[str] = Field(default_factory=list)
+    connectionsCollectedAt: datetime | None = None
+    systemConnectionsSampledAt: datetime | None = None
+    systemConnectionsSampleAgeSeconds: float | None = None
+    systemConnectionsSampleIntervalSeconds: float = 30.0
+    systemConnectionsStale: bool = True
 
 
 class OnlineConnection(BaseModel):
@@ -483,7 +520,7 @@ class NodeSummary(BaseModel):
     domain: str | None = None
     managerVersion: str
     singboxVersion: str
-    status: Literal["online", "offline"]
+    status: Literal["online", "degraded", "offline"]
     singbox: str
     cpu: float
     memory: float
@@ -519,6 +556,55 @@ class TrafficTotals(BaseModel):
     available: bool = False
     source: str = "clash-api-sampled"
     collectedAt: datetime | None = None
+    sampleTime: datetime | None = None
+    stalenessSeconds: float | None = None
+    staleAfterSeconds: float | None = None
+    stale: bool = True
+    telemetryStatus: Literal["fresh", "unavailable"] = "unavailable"
+    telemetryAvailable: bool = False
+    unavailableReason: str | None = None
+    observationAvailable: bool = False
+    enforcementAvailable: bool | None = None
+    enforcementReason: str | None = None
+    measurementQuality: str | None = None
+    measuredTotal: int | None = None
+    lastKnownTotal: int | None = None
+    alertRequired: bool = False
+
+    @model_validator(mode="before")
+    @classmethod
+    def reject_invalid_sample_times(cls, value):
+        if not isinstance(value, dict):
+            return value
+        result = dict(value)
+        invalid = False
+        now = datetime.now(timezone.utc)
+        for field in ("sampleTime", "collectedAt"):
+            stamp = result.get(field)
+            if stamp is None:
+                continue
+            try:
+                parsed = (datetime.fromisoformat(stamp.replace("Z", "+00:00"))
+                          if isinstance(stamp, str) else stamp)
+                valid = (isinstance(parsed, datetime) and parsed.tzinfo is not None
+                         and parsed.utcoffset() is not None and parsed <= now)
+            except (TypeError, ValueError, OverflowError):
+                valid = False
+            if not valid:
+                result[field] = None
+                invalid = True
+        if invalid:
+            result.update(available=False, telemetryAvailable=False, observationAvailable=False,
+                          stale=True, telemetryStatus="unavailable", stalenessSeconds=None,
+                          unavailableReason="sample_time_invalid", measuredTotal=None,
+                          alertRequired=True)
+        return result
+
+    @field_validator("unavailableReason", "enforcementReason")
+    @classmethod
+    def diagnostic_codes_only(cls, value):
+        return value if value is None or (len(value) <= 128 and
+                                         re.fullmatch(r"[a-z][a-z0-9_:.-]*", value)) else None
 
 
 class DeadOutboundInfo(BaseModel):
@@ -530,7 +616,7 @@ class DeadOutboundInfo(BaseModel):
     failCount: int
 
 
-class AgentHeartbeatResponse(BaseModel):
+class AgentHeartbeatResponse(StatusObservationMetadata):
     nodeId: str
     name: str
     host: str
@@ -548,6 +634,17 @@ class AgentHeartbeatResponse(BaseModel):
     traffic: TrafficTotals
     deadOutbounds: list[DeadOutboundInfo] = Field(default_factory=list)
     reportedAt: datetime
+    sampledAt: datetime | None = None
+    sampleAgeSeconds: float | None = None
+    sampleStale: bool = True
+    sampleAvailable: bool = False
+    sampleError: str | None = None
+    metricsUnavailable: list[str] = Field(default_factory=list)
+    connectionsCollectedAt: datetime | None = None
+    systemConnectionsSampledAt: datetime | None = None
+    systemConnectionsSampleAgeSeconds: float | None = None
+    systemConnectionsSampleIntervalSeconds: float = 30.0
+    systemConnectionsStale: bool = True
 
 
 class WireguardPeerApplyRequest(BaseModel):

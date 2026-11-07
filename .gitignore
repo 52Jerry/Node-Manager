@@ -31,9 +31,12 @@ Thumbs.db
 *.egg-info/
 .eggs/
 build/
+!runtime/sing-box/cmd/internal/build/
+!runtime/sing-box/cmd/internal/build/*.go
 dist/
 *.egg
 .cache/
 .vscode/
 .idea/
 node-manager/logs/
+.shared-manager/

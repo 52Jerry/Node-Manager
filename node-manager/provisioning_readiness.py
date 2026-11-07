@@ -5,10 +5,12 @@ import hashlib
 import inspect
 import json
 import os
+from contextvars import ContextVar
 from pathlib import Path
 import re
 import shlex
 import subprocess
+import time
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from auth import verify_token
@@ -18,26 +20,59 @@ from singbox import manager
 router = APIRouter()
 PROTOCOLS = {"vless", "vmess", "socks", "trojan"}
 MAX_FILE = 16 << 20
+OBSERVATION_SECONDS = 3.5
+_deadline = ContextVar("provisioning_observation_deadline", default=None)
+_REASONS = frozenset({
+    "METADATA_TOO_LARGE", "OBSERVATION_TIMEOUT", "OBSERVATION_UNAVAILABLE",
+    "PROCESS_IDENTITY_UNKNOWN", "PROCESS_IDENTITY_UNVERIFIED", "PROCESS_CHANGED",
+    "UNEXPECTED_LISTENER_PROCESS", "LISTENER_OWNER_UNVERIFIED", "CONFIG_CHANGED",
+    "PUBLICATION_INBOUND_MISMATCH", "PUBLICATION_NOT_STEADY", "PUBLICATION_ROUTE_MISMATCH",
+    "PUBLICATION_IDENTITY_UNKNOWN", "UNOWNED_GENERATION", "INVALID_GENERATION_IDENTITY",
+    "GENERATION_PROCESS_CHANGED", "PUBLICATION_HOOK_MISSING", "GENERATION_CONFIG_CHANGED",
+    "GENERATION_INBOUND_MISSING", "LISTENER_OBSERVATION_TIMEOUT", "PROCESS_OBSERVATION_TIMEOUT",
+    "PUBLICATION_OBSERVATION_TIMEOUT", "LISTENER_OBSERVATION_UNAVAILABLE",
+    "PROCESS_OBSERVATION_UNAVAILABLE", "PUBLICATION_OBSERVATION_UNAVAILABLE",
+})
 
 
 class ObservationUnknown(RuntimeError):
-    pass
+    def __init__(self, reason):
+        reason = str(reason).upper()
+        self.reason = reason if reason in _REASONS else "CONFIG_OR_RUNTIME_UNVERIFIED"
+        super().__init__(self.reason)
+
+
+def _remaining():
+    deadline = _deadline.get()
+    remaining = OBSERVATION_SECONDS if deadline is None else deadline - time.monotonic()
+    if remaining <= 0:
+        raise ObservationUnknown("observation_timeout")
+    return remaining
 
 
 def _read(path: Path, watched: dict | None = None) -> bytes:
+    _remaining()
     with path.open("rb") as handle:
         value = handle.read(MAX_FILE + 1)
     if len(value) > MAX_FILE:
         raise ObservationUnknown("metadata_too_large")
     if watched is not None:
+        if path in watched and watched[path] != value:
+            raise ObservationUnknown("config_changed")
         watched[path] = value
     return value
 
 
 def _run(command: list[str]) -> str:
-    result = subprocess.run(command, capture_output=True, text=True, timeout=1)
+    category = {"ss": "LISTENER", "systemctl": "PROCESS", "iptables": "PUBLICATION"}.get(command[0], "OBSERVATION")
+    try:
+        result = subprocess.run(command, capture_output=True, text=True, timeout=min(1, _remaining()))
+    except subprocess.TimeoutExpired:
+        raise ObservationUnknown(category + "_OBSERVATION_TIMEOUT") from None
+    except OSError:
+        raise ObservationUnknown(category + "_OBSERVATION_UNAVAILABLE") from None
     if result.returncode:
-        raise ObservationUnknown("observation_unavailable")
+        raise ObservationUnknown(category + "_OBSERVATION_UNAVAILABLE")
     return result.stdout
 
 
@@ -49,25 +84,66 @@ def _pid(unit: str) -> int:
 
 
 def _identity(pid: int) -> int:
-    path = Path("/proc") / str(pid)
-    executable = Path(os.readlink(path / "exe")).name.removesuffix(" (deleted)")
-    if not executable.startswith(("sing-box", "singbox")):
-        raise ObservationUnknown("unexpected_listener_process")
-    return int((path / "stat").read_text().rsplit(")", 1)[1].split()[19])
+    try:
+        path = Path("/proc") / str(pid)
+        executable = Path(os.readlink(path / "exe")).name
+        if executable.endswith(" (deleted)"):
+            executable = executable[:-10]
+        if not executable.startswith(("sing-box", "singbox")):
+            raise ObservationUnknown("unexpected_listener_process")
+        return int((path / "stat").read_text().rsplit(")", 1)[1].split()[19])
+    except (OSError, ValueError, IndexError):
+        raise ObservationUnknown("process_identity_unverified") from None
 
 
-def _listeners() -> list[dict]:
+def _listeners(ports) -> list[dict]:
     rows = []
-    for line in _run(["ss", "-H", "-lntup"]).splitlines():
+    # -p scans every process's descriptors. Ask the kernel only for the target
+    # listening ports, then prove their inodes against the expected core below.
+    expression = "( " + " or ".join("sport = :" + str(port) for port in sorted(set(ports))) + " )"
+    for line in _run(["ss", "-H", "-lntue", expression]).splitlines():
         parts = line.split()
         if len(parts) < 6 or parts[0] not in {"tcp", "udp"}:
             continue
         match = re.search(r":(\d+)$", parts[4])
         if match:
+            inode = re.search(r"\bino:(\d+)\b", line)
             rows.append({"network": parts[0], "port": int(match[1]),
                          "address": parts[4].rsplit(":", 1)[0].strip("[]"),
-                         "pids": {int(pid) for pid in re.findall(r"pid=(\d+)", line)}})
+                         "inode": int(inode.group(1)) if inode else 0})
     return rows
+
+
+def _owned_sockets(pid: int, inodes: set[int]) -> dict[int, str]:
+    """Find only the required sockets in the expected process, never all /proc."""
+    found = {}
+    try:
+        with os.scandir(Path("/proc") / str(pid) / "fd") as descriptors:
+            for descriptor in descriptors:
+                _remaining()
+                try:
+                    target = os.readlink(descriptor.path)
+                except FileNotFoundError:
+                    continue  # An unrelated connection can close during the scan.
+                match = re.fullmatch(r"socket:\[(\d+)\]", target)
+                if match and int(match.group(1)) in inodes:
+                    found[int(match.group(1))] = descriptor.path
+                    if len(found) == len(inodes):
+                        break
+    except OSError:
+        raise ObservationUnknown("listener_owner_unverified") from None
+    return found
+
+
+def _verify_descriptors(found):
+    # A socket closed/replaced during observation cannot supply a READY proof.
+    for inode, descriptor in found.items():
+        _remaining()
+        try:
+            if os.readlink(descriptor) != "socket:[" + str(inode) + "]":
+                raise ObservationUnknown("listener_owner_unverified")
+        except OSError:
+            raise ObservationUnknown("listener_owner_unverified") from None
 
 
 def _generation(inbound: dict, pid: int, watched: dict) -> tuple[int, int, str]:
@@ -136,14 +212,19 @@ def evaluate(data: dict, protocols: list[str], watched: dict) -> dict:
         if type(port) is not int or not 1 <= port <= 65535:
             return {"state": "UNKNOWN", "reason": "LISTENER_CONFIGURATION_UNKNOWN"}
         requested.append(inbound)
-    pid = _pid("sing-box")
-    if pid:
-        _identity(pid)
-    listeners = _listeners()
+    pid = _pid(config.singbox.service)
+    identities = {pid: _identity(pid)} if pid else {}
+    resolved = []
     for inbound in requested:
         port, owner, listen = _generation(inbound, pid, watched)
         if not owner:
             return {"state": "UNAVAILABLE", "reason": "SERVICE_NOT_RUNNING"}
+        if owner not in identities:
+            identities[owner] = _identity(owner)
+        resolved.append((inbound, port, owner, listen))
+    listeners = _listeners([port for _, port, _, _ in resolved])
+    required = {}
+    for inbound, port, owner, listen in resolved:
         transport = inbound.get("transport") or {}
         network = "udp" if transport.get("type") == "quic" else "tcp"
         address = str(listen).strip("[]")
@@ -152,8 +233,29 @@ def evaluate(data: dict, protocols: list[str], watched: dict) -> dict:
                 and row["address"] in addresses]
         if not rows:
             return {"state": "UNAVAILABLE", "reason": "INBOUND_NOT_LISTENING"}
-        if not any(row["pids"] == {owner} for row in rows):
+        # Every matching listener must be owned by this core. A second socket
+        # on the same address/port (SO_REUSEPORT) must not hide a foreign owner.
+        if any(type(row.get("inode")) is not int or row["inode"] <= 0 for row in rows):
             return {"state": "UNKNOWN", "reason": "LISTENER_OWNER_UNVERIFIED"}
+        required.setdefault(owner, set()).update(row["inode"] for row in rows)
+    descriptors = {}
+    for owner, inodes in required.items():
+        found = _owned_sockets(owner, inodes)
+        if set(found) != inodes:
+            return {"state": "UNKNOWN", "reason": "LISTENER_OWNER_UNVERIFIED"}
+        descriptors[owner] = found
+    # Resolve publication metadata/routes again before granting readiness. The
+    # active generation and its systemd PID must still be the observed pair.
+    if _pid(config.singbox.service) != pid:
+        raise ObservationUnknown("process_changed")
+    for inbound, port, owner, listen in resolved:
+        if _generation(inbound, pid, watched) != (port, owner, listen):
+            raise ObservationUnknown("generation_process_changed")
+    if any(_identity(owner) != identity for owner, identity in identities.items()):
+        raise ObservationUnknown("process_changed")
+    for found in descriptors.values():
+        _verify_descriptors(found)
+    _remaining()
     return {"state": "READY", "reason": "LOCAL_LISTENERS_VERIFIED"}
 
 
@@ -162,6 +264,7 @@ def readiness(protocols: list[str], expected: dict | None = None) -> dict:
     if not protocols or any(name not in PROTOCOLS for name in protocols):
         raise ValueError("unsupported protocol selection")
     watched = {}
+    token = _deadline.set(time.monotonic() + OBSERVATION_SECONDS)
     try:
         data = json.loads(_read(manager.CONFIG_PATH, watched))
         if expected is not None and data != expected:
@@ -169,9 +272,17 @@ def readiness(protocols: list[str], expected: dict | None = None) -> dict:
         result = evaluate(data, protocols, watched)
         if any(_read(path) != value for path, value in watched.items()):
             raise ObservationUnknown("config_changed")
-    except (OSError, ValueError, KeyError, TypeError, AttributeError, IndexError,
-            subprocess.SubprocessError, ObservationUnknown):
+        _remaining()
+    except ObservationUnknown as error:
+        result = {"state": "UNKNOWN", "reason": error.reason}
+    except subprocess.TimeoutExpired:
+        result = {"state": "UNKNOWN", "reason": "OBSERVATION_TIMEOUT"}
+    except OSError:
+        result = {"state": "UNKNOWN", "reason": "METADATA_UNAVAILABLE"}
+    except (ValueError, KeyError, TypeError, AttributeError, IndexError, subprocess.SubprocessError):
         result = {"state": "UNKNOWN", "reason": "CONFIG_OR_RUNTIME_UNVERIFIED"}
+    finally:
+        _deadline.reset(token)
     # No credentials, process IDs, listener ports or full configuration are exposed.
     return {"version": 1, "createGuard": "require_readiness" in inspect.signature(manager.create_user).parameters,
             "protocols": protocols, **result}

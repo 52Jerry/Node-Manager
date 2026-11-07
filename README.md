@@ -8,6 +8,8 @@
 
 Python Node Manager 是部署在每台 sing-box 节点服务器上的管理 Agent，用于管理 sing-box 配置、创建用户节点、绑定住宅 SOCKS5 出口等功能。
 
+独立共享节点用户面板位于 [shared_manager/](shared_manager/README.txt)，支持独立注册登录、本人三协议与订阅、可选 SOCKS5 上游和恢复香港直出。该面板使用独立账号库和 Node Manager 实例。
+
 ## 功能特性
 
 - ✅ 管理本机 sing-box 配置

@@ -213,3 +213,18 @@ def execute_reconciling_idempotent(
             }
             _write_store(store)
             return result, replayed
+
+
+def lookup_receipt(key: str, operation: str, payload: Any) -> dict[str, Any]:
+    """Read the exact encrypted receipt. Missing/expired evidence never authorizes a replay."""
+    fingerprint = _fingerprint(operation, payload)
+    with store_lock:
+        entry = _read_store()["entries"].get(key)
+        if not isinstance(entry, dict) or time.time() - float(entry.get("createdAt", 0)) > RETENTION_SECONDS:
+            return {"state": "UNKNOWN"}
+        if entry.get("fingerprint") != fingerprint:
+            raise IdempotencyConflict("the idempotency key was already used with a different request")
+        result = _decrypt_response(entry.get("responseEncrypted"))
+        if result is None and isinstance(entry.get("response"), dict):
+            result = entry["response"]
+        return {"state": "CONFIRMED", "result": result} if result is not None else {"state": "UNKNOWN"}

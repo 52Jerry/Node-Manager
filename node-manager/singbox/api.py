@@ -187,9 +187,10 @@ class SingboxAPI:
             logger.warning("VLESS generation API unavailable: %s", type(exc).__name__)
             return False
         try:
-            response = requests.get(f"{self.base_url}/proxies", headers=self.headers, timeout=2)
+            # Liveness does not require rendering every configured outbound.
+            response = requests.get(f"{self.base_url}/version", headers=self.headers, timeout=2)
             return response.status_code == 200
-        except:
+        except Exception:
             return False
 
     def create_user_inbound(self, user_id, protocol, port, uuid=None, username=None, password=None):

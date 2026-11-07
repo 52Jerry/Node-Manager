@@ -85,21 +85,34 @@ func (l *Listener) ListenTCP() (net.Listener, error) {
 func (l *Listener) loopTCPIn() {
 	tcpListener := l.tcpListener
 	var metadata adapter.InboundContext
+	var retryDelay time.Duration
 	for {
+		if l.shutdown.Load() || l.ctx.Err() != nil {
+			return
+		}
 		conn, err := tcpListener.Accept()
 		if err != nil {
+			if l.shutdown.Load() || l.ctx.Err() != nil {
+				return
+			}
 			//nolint:staticcheck
 			if netError, isNetError := err.(net.Error); isNetError && netError.Temporary() {
 				l.logger.Error(err)
+				retryDelay = nextTCPAcceptRetryDelay(retryDelay)
+				timer := time.NewTimer(retryDelay)
+				select {
+				case <-l.ctx.Done():
+					timer.Stop()
+					return
+				case <-timer.C:
+				}
 				continue
 			}
-			if l.shutdown.Load() && E.IsClosed(err) {
-				return
-			}
-			l.tcpListener.Close()
+			tcpListener.Close()
 			l.logger.Error("tcp listener closed: ", err)
-			continue
+			return
 		}
+		retryDelay = 0
 		//nolint:staticcheck
 		metadata.InboundDetour = l.listenOptions.Detour
 		metadata.Source = M.SocksaddrFromNet(conn.RemoteAddr()).Unwrap()
@@ -108,4 +121,14 @@ func (l *Listener) loopTCPIn() {
 		l.logger.InfoContext(ctx, "inbound connection from ", metadata.Source)
 		go l.connHandler.NewConnectionEx(ctx, conn, metadata, nil)
 	}
+}
+
+func nextTCPAcceptRetryDelay(previous time.Duration) time.Duration {
+	if previous == 0 {
+		return 5 * time.Millisecond
+	}
+	if previous >= time.Second/2 {
+		return time.Second
+	}
+	return previous * 2
 }

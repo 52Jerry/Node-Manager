@@ -8,6 +8,7 @@ import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from urllib.parse import unquote
 from unittest.mock import MagicMock, patch
 
@@ -2114,7 +2115,8 @@ class ApiTestCase(unittest.TestCase):
             ),
             patch.object(main, "_singbox_version", return_value="1.13.14"),
             patch.object(main, "is_api_available", return_value=True),
-            patch.object(main, "read_registry", return_value={"users": {"a": {}, "b": {}}}),
+            patch.object(main, "get_user_monitoring_snapshot", return_value=SimpleNamespace(
+                registry_user_count=2, listed_user_count=2, socks_port=5001)),
             patch.object(main, "list_users", side_effect=AssertionError("heartbeat must not mutate users")),
             patch.object(
                 main,
@@ -2200,6 +2202,13 @@ class TrafficTestCase(unittest.TestCase):
         self.path_patch.start()
         self.policy_patch.start()
         self.auth_map = self.auth_map_patch.start()
+        # The collector now consumes one paired projection. Keep the existing
+        # synthetic policy/auth controls together for these accounting tests.
+        projection_patch = patch.object(traffic, "get_user_monitoring_snapshot",
+            side_effect=lambda: SimpleNamespace(policies=traffic.get_user_policies(),
+                                                auth_map=traffic.get_user_auth_map()))
+        projection_patch.start()
+        self.addCleanup(projection_patch.stop)
         self.enforcement = self.enforcement_patch.start()
 
     def tearDown(self):

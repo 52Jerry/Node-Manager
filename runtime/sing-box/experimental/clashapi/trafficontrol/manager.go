@@ -1,7 +1,6 @@
 package trafficontrol
 
 import (
-	"runtime"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -42,7 +41,7 @@ type Manager struct {
 	connections             compatible.Map[uuid.UUID, Tracker]
 	closedConnectionsAccess sync.Mutex
 	closedConnections       list.List[TrackerMetadata]
-	memory                  uint64
+	memory                  memorySampler
 
 	eventSubscriber *observable.Subscriber[ConnectionEvent]
 }
@@ -147,15 +146,11 @@ func (m *Manager) Snapshot() *Snapshot {
 		return true
 	})
 
-	var memStats runtime.MemStats
-	runtime.ReadMemStats(&memStats)
-	m.memory = memStats.StackInuse + memStats.HeapInuse + memStats.HeapIdle - memStats.HeapReleased
-
 	return &Snapshot{
 		Upload:      m.uploadTotal.Load(),
 		Download:    m.downloadTotal.Load(),
 		Connections: connections,
-		Memory:      m.memory,
+		Memory:      m.Memory(),
 	}
 }
 

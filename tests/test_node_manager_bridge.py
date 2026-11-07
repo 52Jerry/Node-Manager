@@ -97,6 +97,7 @@ def reload_function(monkeypatch):
         "json": json,
         "Path": Path,
         "subprocess": subprocess,
+        "config": types.SimpleNamespace(singbox=types.SimpleNamespace(service="sing-box")),
         "logger": logging.getLogger("test"),
         "_restart_allowed": types.SimpleNamespace(get=lambda: False),
         "is_singbox_running": lambda: True,

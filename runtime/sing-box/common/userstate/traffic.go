@@ -53,11 +53,11 @@ func (m *Manager) RoutedPacketConnection(_ context.Context, conn N.PacketConn, m
 // A collector must pair them with RuntimeStatus.InstanceID across restarts.
 func (m *Manager) Counters() []TrafficSnapshot {
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	result := make([]TrafficSnapshot, 0, len(m.counters))
 	for key, counter := range m.counters {
 		result = append(result, TrafficSnapshot{key.inbound, key.user, counter.upload.Load(), counter.download.Load()})
 	}
+	m.mu.Unlock()
 	sort.Slice(result, func(i, j int) bool {
 		if result[i].Inbound != result[j].Inbound {
 			return result[i].Inbound < result[j].Inbound

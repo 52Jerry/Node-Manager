@@ -9,16 +9,32 @@ import hashlib
 import json
 import os
 import tempfile
+import threading
 from contextlib import contextmanager
 from contextvars import ContextVar
 from pathlib import Path
 from singbox import manager
 from singbox.runtime_client import RuntimeClient, RuntimeUnavailable, RuntimeRejected, enabled, check_mode
+from runtime_metrics import timed
 
 class RuntimeRecoveryRequired(manager.SingboxConfigError):
     pass
 
 related_targets = ContextVar("runtime_related_targets", default=None)
+
+# One verified baseline, never a history-sized config cache. A raw disk digest
+# is paired with this exact socket/process/revision's normalized native hash.
+# A cache miss still asks the core to normalize the old configuration.
+_baseline_lock = threading.Lock()
+_verified_baseline = None
+
+
+def _remember_baseline(config, receipt):
+    from singbox.runtime_client import validate_status
+    value = (check_mode(), digest(config), validate_status(receipt))
+    global _verified_baseline
+    with _baseline_lock:
+        _verified_baseline = value
 
 def paths():
     root = Path(os.environ.get("NODE_MANAGER_RUNTIME_STATE_DIR", str(manager.REGISTRY_PATH.parent / "runtime")))
@@ -91,16 +107,41 @@ def stage_related(path, value):
         raise manager.SingboxConfigError("related runtime transaction is missing")
     targets[Path(path)] = canonical(value)
 
+@timed("prepare")
 def prepare(previous, desired):
-    check_mode()
+    socket_path = check_mode()
     client = RuntimeClient()
-    old = client.preview(previous)
+    previous_digest = digest(previous)
+    with _baseline_lock:
+        cached = _verified_baseline
+    # This exact process/revision already normalized these identical raw
+    # options. A small status read can reuse that proof; the subsequent
+    # metadata publication still requires its own durable CAS fence.
+    if (cached is not None and cached[:2] == (socket_path, previous_digest)
+            and digest(desired) == previous_digest):
+        try:
+            observed = client.status()
+        except (RuntimeUnavailable, RuntimeRejected):
+            observed = None
+        if observed == cached[2]:
+            if check_mode() != socket_path:
+                raise RuntimeRecoveryRequired("runtime socket changed during preparation")
+            return {"socket": socket_path, "expected": observed,
+                    "previousHash": observed["contentHash"], "targetHash": observed["contentHash"]}
+    # All other paths preview the target. Its receipt also proves whether the
+    # cached baseline still belongs to the running process and revision.
     target = client.preview(desired)
+    if cached is not None and cached[:2] == (socket_path, previous_digest) and cached[2] == target["runtime"]:
+        old = {"runtime": cached[2], "contentHash": cached[2]["contentHash"]}
+    else:
+        old = client.preview(previous)
     if old["runtime"] != target["runtime"] or old["runtime"]["contentHash"] != old["contentHash"]:
         raise manager.SingboxConfigError("runtime configuration drift; publication refused")
     if not target["supported"]:
         raise manager.SingboxConfigError("unsupported runtime topology change; publication refused")
-    return {"socket": check_mode(), "expected": old["runtime"], "previousHash": old["contentHash"], "targetHash": target["contentHash"]}
+    if check_mode() != socket_path:
+        raise RuntimeRecoveryRequired("runtime socket changed during preparation")
+    return {"socket": socket_path, "expected": old["runtime"], "previousHash": old["contentHash"], "targetHash": target["contentHash"]}
 
 def resolve(prepared):
     """Prove applied, or fence every delayed PUT before proving unchanged."""
@@ -125,6 +166,7 @@ def resolve(prepared):
         return "unchanged", fenced
     raise RuntimeRecoveryRequired("runtime changed during recovery; journal retained")
 
+@timed("native_apply")
 def publish(data, prepared):
     client = RuntimeClient()
     try:
@@ -138,6 +180,80 @@ def publish(data, prepared):
         pass
     return resolve(prepared)
 
+
+def _metadata_expected(prepared):
+    """Validate the separate metadata protocol without approximating core hashes."""
+    from singbox.runtime_client import validate_status
+    expected = validate_status(prepared.get("expected"))
+    if (prepared.get("mode") != "metadata-fence"
+            or prepared.get("previousHash") != prepared.get("targetHash")
+            or expected["contentHash"] != prepared.get("previousHash")):
+        raise RuntimeRecoveryRequired("invalid metadata publication intent")
+    if prepared.get("socket") != check_mode():
+        raise RuntimeRecoveryRequired("runtime socket changed during metadata publication")
+    return expected
+
+
+def _metadata_observed(prepared, status):
+    expected = _metadata_expected(prepared)
+    if (status["instanceId"] != expected["instanceId"]
+            or status["contentHash"] != expected["contentHash"]
+            or status["revision"] < expected["revision"]):
+        raise RuntimeRecoveryRequired("runtime changed during metadata publication; journal retained")
+    return expected
+
+
+def resolve_metadata(prepared, proof=None):
+    """Only a durable, exactly matching CAS receipt may roll metadata forward.
+
+    Missing proof means the bundle has not been written. Even if a timed-out
+    fence took effect, another verified fence safely invalidates delayed calls
+    before aborting this intent. A same config hash alone proves no outcome.
+    """
+    from singbox.runtime_client import validate_status
+    expected = _metadata_expected(prepared)
+    client = RuntimeClient()
+    for _ in range(3):
+        status = client.status()
+        _metadata_observed(prepared, status)
+        if proof is not None:
+            proof = validate_status(proof)
+            if (proof["instanceId"] != expected["instanceId"]
+                    or proof["contentHash"] != expected["contentHash"]
+                    or proof["revision"] != expected["revision"] + 1
+                    or status != proof):
+                raise RuntimeRecoveryRequired("metadata fence proof no longer matches runtime; journal retained")
+            return "applied", proof
+        try:
+            fenced = client.fence(status)
+        except RuntimeRejected as error:
+            if error.status == 409:
+                continue
+            raise
+        _metadata_observed(prepared, fenced)
+        if (fenced["revision"] != status["revision"] + 1
+                or client.status() != fenced):
+            raise RuntimeRecoveryRequired("metadata abort fence could not be verified; journal retained")
+        return "unchanged", fenced
+    raise RuntimeRecoveryRequired("runtime changed during metadata recovery; journal retained")
+
+
+@timed("native_apply")
+def publish_metadata(prepared):
+    """Use a small CAS barrier for an already-previewed unchanged core config."""
+    expected = _metadata_expected(prepared)
+    client = RuntimeClient()
+    try:
+        receipt = client.fence(expected)
+        if (receipt["instanceId"] == expected["instanceId"]
+                and receipt["contentHash"] == expected["contentHash"]
+                and receipt["revision"] == expected["revision"] + 1
+                and client.status() == receipt):
+            return "applied", receipt
+    except (RuntimeUnavailable, RuntimeRejected):
+        pass
+    return resolve_metadata(prepared)
+
 def _remove_journal():
     journal, _ = paths()
     journal.unlink(missing_ok=True)
@@ -149,7 +265,12 @@ def _remove_journal():
         # publication after committing and removing its recovery record.
         manager.logger.warning("runtime journal deletion sync failed; committed outcome retained")
 
+@timed("file_bundle")
 def _write_records(records):
+    # A WAL may replace config and registry one at a time. Invalidate before
+    # either write, including rollback/recovery; readers reload only after the
+    # config lock is released and no uncertain transaction remains.
+    manager._invalidate_monitoring_snapshot()
     for path, record in records.items():
         restore(path, record)
     for path, record in records.items():
@@ -185,6 +306,7 @@ def merge_aliases(data, registry, aliases):
         raise manager.SingboxConfigError("runtime authentication name belongs to another historical user")
     return aliases
 
+@timed("receipt")
 def _receipt(config, receipt, aliases=None, archived_versions=None):
     import runtime_history as history
     previous = read_aliases()
@@ -196,13 +318,26 @@ def _receipt(config, receipt, aliases=None, archived_versions=None):
     history.bind_owners(aliases)
     history.versions(archived_versions or {})
     atomic(paths()[1], canonical({"version": 1, "config": config, "runtime": receipt, "authAliases": aliases}))
+    _remember_baseline(config, receipt)
 
+@timed("publication")
 def commit_files(config, previous_config, targets, prepared=None):
     assert_no_pending()
     prepared = prepare(previous_config, config) if prepared is None else prepared
+    # Do not infer equality from a normalized hash alone. Only an unchanged raw
+    # config that also passed the normal preview/drift checks uses this path.
+    metadata_only = (canonical(config) == canonical(previous_config)
+                     and prepared["previousHash"] == prepared["targetHash"])
+    if metadata_only:
+        prepared = {**prepared, "mode": "metadata-fence"}
+        _metadata_expected(prepared)
     targets = {Path(path): data for path, data in targets.items()}
     targets.update(related_targets.get() or {})
-    desired_registry = json.loads(targets.get(manager.REGISTRY_PATH, canonical(manager.read_registry())))
+    # dict.get evaluates its fallback even on a hit. The registry is normally
+    # already staged; avoid reading/encoding that full file a second time.
+    registry_bytes = targets.get(manager.REGISTRY_PATH)
+    previous_registry = manager.read_registry()
+    desired_registry = json.loads(registry_bytes) if registry_bytes is not None else previous_registry
     active_ids = manager._discover_user_ids(config, desired_registry)
     archived_versions = {uid:version for uid,version in desired_registry.get("runtimeUserVersions",{}).items() if uid not in active_ids}
     if archived_versions:
@@ -217,9 +352,11 @@ def commit_files(config, previous_config, targets, prepared=None):
                       "mode": old["mode"] if old else 0o600,
                       "owner": old["owner"] if old else None}
     old_receipt = capture(paths()[1])
-    aliases = merge_aliases(previous_config, manager.read_registry(), read_aliases())
+    aliases = merge_aliases(previous_config, previous_registry, read_aliases())
     aliases = merge_aliases(config, desired_registry, aliases)
-    journal = {"version": 1, "prepared": prepared, "config": config,
+    # Version 2 is deliberate: old v1 recovery must refuse a metadata intent,
+    # rather than interpreting its equal before/after hashes as applied.
+    journal = {"version": 2 if metadata_only else 1, "prepared": prepared, "config": config,
                "before": before, "after": after, "oldReceipt": old_receipt, "authAliases": aliases, "archivedVersions":archived_versions}
     journal["integrity"] = digest(journal)
     try:
@@ -230,8 +367,20 @@ def commit_files(config, previous_config, targets, prepared=None):
             raise RuntimeRecoveryRequired("runtime journal persistence uncertain; recovery required") from error
         raise
     try:
-        _write_records(after)
-        outcome, receipt = publish(config, prepared)
+        if metadata_only:
+            outcome, receipt = publish_metadata(prepared)
+            if outcome == "unchanged":
+                # The bundle is untouched until its fence proof is durable.
+                _remove_journal()
+                raise manager.SingboxConfigError("runtime metadata fence rejected; previous files retained")
+            journal.pop("integrity")
+            journal["metadataFence"] = receipt
+            journal["integrity"] = digest(journal)
+            atomic(paths()[0], canonical(journal))
+            _write_records(after)
+        else:
+            _write_records(after)
+            outcome, receipt = publish(config, prepared)
         if outcome == "unchanged":
             _write_records(before)
             restore(paths()[1], old_receipt)
@@ -266,13 +415,26 @@ def recover_locked(*, return_receipt=False):
         check_mode()
         journal = json.loads(journal_path.read_text(encoding="utf-8"))
         integrity = journal.pop("integrity")
-        if journal.get("version") != 1 or digest(journal) != integrity:
+        version = journal.get("version")
+        if version not in (1, 2) or digest(journal) != integrity:
             raise ValueError("invalid runtime journal")
-        outcome, receipt = resolve(journal["prepared"])
+        metadata_only = version == 2
+        if metadata_only != (journal["prepared"].get("mode") == "metadata-fence"):
+            raise ValueError("invalid runtime journal mode")
+        if metadata_only:
+            proof = None
+            if "metadataFence" in journal:
+                from singbox.runtime_client import validate_status
+                proof = validate_status(journal["metadataFence"])
+            outcome, receipt = resolve_metadata(journal["prepared"], proof)
+        else:
+            outcome, receipt = resolve(journal["prepared"])
         if outcome == "applied":
             _write_records(journal["after"])
             _receipt(journal["config"], receipt, journal["authAliases"],journal.get("archivedVersions",{}))
-        else:
+        elif not metadata_only:
+            # Metadata without durable fence proof never wrote the bundle.
+            # Leave unrelated/newer counter data untouched when aborting it.
             _write_records(journal["before"])
             restore(paths()[1], journal["oldReceipt"])
         _remove_journal()

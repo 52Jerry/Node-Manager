@@ -6,6 +6,7 @@
 | --- | --- |
 | 功能、结构和运行方式 | [项目 README](../README.md) |
 | API 接口 | [API 接口文档](../doc/API接口文档.md) |
+| 独立共享节点用户面板、订阅与隔离部署 | [共享面板说明](../shared_manager/README.txt) |
 | Python Agent 开发 | [开发文档](../doc/Python-Node-Manager-开发文档.md) |
 | sing-box 设计 | [架构方案](../doc/singbox架构方案.md) |
 | 发布包、恢复日志及流量去重 | [revision-and-traffic-accounting.md](revision-and-traffic-accounting.md) |

@@ -4,6 +4,8 @@ import logging
 import os
 import socket
 import subprocess
+import shutil
+import threading
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -64,7 +66,7 @@ from revision import (
     get_revision_state,
     rollback_to_last_known_good,
 )
-from monitor.status import get_node_status
+from monitor.status import get_node_status, start_status_sampler, stop_status_sampler
 from monitor.traffic import (
     collect_traffic,
     delete_user_traffic,
@@ -104,6 +106,7 @@ from singbox.manager import (
     set_user_access,
     UserAccessConnectionError,
     get_user_policies,
+    get_user_monitoring_snapshot,
     update_proxy_metadata,
     update_user_policy,
     apply_default_traffic_limit,
@@ -242,6 +245,7 @@ def startup_tasks():
     except Exception:
         logging.getLogger(__name__).exception("could not migrate existing user traffic outbounds")
     start_traffic_collector()
+    start_status_sampler()
     start_health_checker()
     start_expiration_scheduler()
     start_reconciler()
@@ -249,6 +253,7 @@ def startup_tasks():
 
 @app.on_event("shutdown")
 def shutdown_tasks():
+    stop_status_sampler()
     stop_reconciler()
     stop_expiration_scheduler()
     stop_health_checker()
@@ -464,6 +469,34 @@ def create_user_endpoint(
     )
     response.headers["Idempotency-Replayed"] = str(replayed).lower()
     return result
+
+
+class OperationReceiptRequest(BaseModel):
+    model_config = {"extra": "forbid"}
+    key: str = Field(min_length=1, max_length=128)
+    operation: Literal["create-user", "bind-proxy", "delete-user"]
+    payload: dict
+
+
+@app.post("/api/agent/operation-receipt", tags=["agent"])
+def operation_receipt(request: OperationReceiptRequest, response: Response, _token: str = Depends(verify_token)):
+    from idempotency import lookup_receipt
+    from pydantic import ValidationError
+    response.headers["Cache-Control"] = "no-store, private"
+    try:
+        if request.operation == "create-user":
+            payload = CreateUserRequest.model_validate(request.payload).model_dump(mode="json")
+            payload.pop("requireReadiness", None)
+        elif request.operation == "bind-proxy":
+            payload = BindProxyRequest.model_validate(request.payload).model_dump(mode="json")
+        else:
+            user_id = request.payload.get("userId")
+            if not isinstance(user_id, str) or not user_id or len(user_id) > 64 or set(request.payload) != {"userId"}:
+                raise HTTPException(422, "invalid operation identity")
+            payload = {"userId": user_id}
+    except ValidationError:
+        raise HTTPException(422, "invalid operation identity") from None
+    return lookup_receipt(request.key, request.operation, payload)
 
 
 @app.post(
@@ -745,6 +778,33 @@ def bind_proxy_endpoint(
         ),
     )
     response.headers["Idempotency-Replayed"] = str(replayed).lower()
+    return result
+
+
+class RestoreDirectRequest(BaseModel):
+    model_config = {"extra": "forbid"}
+    expectedUuid: str = Field(pattern=r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
+    expectedSocksUsername: str = Field(min_length=1, max_length=255)
+
+
+@app.post("/api/user/{userId}/direct", response_model=OperationResponse, tags=["users"])
+def restore_user_direct_endpoint(
+    userId: str,
+    request: RestoreDirectRequest,
+    response: Response,
+    idempotency_key: str = Header(alias="Idempotency-Key", min_length=1, max_length=128),
+    _token: str = Depends(verify_token),
+):
+    if not userId or len(userId) > 64:
+        raise HTTPException(422, "invalid userId")
+    from user_direct import restore_direct
+    payload = {"userId": userId, **request.model_dump(mode="json")}
+    result, replayed = execute_idempotent(
+        idempotency_key, "restore-user-direct", payload,
+        lambda: restore_direct(userId, request.expectedUuid, request.expectedSocksUsername),
+    )
+    response.headers["Idempotency-Replayed"] = str(replayed).lower()
+    response.headers["Cache-Control"] = "no-store"
     return result
 
 
@@ -1139,9 +1199,10 @@ def get_agent_info(_token: str = Depends(verify_token)):
 )
 def get_agent_heartbeat(_token: str = Depends(verify_token)):
     current = get_node_status(config.node.id)
+    monitoring = get_user_monitoring_snapshot()
     api_available = is_api_available()
     status = "online" if current["singbox"] == "running" and api_available else "degraded"
-    if current["singbox"] != "running":
+    if current["singbox"] == "stopped":
         status = "offline"
     return {
         "nodeId": config.node.id,
@@ -1156,13 +1217,22 @@ def get_agent_heartbeat(_token: str = Depends(verify_token)):
         "memory": current["memory"],
         "connections": current["connections"],
         "systemConnections": current["systemConnections"],
-        "userCount": len(read_registry().get("users", {})),
-        "socksPort": get_socks_inbound_port(),
+        "userCount": monitoring.registry_user_count,
+        "socksPort": monitoring.socks_port,
         # The collector samples traffic in the background. Avoid an extra
         # synchronous sing-box request on every control-plane heartbeat.
         "traffic": get_traffic_totals(refresh=False),
         "deadOutbounds": get_dead_outbounds(),
         "reportedAt": datetime.now(timezone.utc),
+        **{key: current[key] for key in (
+            "sampledAt", "sampleAgeSeconds", "sampleStale", "sampleAvailable",
+            "sampleError", "metricsUnavailable", "connectionsCollectedAt",
+            "systemConnectionsSampledAt", "systemConnectionsSampleAgeSeconds",
+            "systemConnectionsSampleIntervalSeconds", "systemConnectionsStale",
+            "sampleAttemptedAt", "lastSuccessfulSampledAt", "metricSamples",
+            "connectionsSampleAgeSeconds", "connectionsStale", "connectionsAvailable",
+            "connectionsUnavailableReason", "enforcementAvailable", "enforcementReason",
+        ) if key in current},
     }
 
 
@@ -1171,10 +1241,39 @@ def _manager_version() -> str:
     return version_path.read_text(encoding="utf-8").strip() if version_path.exists() else app.version
 
 
+_core_version_lock = threading.Lock()
+_core_version_cache: tuple | None = None
+
+
+def _binary_version_identity(binary: str) -> tuple | None:
+    try:
+        path = Path(shutil.which(binary) or binary).resolve()
+        stat = path.stat()
+        return (str(path), stat.st_dev, stat.st_ino, stat.st_size,
+                stat.st_mtime_ns, stat.st_ctime_ns)
+    except (OSError, ValueError):
+        return None
+
+
 def _singbox_version() -> str:
+    global _core_version_cache
+    binary = str(getattr(config.singbox, "binary", "sing-box"))
+    identity = _binary_version_identity(binary)
+    with _core_version_lock:
+        if identity is not None and _core_version_cache is not None and _core_version_cache[0] == identity:
+            return _core_version_cache[1]
+        value = _query_singbox_version(binary)
+        # Failed discovery must be retryable; atomic binary replacements and
+        # PATH/symlink changes invalidate successful version results.
+        if identity is not None and value != "unknown" and identity == _binary_version_identity(binary):
+            _core_version_cache = (identity, value)
+        return value
+
+
+def _query_singbox_version(binary: str) -> str:
     try:
         result = subprocess.run(
-            [getattr(config.singbox, "binary", "sing-box"), "version"], capture_output=True, text=True, timeout=5, check=False
+            [binary, "version"], capture_output=True, text=True, timeout=5, check=False
         )
     except (FileNotFoundError, subprocess.TimeoutExpired):
         return "unknown"
@@ -1199,7 +1298,8 @@ def get_nodes(
     _token: str = Depends(verify_token),
 ):
     current = get_node_status(config.node.id)
-    node_status = "online" if current["singbox"] == "running" else "offline"
+    monitoring = get_user_monitoring_snapshot()
+    node_status = {"running": "online", "stopped": "offline"}.get(current["singbox"], "degraded")
     node = {
         "nodeId": config.node.id,
         "name": config.node.name,
@@ -1213,7 +1313,7 @@ def get_nodes(
         "memory": current["memory"],
         "connections": current["connections"],
         "systemConnections": current["systemConnections"],
-        "userCount": len(list_users()),
+        "userCount": monitoring.listed_user_count,
         "apiAvailable": is_api_available(),
         "lastHeartbeatAt": datetime.now(timezone.utc),
     }
@@ -1226,4 +1326,4 @@ def get_nodes(
 if __name__ == "__main__":
     import uvicorn
 
-    uvicorn.run(app, host="0.0.0.0", port=config.server.port)
+    uvicorn.run(app, host="127.0.0.1", port=config.server.port)

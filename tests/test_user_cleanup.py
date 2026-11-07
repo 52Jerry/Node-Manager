@@ -39,7 +39,11 @@ class UserCleanupTests(unittest.TestCase):
     def write(self, data): self.config.write_text(json.dumps(data), encoding="utf-8")
     def set_expiry(self, user_id, value):
         data = json.loads(self.registry.read_text()); data["users"][user_id]["expiresAt"] = value.isoformat()
-        self.registry.write_text(json.dumps(data), encoding="utf-8")
+        # Match the production writer's atomic replacement contract; equal-size
+        # in-place fixture rewrites can retain the same Windows file version.
+        temporary = self.registry.with_suffix(".expiry-pending.json")
+        temporary.write_text(json.dumps(data), encoding="utf-8")
+        temporary.replace(self.registry)
     def prepare(self): return cleanup.snapshot("expired")
     def invalid(self, snapshot):
         with patch.object(cleanup, "_probe_once", return_value=("INVALID", "PROXY_AUTH_REJECTED")):
