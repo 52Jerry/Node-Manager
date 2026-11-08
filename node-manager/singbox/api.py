@@ -38,10 +38,10 @@ class SingboxAPI:
             response = requests.get(f"{self.base_url}/proxies", headers=self.headers, timeout=3)
             if response.status_code == 200:
                 return response.json()
-            logger.error(f"Failed to get proxies: {response.text}")
+            logger.error("Failed to get proxies: HTTP %s", response.status_code)
             return None
         except Exception as e:
-            logger.warning(f"Sing-box API not available: {e}")
+            logger.warning("Sing-box proxy metrics are not available: %s", type(e).__name__)
             return None
 
     def get_connections(self):
@@ -80,7 +80,7 @@ class SingboxAPI:
             if publication is not None:
                 return publication.close(connection_id)
         except Exception as exc:
-            logger.warning("VLESS generation API unavailable: %s", type(exc).__name__)
+            logger.warning("Could not access VLESS generation when closing connection: %s", type(exc).__name__)
             return False
         try:
             response = requests.delete(
@@ -90,10 +90,10 @@ class SingboxAPI:
             )
             if response.status_code in {200, 204, 404}:
                 return True
-            logger.error("Failed to close connection %s: %s", connection_id, response.text)
+            logger.error("Failed to close connection %s: HTTP %s", connection_id, response.status_code)
             return False
         except Exception as exc:
-            logger.warning("Could not close sing-box connection %s: %s", connection_id, exc)
+            logger.warning("Could not close sing-box connection %s: %s", connection_id, type(exc).__name__)
             return False
 
     def add_proxy(self, proxy_data):
@@ -105,12 +105,12 @@ class SingboxAPI:
                 timeout=5,
             )
             if response.status_code == 200:
-                logger.info(f"Added proxy: {proxy_data['name']}")
+                logger.info("Added proxy: %s", proxy_data['name'])
                 return True
-            logger.error(f"Failed to add proxy: {response.text}")
+            logger.error("Failed to add proxy: HTTP %s", response.status_code)
             return False
         except Exception as e:
-            logger.warning(f"Sing-box API not available: {e}")
+            logger.warning("Could not add sing-box proxy: %s", type(e).__name__)
             return False
 
     def remove_proxy(self, proxy_name):
@@ -121,12 +121,12 @@ class SingboxAPI:
                 timeout=5,
             )
             if response.status_code == 200:
-                logger.info(f"Removed proxy: {proxy_name}")
+                logger.info("Removed proxy: %s", proxy_name)
                 return True
-            logger.error(f"Failed to remove proxy: {response.text}")
+            logger.error("Failed to remove proxy: HTTP %s", response.status_code)
             return False
         except Exception as e:
-            logger.warning(f"Sing-box API not available: {e}")
+            logger.warning("Could not remove sing-box proxy: %s", type(e).__name__)
             return False
 
     def add_rule(self, rule_data):
@@ -138,12 +138,12 @@ class SingboxAPI:
                 timeout=5,
             )
             if response.status_code == 200:
-                logger.info(f"Added rule")
+                logger.info("Added rule")
                 return True
-            logger.error(f"Failed to add rule: {response.text}")
+            logger.error("Failed to add rule: HTTP %s", response.status_code)
             return False
         except Exception as e:
-            logger.warning(f"Sing-box API not available: {e}")
+            logger.warning("Could not add sing-box rule: %s", type(e).__name__)
             return False
 
     def remove_rule(self, rule_id):
@@ -154,12 +154,12 @@ class SingboxAPI:
                 timeout=5,
             )
             if response.status_code == 200:
-                logger.info(f"Removed rule: {rule_id}")
+                logger.info("Removed rule: %s", rule_id)
                 return True
-            logger.error(f"Failed to remove rule: {response.text}")
+            logger.error("Failed to remove rule: HTTP %s", response.status_code)
             return False
         except Exception as e:
-            logger.warning(f"Sing-box API not available: {e}")
+            logger.warning("Could not remove sing-box rule: %s", type(e).__name__)
             return False
 
     def reload(self):
@@ -172,10 +172,10 @@ class SingboxAPI:
             if response.status_code == 200:
                 logger.info("Sing-box config reloaded via API")
                 return True
-            logger.error(f"Failed to reload: {response.text}")
+            logger.error("Failed to reload: HTTP %s", response.status_code)
             return False
         except Exception as e:
-            logger.warning(f"Sing-box API not available: {e}")
+            logger.warning("Could not reload sing-box: %s", type(e).__name__)
             return False
 
     def is_available(self):

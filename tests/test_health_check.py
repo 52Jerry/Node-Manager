@@ -105,6 +105,14 @@ class HealthCheckTests(unittest.TestCase):
         self.assertEqual(sum(call.args[0].startswith("DEAD OUTBOUNDS DETECTED")
                              for call in warning.call_args_list), 1)
 
+    def test_bulk_outage_keeps_full_review_list_but_bounds_log_samples(self):
+        outbounds = [self.outbound(str(user)) for user in range(200)]
+        with patch.object(health_check.logger, "warning") as warning:
+            self.run_rounds([outbounds], [False] * 200, fail_threshold=1)
+        self.assertEqual(len(health_check.get_dead_outbounds()), 200)
+        self.assertEqual(warning.call_count, 12)
+        self.assertEqual(sum("[DEAD]" in call.args[0] for call in warning.call_args_list), 10)
+
     def test_recovery_removes_unresolved_failure_and_resets_threshold(self):
         outbound = self.outbound()
         self.run_rounds([[outbound]] * 4, [False, False, True, False])

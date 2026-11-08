@@ -23,7 +23,7 @@ from pathlib import Path
 from idempotency import _encrypt_response, _decrypt_response, IdempotencyConflict
 from singbox.errors import SingboxConfigError
 import runtime_metrics
-from runtime_queue_policy import DurablePolicy, access_policy, select_batch, error_category
+from runtime_queue_policy import DurablePolicy, access_policy, pending_intent_policy, select_batch, error_category
 
 submission_size = contextvars.ContextVar("runtime_submission_bytes", default=2048)
 # A caller may stop waiting after durable admission without cancelling work.
@@ -106,6 +106,7 @@ class RuntimeWriteQueue:
         self.cv = threading.Condition(threading.RLock())
         self.pending, self.live = deque(), {}
         self.units = self.bytes = 0
+        self.pending_intent_coalesced = 0
         self.closed = self.paused = False
         self.db = sqlite3.connect(self.root / "tasks.sqlite3", check_same_thread=False)
         if os.name != "nt":
@@ -223,11 +224,16 @@ class RuntimeWriteQueue:
             self.paused = False
             self.cv.notify_all()
 
-    def submit(self, callback, *, key=None, payload=None, units=1, size=2048, isolated=False, keys=()):
+    def submit(self, callback, *, key=None, payload=None, units=1, size=2048, isolated=False, keys=(), pending_intent=None):
         if units < 1 or size < 1: raise ValueError("positive queue cost required")
         fingerprint = hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str).encode()).hexdigest()
         keys = frozenset(keys)
         info = access_policy(key, payload, keys)
+        intent_hash = None
+        if pending_intent is not None:
+            info = pending_intent_policy(pending_intent, keys)
+            intent_hash = hashlib.sha256(json.dumps(pending_intent, sort_keys=True, separators=(',', ':'),
+                                                    ensure_ascii=False).encode()).hexdigest()
         with self.cv:
             if key:
                 row = (self.policy.alias(key)
@@ -235,17 +241,30 @@ class RuntimeWriteQueue:
                        or self.db.execute("SELECT id,fingerprint FROM task_archive WHERE request_key=?",(key,)).fetchone())
                 if row:
                     if row[1] != fingerprint: raise IdempotencyConflict("runtime task key content conflict")
+                    if intent_hash is not None:
+                        prior=self.db.execute('SELECT intent_hash FROM task_diagnostic WHERE task_id=?',(row[0],)).fetchone()
+                        if prior and prior[0] is not None and prior[0] != intent_hash:
+                            raise IdempotencyConflict("runtime task key intent conflict")
                     return row[0], True
             if self.closed or self.paused: raise QueueBusy("runtime writer unavailable; reconcile before new writes")
-            existing = self.policy.equivalent(info, fingerprint) if key else None
+            existing = (self.policy.equivalent(info, fingerprint, intent_hash)
+                        if not isolated and (key or intent_hash) else None)
+            if existing and (existing not in self.live or self.live[existing].isolated):
+                existing = None
             if existing:
-                with self.db:
-                    self.db.execute('INSERT INTO task_request_alias VALUES (?,?,?)', (key, fingerprint, existing))
-                    self.db.execute('UPDATE task_diagnostic SET priority=MIN(priority,?) WHERE task_id=?',
-                                    (info.priority, existing))
-                if existing in self.live:
-                    self.live[existing].priority = min(self.live[existing].priority, info.priority)
+                promoted = info.priority < self.live[existing].priority
+                # Anonymous repeated legacy polls need neither an alias row nor a
+                # no-op priority UPDATE/commit. Persist only real priority changes.
+                if key or promoted:
+                    with self.db:
+                        if key:
+                            self.db.execute('INSERT INTO task_request_alias VALUES (?,?,?)', (key, fingerprint, existing))
+                        if promoted:
+                            self.db.execute('UPDATE task_diagnostic SET priority=? WHERE task_id=?',
+                                            (info.priority, existing))
+                self.live[existing].priority = min(self.live[existing].priority, info.priority)
                 self.cv.notify_all()
+                self.pending_intent_coalesced += 1
                 return existing, True
             if info.priority == 2 and sum(i.priority == 2 for i in self.live.values()) >= self.maintenance_limit:
                 raise QueueBusy("maintenance admission limited; query existing task and retry later with the same key")
@@ -256,7 +275,7 @@ class RuntimeWriteQueue:
             with self.db:
                 self.db.execute("INSERT INTO tasks VALUES (?,?,?,?,?,?,?,?,?,?)",
                                 (task_id, key, fingerprint, "QUEUED", now, now, None, None, None, units))
-                self.policy.record(task_id, info, now)
+                self.policy.record(task_id, info, now, intent_hash)
             item = Item(task_id, callback, contextvars.copy_context(), Future(), size, units, isolated, fingerprint, keys, info.priority)
             self.live[task_id] = item
             self.pending.append(item)
@@ -297,6 +316,7 @@ class RuntimeWriteQueue:
                     "outstandingBytes": self.bytes, "capacity": self.capacity,
                     "byteCapacity": self.byte_capacity, "maxBatchOperations": self.batch_size,
                     "hotHistoryLimit":self.hot_history,
+                    "pendingIntentCoalesced":self.pending_intent_coalesced,
                     "hotTasks":self.db.execute('SELECT COUNT(*) FROM tasks').fetchone()[0],
                     "performance": runtime_metrics.snapshot(),
                     "queuedByClass": {label:sum(i.priority==number for i in self.pending)

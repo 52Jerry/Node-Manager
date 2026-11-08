@@ -46,6 +46,25 @@ def access_policy(key, payload, keys):
     return result
 
 
+def pending_intent_policy(intent, keys):
+    """Only explicit internal SET operations may coalesce without an HTTP key.
+
+    Never infer equality from a closure name or a callback's hash. Parameters
+    include credentials, deadlines and policy options in the in-memory hash;
+    only that hash and a fixed kind are persisted.
+    """
+    if not isinstance(intent, dict) or intent.get('kind') not in {'renewal-state', 'proxy-binding'}:
+        raise ValueError('unsupported pending mutation intent')
+    parameters = intent.get('parameters')
+    if not isinstance(parameters, dict):
+        raise ValueError('pending intent parameters required')
+    identities = (parameters.get('userIds') if intent['kind'] == 'renewal-state'
+                  else [parameters.get('userId')])
+    if not isinstance(identities, list) or not identities or frozenset(identities) != keys:
+        raise ValueError('pending intent scope mismatch')
+    return Policy(1, intent['kind'], next(iter(keys)) if len(keys) == 1 else None)
+
+
 def error_category(error):
     if error is None:
         return None
@@ -83,7 +102,7 @@ class DurablePolicy:
             queued_at REAL NOT NULL, started_at REAL, finished_at REAL, error_category TEXT)''')
         db.execute('CREATE INDEX IF NOT EXISTS task_diagnostic_scope ON task_diagnostic(scope,sequence)')
         columns = {row[1] for row in db.execute('PRAGMA table_info(task_diagnostic)')}
-        for column in ('failed_phase', 'phase_times'):
+        for column in ('failed_phase', 'phase_times', 'intent_hash'):
             if column not in columns:
                 db.execute('ALTER TABLE task_diagnostic ADD COLUMN ' + column + ' TEXT')
         db.commit()
@@ -91,15 +110,18 @@ class DurablePolicy:
     def alias(self, key):
         return self.db.execute('SELECT task_id,fingerprint FROM task_request_alias WHERE request_key=?', (key,)).fetchone()
 
-    def equivalent(self, info, fingerprint):
-        if info.kind != 'access' or not info.scope:
+    def equivalent(self, info, fingerprint, intent_hash=None):
+        if info.kind not in {'access', 'renewal-state', 'proxy-binding'} or not info.scope:
             return None
         # Inspect the newest generation of ANY command for this user. Never
         # merge true -> false -> true, or bypass intervening credential/routes.
-        row = self.db.execute('''SELECT d.task_id,d.kind,d.target,t.state,t.fingerprint,d.sequence
+        row = self.db.execute('''SELECT d.task_id,d.kind,d.target,t.state,t.fingerprint,d.sequence,d.intent_hash
             FROM task_diagnostic d LEFT JOIN tasks t ON t.id=d.task_id
             WHERE d.scope=? ORDER BY d.sequence DESC LIMIT 1''', (info.scope,)).fetchone()
-        if row and row[1] == 'access' and row[2] == info.target and row[3] in ('QUEUED', 'RUNNING') and row[4] == fingerprint:
+        matches = (row is not None and row[1] == info.kind and row[2] == info.target
+                   and (row[4] == fingerprint if info.kind == 'access'
+                        else intent_hash is not None and row[6] == intent_hash))
+        if matches and row[3] in ('QUEUED', 'RUNNING'):
             # A multi-user/unknown-scope operation may also change this user.
             # Its presence is a barrier even when it has a different API key.
             barrier = self.db.execute('SELECT 1 FROM task_diagnostic WHERE scope IS NULL AND sequence>? LIMIT 1',
@@ -108,10 +130,10 @@ class DurablePolicy:
             return row[0]
         return None
 
-    def record(self, task_id, info, created):
+    def record(self, task_id, info, created, intent_hash=None):
         self.db.execute('''INSERT INTO task_diagnostic
-            (task_id,priority,kind,scope,target,queued_at) VALUES (?,?,?,?,?,?)''',
-            (task_id, info.priority, info.kind, info.scope, info.target, created))
+            (task_id,priority,kind,scope,target,queued_at,intent_hash) VALUES (?,?,?,?,?,?,?)''',
+            (task_id, info.priority, info.kind, info.scope, info.target, created, intent_hash))
 
     def materialize_terminal_aliases(self, task_id):
         """Mirror terminal receipts for older readers before releasing waiters.

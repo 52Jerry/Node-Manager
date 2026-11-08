@@ -772,7 +772,8 @@ def _restore_registry(original: bytes | None) -> None:
     os.chmod(REGISTRY_PATH, 0o600)
 
 
-def mutate_config(mutator: Callable[[dict[str, Any], dict[str, Any]], Any]) -> Any:
+def mutate_config(mutator: Callable[[dict[str, Any], dict[str, Any]], Any], *,
+                  pending_intent: dict | None = None, user_keys: set[str] | None = None) -> Any:
     if _mutation_capture.get():
         raise CapturedMutation(mutator)
     workspace = _mutation_workspace.get()
@@ -788,7 +789,10 @@ def mutate_config(mutator: Callable[[dict[str, Any], dict[str, Any]], Any]) -> A
         execution_ordinal.set(ordinal + 1)
         captured = dict(zip(mutator.__code__.co_freevars, (cell.cell_contents for cell in (mutator.__closure__ or ()))))
         user_id = captured.get("user_id")
-        keys = {user_id} if isinstance(user_id, str) else set()
+        legacy_keys = {user_id} if isinstance(user_id, str) else set()
+        has_related = runtime_publication.related_targets.get() is not None
+        # Preserve old global ordering for accounting/reset bundles, not just isolation.
+        keys = frozenset(user_keys) if user_keys is not None and not has_related else legacy_keys
         def versioned(data, registry):
             result = mutator(data, registry)
             for user in keys:
@@ -797,9 +801,12 @@ def mutate_config(mutator: Callable[[dict[str, Any], dict[str, Any]], Any]) -> A
                 versions[user] = user_version(user,registry) + 1
             return result
         task_id, _ = writer.submit(versioned, key=f"legacy:{identity['key']}:{ordinal}" if identity else None,
-                                   payload={"request": identity, "mutation": mutator.__qualname__, "scope": sorted(keys)},
+                                   # Preserve old request fingerprints for same-key replay after upgrade.
+                                   payload={"request": identity, "mutation": mutator.__qualname__, "scope": sorted(legacy_keys)},
                                    size=runtime_write_queue.submission_size.get(), keys=keys,
-                                   isolated=not keys or runtime_publication.related_targets.get() is not None)
+                                   # Related-file bundles can carry distinct accounting/reset effects.
+                                   pending_intent=pending_intent if not has_related else None,
+                                   isolated=not keys or has_related)
         return writer.wait(task_id)
     return _mutate_config_direct(mutator)
 
@@ -1861,7 +1868,10 @@ def renew_users(
             })
         return {"success": True, "items": items, "userCount": len(items)}
 
-    return mutate_config(apply)
+    return mutate_config(apply, user_keys=set(unique_ids), pending_intent={
+        "kind": "renewal-state", "parameters": {
+            "userIds": unique_ids, "expiresAt": _iso(new_expiry),
+            "trafficLimitBytes": traffic_limit_bytes, "maxSourceIps": max_source_ips}})
 
 
 def renew_user(
@@ -2882,6 +2892,7 @@ def bind_proxy(
     sync_socks_credentials: bool = False,
     new_uuid: str | None = None,
 ) -> dict[str, Any]:
+    proxy = copy.deepcopy(proxy)
     def apply(data: dict[str, Any], registry: dict[str, Any]) -> dict[str, Any]:
         if not _user_exists(data, registry, user_id):
             raise SingboxConfigError(f"user not found: {user_id}")
@@ -2903,7 +2914,10 @@ def bind_proxy(
             _audit("credentials.rotate", user_id, protocols=rotated_protocols)
         return {"success": True, "userId": user_id, "message": "proxy bound"}
 
-    return mutate_config(apply)
+    return mutate_config(apply, user_keys={user_id}, pending_intent={
+        "kind": "proxy-binding", "parameters": {
+            "userId": user_id, "proxy": proxy,
+            "syncSocksCredentials": sync_socks_credentials, "uuid": new_uuid}})
 
 
 def bind_multiple_proxies(

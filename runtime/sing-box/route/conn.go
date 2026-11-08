@@ -115,7 +115,7 @@ func (m *ConnectionManager) NewConnection(ctx context.Context, this N.Dialer, co
 		}
 		err = E.Cause(err, "open connection to ", remoteString, dialerString)
 		N.CloseOnHandshakeFailure(conn, onClose, err)
-		m.logger.ErrorContext(ctx, err)
+		m.logOutboundDialError(ctx, err)
 		return
 	}
 	err = N.ReportConnHandshakeSuccess(conn, remoteConn)
@@ -179,7 +179,7 @@ func (m *ConnectionManager) NewPacketConnection(ctx context.Context, this N.Dial
 			}
 			err = E.Cause(err, "open packet connection to ", remoteString, dialerString)
 			N.CloseOnHandshakeFailure(conn, onClose, err)
-			m.logger.ErrorContext(ctx, err)
+			m.logOutboundDialError(ctx, err)
 			return
 		}
 		remotePacketConn = bufio.NewUnbindPacketConn(remoteConn)
@@ -202,7 +202,7 @@ func (m *ConnectionManager) NewPacketConnection(ctx context.Context, this N.Dial
 			}
 			err = E.Cause(err, "listen packet connection using ", dialerString)
 			N.CloseOnHandshakeFailure(conn, onClose, err)
-			m.logger.ErrorContext(ctx, err)
+			m.logOutboundDialError(ctx, err)
 			return
 		}
 	}

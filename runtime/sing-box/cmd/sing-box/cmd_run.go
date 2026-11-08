@@ -18,6 +18,7 @@ import (
 	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing-box/option"
+	"github.com/sagernet/sing-box/protocol/socks"
 	E "github.com/sagernet/sing/common/exceptions"
 	"github.com/sagernet/sing/common/json"
 	"github.com/sagernet/sing/common/json/badjson"
@@ -179,6 +180,9 @@ func run() error {
 			acknowledgeReload(pendingReload, "full", false)
 			return err
 		}
+		// Report policy coverage even when this running core currently has no
+		// authenticated SOCKS outbound. The check/version commands stay read-only.
+		socks.StartUpstreamAuthBreaker()
 		management, managementErr := startUserManagement(instance)
 		if managementErr != nil {
 			cancel()

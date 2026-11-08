@@ -140,7 +140,7 @@ def _health_check_loop(interval: int, fail_threshold: int, tcp_timeout: float, b
                     break
                 continue
 
-            logger.info("checking %d upstream outbounds", len(outbounds))
+            logger.debug("checking %d upstream outbounds", len(outbounds))
 
             newly_dead: list[dict[str, Any]] = []
             checked = 0
@@ -174,18 +174,16 @@ def _health_check_loop(interval: int, fail_threshold: int, tcp_timeout: float, b
 
             # Log warnings for newly dead outbounds
             if newly_dead:
-                logger.warning("=" * 60)
-                logger.warning("DEAD OUTBOUNDS DETECTED: %d new", len(newly_dead))
-                for d in newly_dead:
+                logger.warning("DEAD OUTBOUNDS DETECTED: %d new, %d unresolved; full list available via node-manager API", len(newly_dead), total_dead)
+                for d in newly_dead[:10]:
                     logger.warning(
                         "  [DEAD] user=%s server=%s:%d tag=%s fail_count=%d",
                         d["userId"], d["server"], d["port"], d["tag"], d["failCount"],
                     )
-                logger.warning("Manual action required: review and delete via node-manager API")
-                logger.warning("Dead outbounds list (total %d):", total_dead)
-                logger.warning("=" * 60)
+                if len(newly_dead) > 10:
+                    logger.warning("%d additional dead outbounds retained for API review", len(newly_dead) - 10)
 
-            logger.info("health check complete: checked=%d, alive=%d, failed=%d, newly_dead=%d, total_dead=%d",
+            logger.debug("health check complete: checked=%d, alive=%d, failed=%d, newly_dead=%d, total_dead=%d",
                         checked, alive, failed, len(newly_dead), total_dead)
 
             if stop_event.wait(interval):

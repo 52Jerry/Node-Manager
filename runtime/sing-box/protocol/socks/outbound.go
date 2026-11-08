@@ -50,11 +50,22 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
 	if err != nil {
 		return nil, err
 	}
+	// Every actual SOCKS5 TCP negotiation, including UDP ASSOCIATE and UoT,
+	// passes through the same credential-scoped authentication guard.
+	var clientDialer N.Dialer = outboundDialer
+	if version == socks.Version5 && options.Username != "" {
+		clientDialer = &authBreakerDialer{
+			Dialer:   outboundDialer,
+			breaker:  sharedAuthBreaker(),
+			identity: newAuthCircuitIdentity(options.Server, options.ServerPort, options.Username, options.Password),
+			server:   options.ServerOptions.Build(),
+		}
+	}
 	outbound := &Outbound{
 		Adapter:   outbound.NewAdapterWithDialerOptions(C.TypeSOCKS, tag, options.Network.Build(), options.DialerOptions),
 		dnsRouter: service.FromContext[adapter.DNSRouter](ctx),
 		logger:    logger,
-		client:    socks.NewClient(outboundDialer, options.ServerOptions.Build(), version, options.Username, options.Password),
+		client:    socks.NewClient(clientDialer, options.ServerOptions.Build(), version, options.Username, options.Password),
 		resolve:   version == socks.Version4,
 	}
 	uotOptions := common.PtrValueOrDefault(options.UDPOverTCP)

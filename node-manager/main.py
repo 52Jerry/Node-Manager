@@ -133,6 +133,8 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
 )
+from background_logging import configure_background_logging
+configure_background_logging()
 
 app = FastAPI(
     title="Python Node Manager API",
@@ -163,6 +165,9 @@ app.include_router(provisioning_router)
 
 from runtime_task_api import router as runtime_task_router
 app.include_router(runtime_task_router)
+
+from upstream_auth_breaker_routes import router as upstream_auth_breaker_router
+app.include_router(upstream_auth_breaker_router)
 
 from runtime_write_queue import QueueBusy, TaskPending
 
@@ -246,6 +251,8 @@ def startup_tasks():
         logging.getLogger(__name__).exception("could not migrate existing user traffic outbounds")
     start_traffic_collector()
     start_status_sampler()
+    from monitor.hotspots import start as start_hotspots
+    start_hotspots()
     start_health_checker()
     start_expiration_scheduler()
     start_reconciler()
@@ -253,6 +260,8 @@ def startup_tasks():
 
 @app.on_event("shutdown")
 def shutdown_tasks():
+    from monitor.hotspots import stop as stop_hotspots
+    stop_hotspots()
     stop_status_sampler()
     stop_reconciler()
     stop_expiration_scheduler()
@@ -306,6 +315,14 @@ def network_check_endpoint(_token: str = Depends(verify_token)):
     在非 Linux 开发环境退化为仅报告不可用，不抛异常。
     """
     return run_network_check().to_dict()
+
+
+@app.get("/api/node/traffic-hotspots", tags=["node"])
+def traffic_hotspots_endpoint(response: Response, _token: str = Depends(verify_token)):
+    """Cached read-only rates across owned core processes; never changes quotas."""
+    from monitor.hotspots import hotspots
+    response.headers["Cache-Control"] = "no-store"
+    return hotspots.read()
 
 
 @app.post("/api/wireguard/peer/apply", tags=["wireguard"])
@@ -1326,4 +1343,4 @@ def get_nodes(
 if __name__ == "__main__":
     import uvicorn
 
-    uvicorn.run(app, host="127.0.0.1", port=config.server.port)
+    uvicorn.run(app, host="127.0.0.1", port=config.server.port, access_log=False)
