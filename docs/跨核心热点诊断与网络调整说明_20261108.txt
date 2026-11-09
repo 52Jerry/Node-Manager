@@ -45,3 +45,19 @@ GET /api/node/traffic-hotspots
 本地测试使用工作区临时目录，以避开Windows受限临时目录对os.replace的拒绝，不降低生产原子写入要求。
 测试结果另见outputs/network-capacity-review-20261108/followup/hotspots-tests-final.log及node-regression-final.log。
 全量Node-Manager回归：1299通过、82个子测试通过、1项跳过；另排除1项需要本机Bash的安装脚本语法检查。最终补充的热点与兼容性检查共23项通过，包含旧/新核心资源地址冲突和缓存并发读取保护。
+
+六、非root承流核心的认证熔断文件权限
+Go核心与管理进程必须使用相同的NIUSU_UPSTREAM_AUTH_BREAKER_CONFIG和NIUSU_UPSTREAM_AUTH_BREAKER_STATE_DIR。
+当核心以sing-box、shared-singbox等独立账号运行时，可在管理服务配置NIUSU_UPSTREAM_AUTH_BREAKER_READER_GROUP，指向专用Linux用户组。每次原子保存策略都会保留该组以及0640权限，组成员只读；未设置此项时继续使用0600。
+策略目录应归root和专用组所有、权限0750。状态目录可使用2770，以便指定核心写入各自的0600心跳文件；管理进程负责读取。目录创建后须明确设置权限，避免UMask=0077遮掉组权限。
+核心服务通过systemd SupplementaryGroups加入专用组，无需提升为root。为所有niusu-vless-gen-*代际服务共用的参数可使用niusu-vless-gen-.service.d前缀配置，保证后续同类服务继承。
+上线前以实际服务账号验证策略可读、不可写，以及状态目录可创建和删除自己的临时文件，再启动承流核心。校验须覆盖下一次原子保存之后的权限。
+用户组不存在或设置属组失败时，保存返回明确错误并保留原策略；不会降级为全局可读。对应回归覆盖原子替换、未知用户组及属组失败的文件描述符和临时文件清理。
+
+七、核心重启后的旧VLESS运行回执
+旧代际控制器的日志保存PID、启动时钟和探测后的计数基线。人工重启同名核心后，PID会改变，计数可能归零。更新运行回执前须确认systemd服务、进程参数中的配置路径、完整配置哈希及已认证的核心API一致；只更新PID和启动时钟，账本和计数基线保留。
+当空闲旧代际的当前计数低于原基线、字段缺失或格式不正确时，collect_empty保留该代际及原记录，继续检查其他代际。旧版会抛出retirement_counter_unknown，并阻断启动器依赖的管理服务。现在不推断丢失的计数，也不关闭这些无法完成计数核对的进程。
+bootstrap与collect服务必须接到当前发布目录中的publication_lifecycle.py，避免管理API已经更新、启动器仍运行历史源码。旧代际仍有未完成的计数核对时，其后续回收应保留审计，不能把未知流量当作零流量。
+
+八、多核心心跳扫描的时钟口径
+扫描多个状态文件可能耗时数秒，期间核心仍每5秒更新心跳。每个文件的鲜活性均以读完该文件后的时间核对；若使用整轮扫描开始时间，期间新写出的正常心跳会被误认为来自未来，导致BREAKER_CORE_STALE误报。真正晚于读取时刻的心跳仍不被接受，未报告、过期和身份不匹配的核心继续阻止“全部已应用”的结论。

@@ -158,11 +158,21 @@ def _write(document):
     encoded = json.dumps(document, ensure_ascii=True, separators=(",", ":")).encode()
     if len(encoded) > POLICY_LIMIT:
         raise BreakerError("BREAKER_POLICY_TOO_LARGE", 409)
+    reader_group = os.environ.get("NIUSU_UPSTREAM_AUTH_BREAKER_READER_GROUP", "")
+    reader_gid = None
+    if reader_group:
+        try:
+            import grp
+            reader_gid = grp.getgrnam(reader_group).gr_gid
+        except (ImportError, KeyError, OSError):
+            raise BreakerError("BREAKER_READER_GROUP_UNAVAILABLE", 503) from None
     descriptor, temporary = tempfile.mkstemp(prefix="." + destination.name + ".", dir=destination.parent)
     try:
-        if hasattr(os, "fchmod"):
-            os.fchmod(descriptor, 0o600)
         with os.fdopen(descriptor, "wb") as handle:
+            if reader_gid is not None:
+                os.fchown(handle.fileno(), -1, reader_gid)
+            if hasattr(os, "fchmod"):
+                os.fchmod(handle.fileno(), 0o640 if reader_gid is not None else 0o600)
             handle.write(encoded)
             handle.flush()
             os.fsync(handle.fileno())
@@ -250,7 +260,6 @@ def inspect() -> dict:
     for name in ("controllerId", "controllerRevision"):
         if name in policy:
             public_policy[name] = policy[name]
-    now = time.time()
     live = _live_cores()
     reports, errors = {}, []
     directory = state_directory()
@@ -286,7 +295,10 @@ def inspect() -> dict:
                 raise BreakerError("BREAKER_STATE_INVALID", 503)
             identity = live.get(pid)
             tick_match = identity is not None and raw.get("processStartTicks") == identity.get("processStartTicks")
-            age = now - raw["observedAtUnix"]
+            # Heartbeats can advance while several state files are read.
+            # Compare with the time after reading this report, not the time
+            # at the beginning of the whole inspection.
+            age = time.time() - raw["observedAtUnix"]
             fresh = tick_match and 0 <= age <= FRESH_SECONDS
             instance = raw.get("instanceId", "")
             if not isinstance(instance, str) or not _identifier.fullmatch(instance):
@@ -331,7 +343,7 @@ def inspect() -> dict:
             "policySource": "FILE" if configured else "DEFAULT", "cores": cores,
             "allReportedCoresApplied": applied, "applicationConfirmed": applied,
             "status": "APPLIED" if applied else ("PENDING" if active else "UNREPORTED"),
-            "stateErrors": sorted(set(errors)), "observedAtUnix": now}
+            "stateErrors": sorted(set(errors)), "observedAtUnix": time.time()}
 
 
 def update(settings: dict, expected_revision: int, controller_id=None, controller_revision=None):

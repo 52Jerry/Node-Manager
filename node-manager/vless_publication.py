@@ -197,6 +197,14 @@ def collect_empty(spec, state):
         two = rr.api(gen, "/connections")
         if two.get("connections") != []:
             continue
+        # A service restart can reset native counters below their original
+        # baseline. Keep that generation and its accounting untouched while
+        # allowing unrelated publication/startup to proceed.
+        totals = ("uploadTotal", "downloadTotal")
+        initial = gen.get("nativeStart", {})
+        if any(type(two.get(key)) is not int or type(initial.get(key, 0)) is not int
+               or initial.get(key, 0) < 0 or two[key] < initial.get(key, 0) for key in totals):
+            continue
         pending = copy.deepcopy(state)
         pending["phase"] = "retiring"
         pending["retiringEndpoint"] = gen
@@ -204,11 +212,9 @@ def collect_empty(spec, state):
         pending["generations"] = [
             g for g in pending["generations"] if g["id"] != gen["id"]
         ]
-        for key in ["uploadTotal", "downloadTotal"]:
+        for key in totals:
             value = two.get(key)
             initial = gen.get("nativeStart", {}).get(key, 0)
-            if type(value) is not int or value < initial:
-                raise rr.RolloutError("retirement_counter_unknown")
             pending.setdefault("retiredTotals", {}).setdefault(key, 0)
             pending["retiredTotals"][key] += value - initial
             pending["retiringDelta"][key] = value - initial

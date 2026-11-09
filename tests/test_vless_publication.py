@@ -281,6 +281,44 @@ def test_auth_changes_only_close_affected_user():
     assert not rr.matching_connection({"chains": ["node-manager-out:b"]}, affected)
 
 
+@pytest.mark.parametrize("value", [None, True, -1, 0, "50"])
+def test_counter_reset_defers_retirement_without_blocking_publication(value):
+    current = state()
+    current["generations"].append(dict(endpoint("draining", 62091), slot="b", pid=10, startTicks=20,
+                                       nativeStart={"uploadTotal": 50, "downloadTotal": 60}))
+    original = copy.deepcopy(current)
+    measured = {"connections": [], "uploadTotal": value, "downloadTotal": 60}
+    with mock.patch.object(vp, "has_live_sockets", return_value=False), mock.patch.object(
+        vp.rr, "api", return_value=measured
+    ), mock.patch.object(vp, "stop_generation") as stop, mock.patch.object(vp, "write_state") as write:
+        assert vp.collect_empty({}, current) == original
+        assert current == original
+        stop.assert_not_called()
+        write.assert_not_called()
+
+
+def test_unknown_counters_do_not_block_retirement_of_another_empty_generation():
+    current = state()
+    current["generations"].extend([
+        dict(endpoint("reset", 62091), pid=10, startTicks=20,
+             nativeStart={"uploadTotal": 50, "downloadTotal": 60}),
+        dict(endpoint("known", 62092), pid=11, startTicks=21,
+             nativeStart={"uploadTotal": 50, "downloadTotal": 60}),
+    ])
+    def measured(generation, path):
+        return {"connections": [], "uploadTotal": 0 if generation["id"] == "reset" else 100,
+                "downloadTotal": 200}
+    with mock.patch.object(vp, "has_live_sockets", return_value=False), mock.patch.object(
+        vp.rr, "api", side_effect=measured
+    ), mock.patch.object(vp, "stop_generation") as stop, mock.patch.object(vp, "write_state") as write:
+        result = vp.collect_empty({}, current)
+    assert [row["id"] for row in result["generations"]] == ["abcdef123456", "reset"]
+    assert result["retiredTotals"] == {"uploadTotal": 60, "downloadTotal": 155}
+    stop.assert_called_once()
+    assert stop.call_args.args[0]["id"] == "known"
+    assert write.call_count == 2
+
+
 def test_unmodified_users_are_not_disconnected_for_a_new_user():
     c = config()
     old = rr.user_fingerprints(c, {"vless-reality"})

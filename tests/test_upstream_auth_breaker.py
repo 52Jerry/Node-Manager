@@ -100,6 +100,53 @@ def test_concurrent_cas_only_one_writer_wins(store):
     assert json.loads(store[0].read_text())["revision"] == 1
 
 
+def test_configured_reader_group_survives_every_atomic_replace(store, monkeypatch):
+    from types import SimpleNamespace
+    monkeypatch.setenv("NIUSU_UPSTREAM_AUTH_BREAKER_READER_GROUP", "niusu-breaker")
+    monkeypatch.setitem(sys.modules, "grp", SimpleNamespace(getgrnam=lambda name: SimpleNamespace(gr_gid=456)))
+    ownership, modes = [], []
+    monkeypatch.setattr(breaker.os, "fchown", lambda fd, uid, gid: ownership.append((uid, gid)), raising=False)
+    monkeypatch.setattr(breaker.os, "fchmod", lambda fd, mode: modes.append(mode), raising=False)
+    breaker.update(breaker.DEFAULTS, 0)
+    breaker.update({**breaker.DEFAULTS, "enabled": False}, 1)
+    assert ownership == [(-1, 456), (-1, 456)]
+    assert modes == [0o640, 0o640]
+    assert json.loads(store[0].read_text())["revision"] == 2
+
+
+def test_unknown_reader_group_preserves_previous_policy(store, monkeypatch):
+    from types import SimpleNamespace
+    breaker.update(breaker.DEFAULTS, 0)
+    original = store[0].read_bytes()
+    monkeypatch.setenv("NIUSU_UPSTREAM_AUTH_BREAKER_READER_GROUP", "missing")
+    def missing_group(name):
+        raise KeyError(name)
+    monkeypatch.setitem(sys.modules, "grp", SimpleNamespace(getgrnam=missing_group))
+    with pytest.raises(breaker.BreakerError, match="BREAKER_READER_GROUP_UNAVAILABLE"):
+        breaker.update({**breaker.DEFAULTS, "enabled": False}, 1)
+    assert store[0].read_bytes() == original
+    assert not list(store[0].parent.glob(".policy.json.*"))
+
+
+def test_reader_group_ownership_failure_closes_descriptor_and_keeps_policy(store, monkeypatch):
+    from types import SimpleNamespace
+    breaker.update(breaker.DEFAULTS, 0)
+    original = store[0].read_bytes()
+    monkeypatch.setenv("NIUSU_UPSTREAM_AUTH_BREAKER_READER_GROUP", "niusu-breaker")
+    monkeypatch.setitem(sys.modules, "grp", SimpleNamespace(getgrnam=lambda name: SimpleNamespace(gr_gid=456)))
+    descriptors = []
+    def denied(fd, uid, gid):
+        descriptors.append(fd)
+        raise PermissionError("ownership denied")
+    monkeypatch.setattr(breaker.os, "fchown", denied, raising=False)
+    with pytest.raises(breaker.BreakerError, match="BREAKER_POLICY_WRITE_FAILED"):
+        breaker.update({**breaker.DEFAULTS, "enabled": False}, 1)
+    with pytest.raises(OSError):
+        os.fstat(descriptors[0])
+    assert store[0].read_bytes() == original
+    assert not list(store[0].parent.glob(".policy.json.*"))
+
+
 def test_cross_process_cas_uses_shared_lock(store):
     source = (
         "import sys;sys.path.insert(0,sys.argv[1]);import upstream_auth_breaker as b;"
@@ -185,6 +232,27 @@ def test_dead_core_report_is_unreported(store):
     state_file(store)
     result = breaker.inspect()
     assert result["status"] == "UNREPORTED" and result["cores"][0]["stale"]
+
+
+@pytest.mark.parametrize("report_offset,expected", [(1, True), (100, False)])
+def test_heartbeat_written_during_slow_inspection_uses_time_after_read(store, monkeypatch, report_offset, expected):
+    live(monkeypatch, 321)
+    path, value = state_file(store)
+    base = time.time()
+    value["observedAtUnix"] = base + report_offset
+    path.write_text(json.dumps(value))
+    clock = [base]
+    monkeypatch.setattr(breaker.time, "time", lambda: clock[0])
+    read = breaker._read_json
+    def delayed_read(target, limit):
+        document = read(target, limit)
+        if target == path:
+            clock[0] += 2
+        return document
+    monkeypatch.setattr(breaker, "_read_json", delayed_read)
+    result = breaker.inspect()
+    assert result["applicationConfirmed"] is expected
+    assert result["observedAtUnix"] == base + 2
 
 
 def test_unsafe_state_cannot_echo_endpoint_credentials(store, monkeypatch):
